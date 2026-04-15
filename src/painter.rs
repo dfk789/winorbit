@@ -1,4 +1,4 @@
-use crate::app::SwitchAppsState;
+use crate::switch_apps::SwitchAppsState;
 use crate::utils::{check_error, get_moinitor_rect, is_light_theme, is_win11};
 
 use anyhow::{Context, Result};
@@ -339,7 +339,7 @@ fn draw_icons(
 
         FillRect(hdc_scaled, &rect, bg_brush);
 
-        for (i, (icon, _)) in state.apps.iter().enumerate() {
+        for (i, app) in state.apps.iter().enumerate() {
             // draw the box for selected icon
             if i == state.index {
                 let left = scaled_icon_outer_size * (i as i32);
@@ -363,7 +363,7 @@ fn draw_icons(
                 hdc_scaled,
                 cx,
                 scaled_border_size,
-                *icon,
+                app.icon,
                 scaled_icon_inner_size,
                 scaled_icon_inner_size,
                 0,

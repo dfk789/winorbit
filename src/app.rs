@@ -3,6 +3,9 @@ use crate::foreground::ForegroundWatcher;
 use crate::keyboard::KeyboardListener;
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::startup::Startup;
+use crate::switch_apps::{
+    representative_window_index, AppSwitchEntry, AppSwitchWindow, SwitchAppsState,
+};
 use crate::trayicon::TrayIcon;
 use crate::utils::{
     check_error, get_app_icon, get_foreground_window, get_window_user_data, is_iconic_window,
@@ -244,7 +247,7 @@ impl App {
                 let hwnd = app
                     .switch_apps_state
                     .as_ref()
-                    .and_then(|state| state.apps.get(state.index).map(|(_, id)| *id))
+                    .and_then(SwitchAppsState::selected_hwnd)
                     .unwrap_or_else(get_foreground_window);
                 app.switch_windows(hwnd, reverse)?;
             }
@@ -407,11 +410,14 @@ impl App {
         )?;
         let mut apps = vec![];
         for (module_path, hwnds) in windows.iter() {
-            let module_hwnd = if is_iconic_window(hwnds[0].0) {
-                hwnds[hwnds.len() - 1].0
-            } else {
-                hwnds[0].0
-            };
+            let windows: Vec<AppSwitchWindow> = hwnds
+                .iter()
+                .map(|(hwnd, title)| AppSwitchWindow::new(*hwnd, title.clone()))
+                .collect();
+            let representative_index =
+                representative_window_index(&windows, is_iconic_window(windows[0].hwnd))
+                    .unwrap_or(0);
+            let representative_hwnd = windows[representative_index].hwnd;
             let module_hicon = self
                 .cached_icons
                 .entry(module_path.clone())
@@ -419,10 +425,15 @@ impl App {
                     get_app_icon(
                         &self.config.switch_apps_override_icons,
                         module_path,
-                        module_hwnd,
+                        representative_hwnd,
                     )
                 });
-            apps.push((*module_hicon, module_hwnd));
+            apps.push(AppSwitchEntry::new(
+                module_path.clone(),
+                *module_hicon,
+                representative_hwnd,
+                windows,
+            ));
         }
         let num_apps = apps.len() as i32;
         if num_apps == 0 {
@@ -454,8 +465,8 @@ impl App {
 
     fn do_switch_app(&mut self) {
         if let Some(state) = self.switch_apps_state.take() {
-            if let Some((_, id)) = state.apps.get(state.index) {
-                set_foreground_window(*id);
+            if let Some(hwnd) = state.selected_hwnd() {
+                set_foreground_window(hwnd);
             }
             self.painter.unpaint(state);
         }
@@ -481,10 +492,4 @@ fn get_app(hwnd: HWND) -> Result<&'static mut App> {
 struct SwitchWindowsState {
     cache: Option<(String, HWND, usize, Vec<isize>)>,
     modifier_released: bool,
-}
-
-#[derive(Debug)]
-pub struct SwitchAppsState {
-    pub apps: Vec<(HICON, HWND)>,
-    pub index: usize,
 }
