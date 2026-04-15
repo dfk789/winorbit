@@ -2,6 +2,7 @@ use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
 use crate::keyboard::KeyboardListener;
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
+use crate::preview::{PreviewSource, WindowPreviewSource};
 use crate::startup::Startup;
 use crate::switch_apps::{
     representative_window_index, AppSwitchEntry, AppSwitchWindow, SwitchAppsState,
@@ -410,6 +411,7 @@ impl App {
             self.config.switch_apps_only_current_desktop(),
             self.is_admin,
         )?;
+        let preview_source = WindowPreviewSource::new(self.config.switch_apps_render_mode);
         let mut apps = vec![];
         for (module_path, hwnds) in windows.iter() {
             let windows: Vec<AppSwitchWindow> = hwnds
@@ -423,6 +425,7 @@ impl App {
             )
             .map(|index| windows[index].hwnd)
             .unwrap_or(windows[0].hwnd);
+            let preview = preview_source.preview_for_hwnd(representative_hwnd);
             let module_hicon = self
                 .cached_icons
                 .entry(module_path.clone())
@@ -437,6 +440,7 @@ impl App {
                 AppSwitchEntry::from_windows(
                     module_path.clone(),
                     *module_hicon,
+                    preview,
                     windows,
                     self.config.switch_apps_representative_window,
                     |window| is_iconic_window(window.hwnd),

@@ -9,6 +9,7 @@ mod config;
 mod foreground;
 mod keyboard;
 mod painter;
+mod preview;
 mod startup;
 mod switch_apps;
 mod trayicon;

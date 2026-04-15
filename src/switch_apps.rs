@@ -1,3 +1,5 @@
+use crate::preview::AppPreview;
+
 use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::HICON};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -36,6 +38,8 @@ pub struct AppSwitchEntry {
     pub icon: HICON,
     pub representative_hwnd: HWND,
     #[allow(dead_code)]
+    pub preview: AppPreview,
+    #[allow(dead_code)]
     pub windows: Vec<AppSwitchWindow>,
 }
 
@@ -44,6 +48,7 @@ impl AppSwitchEntry {
         module_path: String,
         icon: HICON,
         representative_hwnd: HWND,
+        preview: AppPreview,
         windows: Vec<AppSwitchWindow>,
     ) -> Self {
         debug_assert!(
@@ -56,6 +61,7 @@ impl AppSwitchEntry {
             module_path,
             icon,
             representative_hwnd,
+            preview,
             windows,
         }
     }
@@ -63,13 +69,20 @@ impl AppSwitchEntry {
     pub fn from_windows(
         module_path: String,
         icon: HICON,
+        preview: AppPreview,
         windows: Vec<AppSwitchWindow>,
         policy: RepresentativeWindowPolicy,
         is_iconic: impl FnMut(&AppSwitchWindow) -> bool,
     ) -> Option<Self> {
         let representative_index = representative_window_index(&windows, policy, is_iconic)?;
         let representative_hwnd = windows[representative_index].hwnd;
-        Some(Self::new(module_path, icon, representative_hwnd, windows))
+        Some(Self::new(
+            module_path,
+            icon,
+            representative_hwnd,
+            preview,
+            windows,
+        ))
     }
 
     pub fn preview_hwnd(&self) -> HWND {
@@ -122,6 +135,7 @@ mod tests {
     use super::{
         representative_window_index, AppSwitchEntry, AppSwitchWindow, RepresentativeWindowPolicy,
     };
+    use crate::preview::{AppPreview, DwmThumbnailPreview, PreviewUnavailableReason};
     use core::ffi::c_void;
     use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::HICON};
 
@@ -194,6 +208,7 @@ mod tests {
         let entry = AppSwitchEntry::from_windows(
             "C:\\Program Files\\App\\app.exe".into(),
             fake_hicon(7),
+            AppPreview::Unavailable(PreviewUnavailableReason::DisabledByConfig),
             vec![],
             RepresentativeWindowPolicy::LegacyMinimizedFallback,
             |_| false,
@@ -208,6 +223,7 @@ mod tests {
         let entry = AppSwitchEntry::from_windows(
             "C:\\Program Files\\App\\app.exe".into(),
             fake_hicon(7),
+            AppPreview::DwmThumbnail(DwmThumbnailPreview::new(first_hwnd)),
             vec![
                 AppSwitchWindow::new(first_hwnd, "Current".into()),
                 AppSwitchWindow::new(fake_hwnd(41), "Older".into()),
@@ -218,6 +234,10 @@ mod tests {
         let entry = entry.expect("entry should be created");
 
         assert_eq!(entry.preview_hwnd(), first_hwnd);
+        assert_eq!(
+            entry.preview,
+            AppPreview::DwmThumbnail(DwmThumbnailPreview::new(first_hwnd))
+        );
         assert_eq!(entry.windows.len(), 2);
         assert_eq!(entry.module_path, "C:\\Program Files\\App\\app.exe");
         assert_eq!(
@@ -236,6 +256,7 @@ mod tests {
         let entry = AppSwitchEntry::from_windows(
             "C:\\Program Files\\App\\app.exe".into(),
             fake_hicon(7),
+            AppPreview::Unavailable(PreviewUnavailableReason::Minimized),
             vec![
                 AppSwitchWindow::new(fake_hwnd(42), "Minimized".into()),
                 AppSwitchWindow::new(fallback_hwnd, "Fallback".into()),
@@ -246,5 +267,9 @@ mod tests {
         .expect("entry should be created");
 
         assert_eq!(entry.preview_hwnd(), fallback_hwnd);
+        assert_eq!(
+            entry.preview,
+            AppPreview::Unavailable(PreviewUnavailableReason::Minimized)
+        );
     }
 }
