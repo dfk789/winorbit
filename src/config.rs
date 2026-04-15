@@ -26,6 +26,8 @@ pub struct Config {
     pub switch_apps_enable: bool,
     pub switch_apps_hotkey: Hotkey,
     pub switch_apps_ignore_minimal: bool,
+    pub switch_apps_render_mode: SwitchAppsRenderMode,
+    pub switch_apps_show_window_count: bool,
     pub switch_apps_representative_window: RepresentativeWindowPolicy,
     pub switch_apps_override_icons: IndexMap<String, String>,
     switch_apps_only_current_desktop: Option<bool>,
@@ -50,6 +52,8 @@ impl Default for Config {
             switch_apps_hotkey: Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt + tab")
                 .unwrap(),
             switch_apps_ignore_minimal: false,
+            switch_apps_render_mode: SwitchAppsRenderMode::default(),
+            switch_apps_show_window_count: false,
             switch_apps_representative_window: RepresentativeWindowPolicy::default(),
             switch_apps_override_icons: Default::default(),
             switch_apps_only_current_desktop: None,
@@ -121,6 +125,15 @@ impl Config {
                 conf.switch_apps_ignore_minimal = v;
             }
             if let Some(v) = section
+                .get("render_mode")
+                .and_then(SwitchAppsRenderMode::parse)
+            {
+                conf.switch_apps_render_mode = v;
+            }
+            if let Some(v) = section.get("show_window_count").and_then(Config::to_bool) {
+                conf.switch_apps_show_window_count = v;
+            }
+            if let Some(v) = section
                 .get("representative_window")
                 .and_then(RepresentativeWindowPolicy::parse)
             {
@@ -188,6 +201,23 @@ impl Config {
         .unwrap_or(1);
 
         alt_tab_filter != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SwitchAppsRenderMode {
+    #[default]
+    IconOnly,
+    Preview,
+}
+
+impl SwitchAppsRenderMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "icon" | "icons" | "icon_only" => Some(Self::IconOnly),
+            "preview" | "previews" => Some(Self::Preview),
+            _ => None,
+        }
     }
 }
 
@@ -403,5 +433,55 @@ representative_window = first_window
             config.switch_apps_representative_window,
             RepresentativeWindowPolicy::FirstWindow
         );
+    }
+
+    #[test]
+    fn test_switch_apps_render_mode_defaults_to_icon_only() {
+        let conf = Ini::load_from_str(DEFAULT_CONFIG).expect("default config should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(
+            config.switch_apps_render_mode,
+            SwitchAppsRenderMode::IconOnly
+        );
+        assert!(!config.switch_apps_show_window_count);
+    }
+
+    #[test]
+    fn test_switch_apps_render_mode_supports_preview_and_count_toggle() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+render_mode = preview
+show_window_count = yes
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(
+            config.switch_apps_render_mode,
+            SwitchAppsRenderMode::Preview
+        );
+        assert!(config.switch_apps_show_window_count);
+    }
+
+    #[test]
+    fn test_switch_apps_render_mode_invalid_values_fall_back_to_defaults() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+render_mode = sideways
+show_window_count = maybe
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(
+            config.switch_apps_render_mode,
+            SwitchAppsRenderMode::IconOnly
+        );
+        assert!(!config.switch_apps_show_window_count);
     }
 }

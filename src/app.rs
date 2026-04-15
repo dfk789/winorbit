@@ -385,8 +385,10 @@ impl App {
 
     fn switch_apps(&mut self, reverse: bool) -> Result<()> {
         debug!(
-            "switch apps: reverse:{reverse}, state:{:?}",
-            self.switch_apps_state
+            "switch apps: reverse:{reverse}, state:{:?}, render_mode:{:?}, show_window_count:{}",
+            self.switch_apps_state,
+            self.config.switch_apps_render_mode,
+            self.config.switch_apps_show_window_count
         );
         if let Some(state) = self.switch_apps_state.as_mut() {
             if reverse {
