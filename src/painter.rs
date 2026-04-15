@@ -228,14 +228,26 @@ pub fn find_clicked_app_index(state: &SwitchAppsState) -> Option<usize> {
     let xpos = cursor_pos.x - x;
     let ypos = cursor_pos.y - y;
 
+    hit_test_app_index(state.apps.len(), item_size, xpos, ypos)
+}
+
+fn hit_test_app_index(num_apps: usize, item_size: i32, xpos: i32, ypos: i32) -> Option<usize> {
     let cy = WINDOW_BORDER_SIZE;
-    for (i, _) in state.apps.iter().enumerate() {
-        let cx = WINDOW_BORDER_SIZE + item_size * (i as i32);
-        if xpos >= cx && xpos < cx + item_size && ypos >= cy && ypos < cy + item_size {
-            return Some(i);
-        }
+    if ypos < cy || ypos >= cy + item_size {
+        return None;
     }
-    None
+
+    let xpos = xpos - WINDOW_BORDER_SIZE;
+    if xpos < 0 {
+        return None;
+    }
+
+    let index = xpos / item_size;
+    if index >= 0 && index < num_apps as i32 {
+        Some(index as usize)
+    } else {
+        None
+    }
 }
 
 const fn theme_color(light_theme: bool) -> (u32, u32) {
@@ -430,5 +442,61 @@ impl Coordinate {
             icon_size,
             item_size,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hit_test_app_index, WINDOW_BORDER_SIZE};
+
+    #[test]
+    fn hit_test_app_index_tracks_visual_slot_order() {
+        let item_size = 72;
+
+        assert_eq!(
+            hit_test_app_index(3, item_size, WINDOW_BORDER_SIZE + 5, WINDOW_BORDER_SIZE + 5),
+            Some(0)
+        );
+        assert_eq!(
+            hit_test_app_index(
+                3,
+                item_size,
+                WINDOW_BORDER_SIZE + item_size + 5,
+                WINDOW_BORDER_SIZE + 5
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            hit_test_app_index(
+                3,
+                item_size,
+                WINDOW_BORDER_SIZE + item_size * 2 + 5,
+                WINDOW_BORDER_SIZE + 5
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn hit_test_app_index_rejects_border_and_outside_points() {
+        let item_size = 72;
+
+        assert_eq!(
+            hit_test_app_index(3, item_size, WINDOW_BORDER_SIZE - 1, WINDOW_BORDER_SIZE + 5),
+            None
+        );
+        assert_eq!(
+            hit_test_app_index(3, item_size, WINDOW_BORDER_SIZE + 5, WINDOW_BORDER_SIZE - 1),
+            None
+        );
+        assert_eq!(
+            hit_test_app_index(
+                3,
+                item_size,
+                WINDOW_BORDER_SIZE + item_size * 3,
+                WINDOW_BORDER_SIZE + 5
+            ),
+            None
+        );
     }
 }

@@ -3,13 +3,11 @@ use crate::foreground::ForegroundWatcher;
 use crate::keyboard::KeyboardListener;
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::startup::Startup;
-use crate::switch_apps::{
-    representative_window_index, AppSwitchEntry, AppSwitchWindow, SwitchAppsState,
-};
+use crate::switch_apps::{AppSwitchEntry, AppSwitchWindow, SwitchAppsState};
 use crate::trayicon::TrayIcon;
 use crate::utils::{
-    check_error, get_app_icon, get_foreground_window, get_window_user_data, is_iconic_window,
-    is_running_as_admin, list_windows, set_foreground_window, set_window_user_data,
+    check_error, get_app_icon, get_foreground_window, get_window_user_data, is_running_as_admin,
+    list_windows, set_foreground_window, set_window_user_data,
 };
 
 use anyhow::{anyhow, Result};
@@ -414,10 +412,7 @@ impl App {
                 .iter()
                 .map(|(hwnd, title)| AppSwitchWindow::new(*hwnd, title.clone()))
                 .collect();
-            let representative_index =
-                representative_window_index(&windows, is_iconic_window(windows[0].hwnd))
-                    .unwrap_or(0);
-            let representative_hwnd = windows[representative_index].hwnd;
+            let representative_hwnd = windows[0].hwnd;
             let module_hicon = self
                 .cached_icons
                 .entry(module_path.clone())
@@ -428,12 +423,10 @@ impl App {
                         representative_hwnd,
                     )
                 });
-            apps.push(AppSwitchEntry::new(
-                module_path.clone(),
-                *module_hicon,
-                representative_hwnd,
-                windows,
-            ));
+            apps.push(
+                AppSwitchEntry::from_windows(module_path.clone(), *module_hicon, windows)
+                    .expect("switch-app entry groups should never be empty"),
+            );
         }
         let num_apps = apps.len() as i32;
         if num_apps == 0 {
