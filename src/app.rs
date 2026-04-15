@@ -3,11 +3,13 @@ use crate::foreground::ForegroundWatcher;
 use crate::keyboard::KeyboardListener;
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::startup::Startup;
-use crate::switch_apps::{AppSwitchEntry, AppSwitchWindow, SwitchAppsState};
+use crate::switch_apps::{
+    representative_window_index, AppSwitchEntry, AppSwitchWindow, SwitchAppsState,
+};
 use crate::trayicon::TrayIcon;
 use crate::utils::{
-    check_error, get_app_icon, get_foreground_window, get_window_user_data, is_running_as_admin,
-    list_windows, set_foreground_window, set_window_user_data,
+    check_error, get_app_icon, get_foreground_window, get_window_user_data, is_iconic_window,
+    is_running_as_admin, list_windows, set_foreground_window, set_window_user_data,
 };
 
 use anyhow::{anyhow, Result};
@@ -412,7 +414,13 @@ impl App {
                 .iter()
                 .map(|(hwnd, title)| AppSwitchWindow::new(*hwnd, title.clone()))
                 .collect();
-            let representative_hwnd = windows[0].hwnd;
+            let representative_hwnd = representative_window_index(
+                &windows,
+                self.config.switch_apps_representative_window,
+                |window| is_iconic_window(window.hwnd),
+            )
+            .map(|index| windows[index].hwnd)
+            .unwrap_or(windows[0].hwnd);
             let module_hicon = self
                 .cached_icons
                 .entry(module_path.clone())
@@ -424,8 +432,14 @@ impl App {
                     )
                 });
             apps.push(
-                AppSwitchEntry::from_windows(module_path.clone(), *module_hicon, windows)
-                    .expect("switch-app entry groups should never be empty"),
+                AppSwitchEntry::from_windows(
+                    module_path.clone(),
+                    *module_hicon,
+                    windows,
+                    self.config.switch_apps_representative_window,
+                    |window| is_iconic_window(window.hwnd),
+                )
+                .expect("switch-app entry groups should never be empty"),
             );
         }
         let num_apps = apps.len() as i32;

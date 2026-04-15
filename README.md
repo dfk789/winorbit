@@ -61,6 +61,12 @@ hotkey = alt+tab
 # Ignore minimal windows
 ignore_minimal = no
 
+# Which app window to use as the representative target.
+# legacy_minimized_fallback = use the original upstream behavior:
+#   if the first grouped window is minimized, fall back to the last window in that app group.
+# first_window = always use the first window in the existing app-group order.
+representative_window = legacy_minimized_fallback
+
 # Only switch apps within the current virtual desktops: yes/no/auto
 only_current_desktop = auto
 ```

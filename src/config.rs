@@ -6,6 +6,7 @@ use ini::{Ini, ParseOption};
 use log::LevelFilter;
 use windows::core::w;
 
+use crate::switch_apps::RepresentativeWindowPolicy;
 use crate::utils::{get_exe_folder, RegKey};
 
 pub const SWITCH_WINDOWS_HOTKEY_ID: u32 = 1;
@@ -25,6 +26,7 @@ pub struct Config {
     pub switch_apps_enable: bool,
     pub switch_apps_hotkey: Hotkey,
     pub switch_apps_ignore_minimal: bool,
+    pub switch_apps_representative_window: RepresentativeWindowPolicy,
     pub switch_apps_override_icons: IndexMap<String, String>,
     switch_apps_only_current_desktop: Option<bool>,
 }
@@ -48,6 +50,7 @@ impl Default for Config {
             switch_apps_hotkey: Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt + tab")
                 .unwrap(),
             switch_apps_ignore_minimal: false,
+            switch_apps_representative_window: RepresentativeWindowPolicy::default(),
             switch_apps_override_icons: Default::default(),
             switch_apps_only_current_desktop: None,
         }
@@ -116,6 +119,12 @@ impl Config {
             }
             if let Some(v) = section.get("ignore_minimal").and_then(Config::to_bool) {
                 conf.switch_apps_ignore_minimal = v;
+            }
+            if let Some(v) = section
+                .get("representative_window")
+                .and_then(RepresentativeWindowPolicy::parse)
+            {
+                conf.switch_apps_representative_window = v;
             }
             if let Some(v) = section.get("override_icons").map(normalize_path_value) {
                 conf.switch_apps_override_icons = v
@@ -366,5 +375,33 @@ mod tests {
     fn test_hotkey() {
         assert_eq!(Hotkey::parse("alt + `"), Some(([0x38, 0x38], 0x29)));
         assert_eq!(Hotkey::parse("alt + tab"), Some(([0x38, 0x38], 0x0f)));
+    }
+
+    #[test]
+    fn test_switch_apps_representative_window_defaults_to_legacy_policy() {
+        let conf = Ini::load_from_str(DEFAULT_CONFIG).expect("default config should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(
+            config.switch_apps_representative_window,
+            RepresentativeWindowPolicy::LegacyMinimizedFallback
+        );
+    }
+
+    #[test]
+    fn test_switch_apps_representative_window_supports_first_window_policy() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+representative_window = first_window
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(
+            config.switch_apps_representative_window,
+            RepresentativeWindowPolicy::FirstWindow
+        );
     }
 }
