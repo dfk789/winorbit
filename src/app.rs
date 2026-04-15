@@ -461,7 +461,11 @@ impl App {
             1
         };
 
-        let state = SwitchAppsState { apps, index };
+        let state = SwitchAppsState {
+            apps,
+            index,
+            render_mode: self.config.switch_apps_render_mode,
+        };
         self.switch_apps_state = Some(state);
         debug!("switch apps, new state:{:?}", self.switch_apps_state);
         Ok(())

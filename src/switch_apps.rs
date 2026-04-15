@@ -1,3 +1,4 @@
+use crate::config::SwitchAppsRenderMode;
 use crate::preview::AppPreview;
 
 use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::HICON};
@@ -94,6 +95,7 @@ impl AppSwitchEntry {
 pub struct SwitchAppsState {
     pub apps: Vec<AppSwitchEntry>,
     pub index: usize,
+    pub render_mode: SwitchAppsRenderMode,
 }
 
 impl SwitchAppsState {
