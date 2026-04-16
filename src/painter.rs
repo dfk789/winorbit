@@ -47,10 +47,12 @@ pub const FG_DARK_COLOR: u32 = 0x3b3b3b;
 pub const BG_LIGHT_COLOR: u32 = 0xe0e0e0;
 pub const FG_LIGHT_COLOR: u32 = 0xf2f2f2;
 pub const ALPHA_MASK: u32 = 0xff000000;
+pub const SELECTION_OUTLINE_COLOR: u32 = 0xd77800;
 pub const ICON_SIZE: i32 = 64;
 pub const WINDOW_BORDER_SIZE: i32 = 10;
 pub const ICON_BORDER_SIZE: i32 = 4;
 pub const SCALE_FACTOR: i32 = 6;
+pub const SELECTED_CARD_OUTLINE_WIDTH: i32 = 2;
 pub const PREVIEW_CARD_GAP: i32 = 12;
 pub const PREVIEW_CARD_MAX_WIDTH: i32 = 220;
 pub const PREVIEW_CARD_CONTENT_PADDING: i32 = 10;
@@ -71,6 +73,18 @@ pub struct GdiAAPainter {
     rounded_corner: bool,
     preview_thumbnails: HashMap<isize, RegisteredThumbnail>,
     show: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayPalette {
+    overlay_background: u32,
+    card_background: u32,
+    selected_card_background: u32,
+    selection_outline: u32,
+    unselected_badge_fill: u32,
+    unselected_badge_text: u32,
+    selected_badge_fill: u32,
+    selected_badge_text: u32,
 }
 
 impl GdiAAPainter {
@@ -109,7 +123,7 @@ impl GdiAAPainter {
         let hwnd = self.hwnd;
         let hdc_screen = self.hdc_screen;
 
-        let (fg_color, bg_color) = theme_color(is_light_theme());
+        let palette = overlay_palette(is_light_theme());
 
         unsafe {
             let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
@@ -124,7 +138,12 @@ impl GdiAAPainter {
 
             let mut bg_pen = GpPen::default();
             let mut bg_pen_ptr: *mut GpPen = &mut bg_pen;
-            GdipCreatePen1(ALPHA_MASK | bg_color, 0.0, Unit(0), &mut bg_pen_ptr as _);
+            GdipCreatePen1(
+                ALPHA_MASK | palette.overlay_background,
+                0.0,
+                Unit(0),
+                &mut bg_pen_ptr as _,
+            );
 
             let mut bg_brush = GpBrush::default();
             let mut bg_brush_ptr: *mut GpBrush = &mut bg_brush;
@@ -151,14 +170,7 @@ impl GdiAAPainter {
                 );
             }
 
-            let bitmap_entries = draw_entries(
-                state,
-                &layout,
-                &live_previews,
-                hdc_screen,
-                fg_color,
-                bg_color,
-            );
+            let bitmap_entries = draw_entries(state, &layout, &live_previews, hdc_screen, &palette);
 
             let mut bitmap = GpBitmap::default();
             let mut bitmap_ptr: *mut GpBitmap = &mut bitmap as _;
@@ -348,6 +360,22 @@ const fn theme_color(light_theme: bool) -> (u32, u32) {
     }
 }
 
+fn overlay_palette(light_theme: bool) -> OverlayPalette {
+    let (foreground, background) = theme_color(light_theme);
+    let card_background = blend_color(background, foreground, 1, 2);
+
+    OverlayPalette {
+        overlay_background: background,
+        card_background,
+        selected_card_background: blend_color(background, SELECTION_OUTLINE_COLOR, 1, 5),
+        selection_outline: SELECTION_OUTLINE_COLOR,
+        unselected_badge_fill: foreground,
+        unselected_badge_text: background,
+        selected_badge_fill: SELECTION_OUTLINE_COLOR,
+        selected_badge_text: 0xffffff,
+    }
+}
+
 unsafe fn draw_round_rect(
     graphic_ptr: *mut GpGraphics,
     brush_ptr: *mut GpBrush,
@@ -408,15 +436,14 @@ fn draw_entries(
     layout: &OverlayLayout,
     live_previews: &[bool],
     hdc_screen: HDC,
-    fg_color: u32,
-    bg_color: u32,
+    palette: &OverlayPalette,
 ) -> HBITMAP {
     let width = rect_width(&layout.content_rect);
     let height = rect_height(&layout.content_rect);
     let scaled_width = width * SCALE_FACTOR;
     let scaled_height = height * SCALE_FACTOR;
     let scaled_card_corner_radius = layout.card_corner_radius * SCALE_FACTOR;
-    let card_color = blend_color(bg_color, fg_color, 1, 2);
+    let scaled_selected_outline_width = SELECTED_CARD_OUTLINE_WIDTH * SCALE_FACTOR;
 
     unsafe {
         let hdc_tmp = CreateCompatibleDC(Some(hdc_screen));
@@ -427,9 +454,12 @@ fn draw_entries(
         let bitmap_scaled = CreateCompatibleBitmap(hdc_screen, scaled_width, scaled_height);
         SelectObject(hdc_scaled, bitmap_scaled.into());
 
-        let fg_brush = CreateSolidBrush(COLORREF(fg_color));
-        let bg_brush = CreateSolidBrush(COLORREF(bg_color));
-        let card_brush = CreateSolidBrush(COLORREF(card_color));
+        let background_brush = CreateSolidBrush(COLORREF(palette.overlay_background));
+        let card_brush = CreateSolidBrush(COLORREF(palette.card_background));
+        let selected_card_brush = CreateSolidBrush(COLORREF(palette.selected_card_background));
+        let selection_outline_brush = CreateSolidBrush(COLORREF(palette.selection_outline));
+        let unselected_badge_brush = CreateSolidBrush(COLORREF(palette.unselected_badge_fill));
+        let selected_badge_brush = CreateSolidBrush(COLORREF(palette.selected_badge_fill));
 
         let rect = RECT {
             left: 0,
@@ -438,7 +468,7 @@ fn draw_entries(
             bottom: scaled_height,
         };
 
-        FillRect(hdc_scaled, &rect, bg_brush);
+        FillRect(hdc_scaled, &rect, background_brush);
 
         if state.render_mode.uses_preview_cards() {
             for (i, _) in state.apps.iter().enumerate() {
@@ -451,16 +481,23 @@ fn draw_entries(
                     ),
                     SCALE_FACTOR,
                 );
-                fill_round_rect_region(
-                    hdc_scaled,
-                    if i == state.index {
-                        fg_brush
-                    } else {
-                        card_brush
-                    },
-                    &card_rect,
-                    scaled_card_corner_radius,
-                );
+                if i == state.index {
+                    fill_selected_card(
+                        hdc_scaled,
+                        &card_rect,
+                        scaled_card_corner_radius,
+                        scaled_selected_outline_width,
+                        selection_outline_brush,
+                        selected_card_brush,
+                    );
+                } else {
+                    fill_round_rect_region(
+                        hdc_scaled,
+                        card_brush,
+                        &card_rect,
+                        scaled_card_corner_radius,
+                    );
+                }
             }
         } else if let Some(entry) = layout.entries.get(state.index) {
             let card_rect = scale_rect(
@@ -471,7 +508,14 @@ fn draw_entries(
                 ),
                 SCALE_FACTOR,
             );
-            fill_round_rect_region(hdc_scaled, fg_brush, &card_rect, scaled_card_corner_radius);
+            fill_selected_card(
+                hdc_scaled,
+                &card_rect,
+                scaled_card_corner_radius,
+                scaled_selected_outline_width,
+                selection_outline_brush,
+                selected_card_brush,
+            );
         }
 
         for (i, app) in state.apps.iter().enumerate() {
@@ -515,18 +559,49 @@ fn draw_entries(
         );
 
         draw_count_badges(
-            state, layout, hdc_tmp, fg_color, bg_color, fg_brush, bg_brush,
+            state,
+            layout,
+            hdc_tmp,
+            palette,
+            unselected_badge_brush,
+            selected_badge_brush,
         );
 
-        let _ = DeleteObject(fg_brush.into());
-        let _ = DeleteObject(bg_brush.into());
+        let _ = DeleteObject(background_brush.into());
         let _ = DeleteObject(card_brush.into());
+        let _ = DeleteObject(selected_card_brush.into());
+        let _ = DeleteObject(selection_outline_brush.into());
+        let _ = DeleteObject(unselected_badge_brush.into());
+        let _ = DeleteObject(selected_badge_brush.into());
         let _ = DeleteObject(bitmap_scaled.into());
         let _ = DeleteDC(hdc_scaled);
         let _ = DeleteDC(hdc_tmp);
 
         bitmap_tmp
     }
+}
+
+fn fill_selected_card(
+    hdc: HDC,
+    card_rect: &RECT,
+    corner_radius: i32,
+    outline_width: i32,
+    outline_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    fill_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+) {
+    fill_round_rect_region(hdc, outline_brush, card_rect, corner_radius);
+
+    let inner_rect = inset_rect(*card_rect, outline_width);
+    if rect_width(&inner_rect) <= 0 || rect_height(&inner_rect) <= 0 {
+        return;
+    }
+
+    fill_round_rect_region(
+        hdc,
+        fill_brush,
+        &inner_rect,
+        (corner_radius - outline_width).max(0),
+    );
 }
 
 #[derive(Debug)]
@@ -595,8 +670,7 @@ fn draw_count_badges(
     state: &SwitchAppsState,
     layout: &OverlayLayout,
     hdc: HDC,
-    fg_color: u32,
-    bg_color: u32,
+    palette: &OverlayPalette,
     unselected_badge_brush: windows::Win32::Graphics::Gdi::HBRUSH,
     selected_badge_brush: windows::Win32::Graphics::Gdi::HBRUSH,
 ) {
@@ -644,9 +718,9 @@ fn draw_count_badges(
             let _ = SetTextColor(
                 hdc,
                 COLORREF(if index == state.index {
-                    fg_color
+                    palette.selected_badge_text
                 } else {
-                    bg_color
+                    palette.unselected_badge_text
                 }),
             );
 
@@ -972,8 +1046,8 @@ fn blend_color(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        badge_layout, fit_preview_destination, hit_test_app_index, rect_height, rect_width,
-        OverlayLayout, SwitchAppsRenderMode, WINDOW_BORDER_SIZE,
+        badge_layout, fit_preview_destination, hit_test_app_index, overlay_palette, rect_height,
+        rect_width, OverlayLayout, SwitchAppsRenderMode, WINDOW_BORDER_SIZE,
     };
     use windows::Win32::Foundation::{RECT, SIZE};
 
@@ -1257,6 +1331,24 @@ mod tests {
 
         assert!(rect_width(&large.0) > rect_width(&small.0));
         assert_eq!(rect_height(&small.0), rect_height(&large.0));
+    }
+
+    #[test]
+    fn overlay_palette_makes_selected_cards_distinct_in_dark_theme() {
+        let palette = overlay_palette(false);
+
+        assert_ne!(palette.selected_card_background, palette.card_background);
+        assert_ne!(palette.selection_outline, palette.card_background);
+        assert_eq!(palette.selected_badge_text, 0xffffff);
+    }
+
+    #[test]
+    fn overlay_palette_makes_selected_cards_distinct_in_light_theme() {
+        let palette = overlay_palette(true);
+
+        assert_ne!(palette.selected_card_background, palette.card_background);
+        assert_ne!(palette.selection_outline, palette.overlay_background);
+        assert_eq!(palette.selected_badge_fill, super::SELECTION_OUTLINE_COLOR);
     }
 
     #[test]
