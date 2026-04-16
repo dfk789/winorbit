@@ -1263,7 +1263,8 @@ mod tests {
     fn icon_layout_stays_compact_and_square() {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::IconOnly,
-            6,
+            false,
+            &[1, 1, 1, 1, 1, 1],
             fake_monitor_rect(1920, 1080),
         );
         let card = layout.entries[0].card_rect;
@@ -1286,7 +1287,8 @@ mod tests {
     fn icon_layout_remains_centered_when_preview_mode_exists() {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::IconOnly,
-            4,
+            false,
+            &[1, 1, 1, 1],
             fake_monitor_rect(1280, 720),
         );
 
