@@ -1539,4 +1539,65 @@ mod tests {
 
         assert!(all_same_row, "8 icon entries should fit in a single row on 1920px");
     }
+
+    #[test]
+    fn zero_app_layout_produces_empty_entries() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        assert!(layout.entries.is_empty());
+        assert_eq!(layout.selected_outline_width, 0);
+    }
+
+    #[test]
+    fn single_app_layout_stays_centered() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[1],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        assert_eq!(layout.entries.len(), 1);
+        assert_eq!(layout.x, (1920 - layout.width) / 2);
+        assert_eq!(layout.y, (1080 - layout.height) / 2);
+    }
+
+    #[test]
+    fn overlay_scale_at_minimum_still_produces_valid_layout() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            true,
+            50,
+            &[2, 3],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        assert!(layout.width > 0);
+        assert!(layout.height > 0);
+        assert_eq!(layout.entries.len(), 2);
+        assert!(layout.selected_outline_width >= 1);
+    }
+
+    #[test]
+    fn dot_indicator_not_shown_for_disabled_window_count() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[3, 1, 2],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        assert!(
+            layout.entries.iter().all(|e| e.dots.is_none()),
+            "dots should not appear when show_window_count is false"
+        );
+    }
 }

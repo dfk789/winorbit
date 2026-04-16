@@ -439,4 +439,40 @@ mod tests {
             Some(state.apps[1].windows[0].hwnd)
         );
     }
+
+    #[test]
+    fn selected_hwnd_falls_back_to_representative_for_out_of_range_window_index() {
+        let mut state = make_test_state(&[2, 1]);
+        // Manually set window_index out of range to simulate a stale index.
+        state.window_index = 99;
+        assert_eq!(
+            state.selected_hwnd(),
+            Some(state.apps[0].representative_hwnd)
+        );
+    }
+
+    #[test]
+    fn cycle_window_wraps_forward_and_backward_with_two_windows() {
+        let mut state = make_test_state(&[2]);
+        let w0 = state.apps[0].windows[0].hwnd;
+        let w1 = state.apps[0].windows[1].hwnd;
+
+        assert_eq!(state.selected_hwnd(), Some(w0));
+        state.cycle_window(false);
+        assert_eq!(state.selected_hwnd(), Some(w1));
+        state.cycle_window(false);
+        assert_eq!(state.selected_hwnd(), Some(w0));
+
+        state.cycle_window(true);
+        assert_eq!(state.selected_hwnd(), Some(w1));
+        state.cycle_window(true);
+        assert_eq!(state.selected_hwnd(), Some(w0));
+    }
+
+    #[test]
+    fn selected_app_returns_none_for_empty_state() {
+        let state = make_test_state(&[]);
+        assert!(state.selected_app().is_none());
+        assert!(state.selected_hwnd().is_none());
+    }
 }

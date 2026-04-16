@@ -645,4 +645,42 @@ backdrop_color = #fff
         let config = Config::load(&conf).expect("config should load");
         assert_eq!(config.switch_apps_backdrop_color, None);
     }
+
+    #[test]
+    fn test_overlay_scale_valid_boundary_values() {
+        for (input, expected) in [("50", 50), ("100", 100), ("200", 200)] {
+            let conf = Ini::load_from_str(&format!(
+                r#"
+[switch-apps]
+overlay_scale = {input}
+"#
+            ))
+            .expect("config snippet should parse");
+            let config = Config::load(&conf).expect("config should load");
+            assert_eq!(config.switch_apps_overlay_scale, expected);
+        }
+    }
+
+    #[test]
+    fn test_backdrop_opacity_at_zero_is_valid() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+backdrop_opacity = 0
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_backdrop_opacity, 0);
+    }
+
+    #[test]
+    fn test_default_config_loads_all_new_fields_with_safe_defaults() {
+        let conf = Ini::load_from_str(DEFAULT_CONFIG).expect("default config should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(config.switch_apps_overlay_scale, 100);
+        assert_eq!(config.switch_apps_backdrop_opacity, 100);
+        assert_eq!(config.switch_apps_backdrop_color, None);
+    }
 }
