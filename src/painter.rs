@@ -816,25 +816,38 @@ impl OverlayLayout {
             SwitchAppsRenderMode::IconOnly => 0,
             SwitchAppsRenderMode::Preview => scaled_preview_gap,
         };
-        let available_width =
-            (monitor_width - outer_padding * 2 - gap * (num_apps as i32 - 1)).max(num_apps as i32);
-        let card_width = match render_mode {
-            SwitchAppsRenderMode::IconOnly => {
-                ((available_width / num_apps as i32) - scaled_icon_border * 2).min(scaled_icon_size)
-                    + scaled_icon_border * 2
-            }
-            SwitchAppsRenderMode::Preview => {
-                (available_width / num_apps as i32).min(scaled_preview_max_width)
-            }
+
+        let desired_card_width = match render_mode {
+            SwitchAppsRenderMode::IconOnly => scaled_icon_size + scaled_icon_border * 2,
+            SwitchAppsRenderMode::Preview => scaled_preview_max_width,
         };
+
+        // Compute grid dimensions that fit within 85% of the monitor.
+        let max_content_width = (monitor_width * 85 / 100).max(desired_card_width + outer_padding * 2) - outer_padding * 2;
+        let max_cols = if desired_card_width + gap <= 0 {
+            num_apps as i32
+        } else {
+            ((max_content_width + gap) / (desired_card_width + gap)).max(1)
+        };
+
+        let (cols, rows) = if (num_apps as i32) <= max_cols {
+            (num_apps as i32, 1)
+        } else {
+            let rows = ((num_apps as i32) + max_cols - 1) / max_cols;
+            let balanced_cols = ((num_apps as i32) + rows - 1) / rows;
+            (balanced_cols.min(max_cols).max(1), rows)
+        };
+
+        let card_width = desired_card_width;
         let card_height = match render_mode {
             SwitchAppsRenderMode::IconOnly => card_width,
             SwitchAppsRenderMode::Preview => {
                 (card_width * PREVIEW_CARD_ASPECT_HEIGHT) / PREVIEW_CARD_ASPECT_WIDTH
             }
         };
-        let content_width = card_width * num_apps as i32 + gap * (num_apps as i32 - 1);
-        let content_height = card_height;
+        let row_gap = gap;
+        let content_width = card_width * cols + gap * (cols - 1);
+        let content_height = card_height * rows + row_gap * (rows - 1);
         let width = content_width + outer_padding * 2;
         let height = content_height + outer_padding * 2;
         let x = monitor_rect.left + (monitor_width - width) / 2;
@@ -847,8 +860,10 @@ impl OverlayLayout {
         };
         let entries = (0..num_apps)
             .map(|index| {
-                let left = content_rect.left + index as i32 * (card_width + gap);
-                let top = content_rect.top;
+                let col = index as i32 % cols;
+                let row = index as i32 / cols;
+                let left = content_rect.left + col * (card_width + gap);
+                let top = content_rect.top + row * (card_height + row_gap);
                 let card_rect = RECT {
                     left,
                     top,
@@ -1492,5 +1507,91 @@ mod tests {
         assert_eq!(custom.overlay_background, 0x112233);
         assert_ne!(custom.overlay_background, default.overlay_background);
         assert_ne!(custom.card_background, default.card_background);
+    }
+
+    #[test]
+    fn preview_layout_wraps_to_multiple_rows_when_needed() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        // 10 apps at 220px each won't fit in one row on 85% of 1920px.
+        // The layout should wrap to multiple rows.
+        let first_row_top = layout.entries[0].card_rect.top;
+        let has_second_row = layout
+            .entries
+            .iter()
+            .any(|entry| entry.card_rect.top > first_row_top);
+
+        assert!(has_second_row);
+        assert!(layout.width <= 1920);
+        assert!(layout.height <= 1080);
+    }
+
+    #[test]
+    fn multi_row_layout_keeps_hit_testing_correct() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        for (i, entry) in layout.entries.iter().enumerate() {
+            let hit = hit_test_app_index(
+                &layout,
+                entry.card_rect.left + 5,
+                entry.card_rect.top + 5,
+            );
+            assert_eq!(hit, Some(i), "hit test failed for entry {i}");
+        }
+    }
+
+    #[test]
+    fn multi_row_layout_balances_columns() {
+        // Force multi-row by using a narrow monitor: 7 apps at 220px each won't
+        // fit in one row on a 1280px monitor (85% = 1088px usable, max_cols = 4).
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[1, 1, 1, 1, 1, 1, 1],
+            fake_monitor_rect(1280, 720),
+        );
+
+        let first_row_top = layout.entries[0].card_rect.top;
+        let first_row_count = layout
+            .entries
+            .iter()
+            .filter(|e| e.card_rect.top == first_row_top)
+            .count();
+
+        // Should use a balanced layout (e.g. 4+3) rather than all-in-one or 4+3 with big gap.
+        assert!(first_row_count <= 4, "first row has {first_row_count} items, expected balanced grid");
+        assert!(first_row_count >= 3, "first row has {first_row_count} items, expected at least 3");
+    }
+
+    #[test]
+    fn icon_layout_stays_single_row_for_small_counts() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::IconOnly,
+            false,
+            100,
+            &[1, 1, 1, 1, 1, 1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        let first_row_top = layout.entries[0].card_rect.top;
+        let all_same_row = layout
+            .entries
+            .iter()
+            .all(|entry| entry.card_rect.top == first_row_top);
+
+        assert!(all_same_row, "8 icon entries should fit in a single row on 1920px");
     }
 }
