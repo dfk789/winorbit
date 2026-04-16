@@ -35,6 +35,8 @@ try {
 $dest = "C:\Users\$env:USERNAME\AppData\Local\Programs\$command"
 $archive = "$url/releases/download/$tag/$command-$tag-$target.zip"
 $outfile = "$dest\$command.exe"
+$config = "$dest\$command.ini"
+$license = "$dest\LICENSE"
 
 Write-Host "Repository:  $url"
 Write-Host "Command:     $command"
@@ -77,6 +79,19 @@ if (Test-Path $outfile) {
 }
 
 Move-Item "$temp\$command.exe" $outfile
+
+if (Test-Path "$temp\$command.ini") {
+    if (-not (Test-Path $config)) {
+        Move-Item "$temp\$command.ini" $config
+        Write-Host "Installed default $command.ini."
+    } else {
+        Write-Host "Preserved existing $command.ini."
+    }
+}
+
+if (Test-Path "$temp\LICENSE") {
+    Move-Item -Force "$temp\LICENSE" $license
+}
 
 Remove-Item -Force "$temp.zip"
 Remove-Item -Force -Recurse "$temp"

@@ -93,6 +93,8 @@ jobs:
         dist_dir=`pwd`/dist
         name=$bin-$version-$platform
         executable=target/$target/release/$bin
+        config=$bin.ini
+        license=LICENSE
 
         if [[ "$RUNNER_OS" == "Windows" ]]; then
           executable=$executable.exe
@@ -100,6 +102,8 @@ jobs:
 
         mkdir $dist_dir
         cp $executable $dist_dir
+        cp $config $dist_dir
+        cp $license $dist_dir
         cd $dist_dir
 
         if [[ "$RUNNER_OS" == "Windows" ]]; then

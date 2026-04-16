@@ -17,11 +17,11 @@ It keeps the lightweight same-app switching flow, adds an optional card-based `A
 ## Installation
 
 1. Download the latest release archive from this repository's Releases page.
-2. Extract `winorbit.exe` and place it wherever you want to run it from.
-3. Put `winorbit.ini` next to `winorbit.exe`.
+2. Extract the archive to a folder and keep `winorbit.exe`, `winorbit.ini`, and `LICENSE` together.
+3. Edit `winorbit.ini` if you want to change the default hotkeys or overlay behavior.
 4. Launch `winorbit.exe`.
 
-An optional PowerShell installer script is included as [install.ps1](install.ps1). It defaults to `dfk789/winorbit`, and you can override that with `-Repo owner/name` if you fork it.
+An optional PowerShell installer script is included as [install.ps1](install.ps1). It defaults to `dfk789/winorbit`, and you can override that with `-Repo owner/name` if you fork it. The installer now lays down the bundled default `winorbit.ini` on first install and preserves an existing config on upgrades.
 
 ## Configuration
 
