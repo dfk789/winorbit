@@ -105,6 +105,9 @@ impl AppSwitchEntry {
 pub struct SwitchAppsState {
     pub apps: Vec<AppSwitchEntry>,
     pub index: usize,
+    /// Index of the selected window within the currently selected app.
+    /// `0` means the representative window. Updated by inline `Alt+\`` cycling.
+    pub window_index: usize,
     pub render_mode: SwitchAppsRenderMode,
     pub show_window_count: bool,
     pub overlay_scale: u32,
@@ -118,7 +121,39 @@ impl SwitchAppsState {
     }
 
     pub fn selected_hwnd(&self) -> Option<HWND> {
-        self.selected_app().map(AppSwitchEntry::preview_hwnd)
+        self.selected_app().map(|app| {
+            app.windows
+                .get(self.window_index)
+                .map(|w| w.hwnd)
+                .unwrap_or(app.representative_hwnd)
+        })
+    }
+
+    pub fn cycle_window(&mut self, reverse: bool) {
+        let Some(app) = self.apps.get(self.index) else {
+            return;
+        };
+        let count = app.windows.len();
+        if count <= 1 {
+            return;
+        }
+        if reverse {
+            self.window_index = if self.window_index == 0 {
+                count - 1
+            } else {
+                self.window_index - 1
+            };
+        } else {
+            self.window_index = if self.window_index >= count - 1 {
+                0
+            } else {
+                self.window_index + 1
+            };
+        }
+    }
+
+    pub fn reset_window_index(&mut self) {
+        self.window_index = 0;
     }
 }
 
@@ -286,6 +321,122 @@ mod tests {
         assert_eq!(
             entry.preview,
             AppPreview::Unavailable(PreviewUnavailableReason::Minimized)
+        );
+    }
+
+    fn make_test_state(window_counts: &[usize]) -> super::SwitchAppsState {
+        use crate::config::SwitchAppsRenderMode;
+
+        let apps = window_counts
+            .iter()
+            .enumerate()
+            .map(|(app_idx, &count)| {
+                let windows: Vec<AppSwitchWindow> = (0..count)
+                    .map(|win_idx| {
+                        AppSwitchWindow::new(
+                            fake_hwnd(app_idx * 100 + win_idx + 1),
+                            format!("Window {win_idx}"),
+                        )
+                    })
+                    .collect();
+                let representative_hwnd = windows[0].hwnd;
+                AppSwitchEntry::new(
+                    format!("app{app_idx}.exe"),
+                    fake_hicon(app_idx + 1),
+                    representative_hwnd,
+                    AppPreview::Unavailable(PreviewUnavailableReason::DisabledByConfig),
+                    windows,
+                )
+            })
+            .collect();
+
+        super::SwitchAppsState {
+            apps,
+            index: 0,
+            window_index: 0,
+            render_mode: SwitchAppsRenderMode::IconOnly,
+            show_window_count: false,
+            overlay_scale: 100,
+            backdrop_opacity: 100,
+            backdrop_color: None,
+        }
+    }
+
+    #[test]
+    fn cycle_window_advances_within_selected_app() {
+        let mut state = make_test_state(&[3, 1]);
+
+        assert_eq!(state.window_index, 0);
+        state.cycle_window(false);
+        assert_eq!(state.window_index, 1);
+        state.cycle_window(false);
+        assert_eq!(state.window_index, 2);
+        state.cycle_window(false);
+        assert_eq!(state.window_index, 0);
+    }
+
+    #[test]
+    fn cycle_window_reverses_within_selected_app() {
+        let mut state = make_test_state(&[3, 1]);
+
+        assert_eq!(state.window_index, 0);
+        state.cycle_window(true);
+        assert_eq!(state.window_index, 2);
+        state.cycle_window(true);
+        assert_eq!(state.window_index, 1);
+    }
+
+    #[test]
+    fn cycle_window_is_noop_for_single_window_app() {
+        let mut state = make_test_state(&[1, 3]);
+
+        state.cycle_window(false);
+        assert_eq!(state.window_index, 0);
+        state.cycle_window(true);
+        assert_eq!(state.window_index, 0);
+    }
+
+    #[test]
+    fn selected_hwnd_follows_window_index() {
+        let mut state = make_test_state(&[3, 1]);
+        let expected_first = state.apps[0].windows[0].hwnd;
+        let expected_second = state.apps[0].windows[1].hwnd;
+
+        assert_eq!(state.selected_hwnd(), Some(expected_first));
+        state.cycle_window(false);
+        assert_eq!(state.selected_hwnd(), Some(expected_second));
+    }
+
+    #[test]
+    fn reset_window_index_returns_to_representative() {
+        let mut state = make_test_state(&[3, 1]);
+
+        state.cycle_window(false);
+        state.cycle_window(false);
+        assert_eq!(state.window_index, 2);
+
+        state.reset_window_index();
+        assert_eq!(state.window_index, 0);
+        assert_eq!(
+            state.selected_hwnd(),
+            Some(state.apps[0].windows[0].hwnd)
+        );
+    }
+
+    #[test]
+    fn switching_apps_resets_window_index_conceptually() {
+        let mut state = make_test_state(&[3, 2]);
+
+        state.cycle_window(false);
+        assert_eq!(state.window_index, 1);
+
+        // Simulate switching to next app.
+        state.index = 1;
+        state.reset_window_index();
+        assert_eq!(state.window_index, 0);
+        assert_eq!(
+            state.selected_hwnd(),
+            Some(state.apps[1].windows[0].hwnd)
         );
     }
 }

@@ -245,12 +245,17 @@ impl App {
                 debug!("message WM_USER_SWITCH_WINDOWS");
                 let app = get_app(hwnd)?;
                 let reverse = lparam.0 == 1;
-                let hwnd = app
-                    .switch_apps_state
-                    .as_ref()
-                    .and_then(SwitchAppsState::selected_hwnd)
-                    .unwrap_or_else(get_foreground_window);
-                app.switch_windows(hwnd, reverse)?;
+                if app.switch_apps_state.is_some() {
+                    // Inline same-app cycling: update the selected window within
+                    // the overlay without foregrounding or dismissing.
+                    if let Some(state) = app.switch_apps_state.as_mut() {
+                        state.cycle_window(reverse);
+                        app.painter.paint(state);
+                    }
+                } else {
+                    let hwnd = get_foreground_window();
+                    app.switch_windows(hwnd, reverse)?;
+                }
             }
             WM_USER_SWITCH_WINDOWS_DONE => {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
@@ -403,6 +408,7 @@ impl App {
             } else {
                 state.index += 1;
             };
+            state.reset_window_index();
             debug!("switch apps: new index:{}", state.index);
             return Ok(());
         }
@@ -461,6 +467,7 @@ impl App {
         let state = SwitchAppsState {
             apps,
             index,
+            window_index: 0,
             render_mode: self.config.switch_apps_render_mode,
             show_window_count: self.config.switch_apps_show_window_count,
             overlay_scale: self.config.switch_apps_overlay_scale,
