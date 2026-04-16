@@ -44,6 +44,63 @@ pub fn is_iconic_window(hwnd: HWND) -> bool {
     unsafe { IsIconic(hwnd) }.as_bool()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowFilterInput {
+    pub owner_hwnd: HWND,
+    pub is_visible: bool,
+    pub is_iconic: bool,
+    pub is_tool: bool,
+    pub is_topmost: bool,
+    pub is_cloaked: bool,
+    pub is_small: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFilterReason {
+    NotVisible,
+    Minimized,
+    ToolWindow,
+    OwnedTopmostWindow,
+    Cloaked,
+    Small,
+    EmptyTitle,
+    WindowsInputExperience,
+}
+
+pub fn window_filter_reason(
+    input: WindowFilterInput,
+    title: &str,
+    ignore_minimal: bool,
+) -> Option<WindowFilterReason> {
+    if !input.is_visible {
+        return Some(WindowFilterReason::NotVisible);
+    }
+    if ignore_minimal && input.is_iconic {
+        return Some(WindowFilterReason::Minimized);
+    }
+    if input.is_tool {
+        return Some(WindowFilterReason::ToolWindow);
+    }
+    if input.is_topmost && input.owner_hwnd != HWND::default() {
+        // Keep ownerless always-on-top app windows like VLC in the app list, but
+        // continue filtering transient owned topmost surfaces that add overlay noise.
+        return Some(WindowFilterReason::OwnedTopmostWindow);
+    }
+    if input.is_cloaked {
+        return Some(WindowFilterReason::Cloaked);
+    }
+    if input.is_small {
+        return Some(WindowFilterReason::Small);
+    }
+    if title.is_empty() {
+        return Some(WindowFilterReason::EmptyTitle);
+    }
+    if title == "Windows Input Experience" {
+        return Some(WindowFilterReason::WindowsInputExperience);
+    }
+    None
+}
+
 pub fn get_window_cloak_type(hwnd: HWND) -> u32 {
     let mut cloak_type = 0u32;
     let _ = unsafe {
@@ -58,8 +115,10 @@ pub fn get_window_cloak_type(hwnd: HWND) -> u32 {
 }
 
 fn is_cloaked_window(hwnd: HWND, only_current_desktop: bool) -> bool {
-    let cloak_type = get_window_cloak_type(hwnd);
+    window_is_cloaked_for_switching(get_window_cloak_type(hwnd), only_current_desktop)
+}
 
+pub fn window_is_cloaked_for_switching(cloak_type: u32, only_current_desktop: bool) -> bool {
     if only_current_desktop {
         // Any kind of cloaking counts against a window
         cloak_type != 0
@@ -221,19 +280,25 @@ pub fn list_windows(
     let mut owner_hwnds = vec![];
     for hwnd in hwnds.iter().cloned() {
         let (is_visible, is_iconic, is_tool, is_topmost) = get_window_state(hwnd);
-        let ok = is_visible
-            && (if ignore_minimal { !is_iconic } else { true })
-            && !is_tool
-            && !is_topmost
-            && !is_cloaked_window(hwnd, only_current_desktop)
-            && !is_small_window(hwnd);
-        if ok {
-            let title = get_window_title(hwnd);
-            if !title.is_empty() && title != "Windows Input Experience" {
-                valid_hwnds.push((hwnd, title));
-            }
+        let owner_hwnd = get_owner_window(hwnd);
+        let title = get_window_title(hwnd);
+        let filter_reason = window_filter_reason(
+            WindowFilterInput {
+                owner_hwnd,
+                is_visible,
+                is_iconic,
+                is_tool,
+                is_topmost,
+                is_cloaked: is_cloaked_window(hwnd, only_current_desktop),
+                is_small: is_small_window(hwnd),
+            },
+            &title,
+            ignore_minimal,
+        );
+        if filter_reason.is_none() {
+            valid_hwnds.push((hwnd, title));
         }
-        owner_hwnds.push(get_owner_window(hwnd))
+        owner_hwnds.push(owner_hwnd)
     }
     for (hwnd, title) in valid_hwnds.into_iter() {
         let mut pid = get_window_pid(hwnd);
@@ -257,7 +322,7 @@ pub fn list_windows(
     Ok(result)
 }
 
-fn is_valid_module_path(module_path: &str) -> bool {
+pub fn is_valid_module_path(module_path: &str) -> bool {
     !module_path.is_empty() && module_path != "C:\\Windows\\System32\\ApplicationFrameHost.exe"
 }
 
@@ -265,4 +330,73 @@ extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let windows: &mut Vec<HWND> = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
     windows.push(hwnd);
     BOOL(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{window_filter_reason, WindowFilterInput, WindowFilterReason};
+    use core::ffi::c_void;
+    use windows::Win32::Foundation::HWND;
+
+    fn fake_hwnd(value: usize) -> HWND {
+        HWND(value as *mut c_void)
+    }
+
+    fn candidate() -> WindowFilterInput {
+        WindowFilterInput {
+            owner_hwnd: HWND::default(),
+            is_visible: true,
+            is_iconic: false,
+            is_tool: false,
+            is_topmost: false,
+            is_cloaked: false,
+            is_small: false,
+        }
+    }
+
+    #[test]
+    fn ownerless_topmost_window_stays_switchable() {
+        let mut input = candidate();
+        input.is_topmost = true;
+
+        assert_eq!(window_filter_reason(input, "VLC media player", false), None);
+    }
+
+    #[test]
+    fn owned_topmost_window_is_filtered_out() {
+        let mut input = candidate();
+        input.is_topmost = true;
+        input.owner_hwnd = fake_hwnd(7);
+
+        assert_eq!(
+            window_filter_reason(input, "Floating palette", false),
+            Some(WindowFilterReason::OwnedTopmostWindow)
+        );
+    }
+
+    #[test]
+    fn minimized_windows_are_filtered_only_when_requested() {
+        let mut input = candidate();
+        input.is_iconic = true;
+
+        assert_eq!(window_filter_reason(input, "Editor", false), None);
+        assert_eq!(
+            window_filter_reason(input, "Editor", true),
+            Some(WindowFilterReason::Minimized)
+        );
+    }
+
+    #[test]
+    fn empty_and_special_titles_still_stay_filtered() {
+        let input = candidate();
+
+        assert_eq!(
+            window_filter_reason(input, "", false),
+            Some(WindowFilterReason::EmptyTitle)
+        );
+        assert_eq!(
+            window_filter_reason(input, "Windows Input Experience", false),
+            Some(WindowFilterReason::WindowsInputExperience)
+        );
+    }
 }
