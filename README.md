@@ -21,7 +21,7 @@ It keeps the lightweight same-app switching flow, adds an optional card-based `A
 3. Put `winorbit.ini` next to `winorbit.exe`.
 4. Launch `winorbit.exe`.
 
-An optional PowerShell installer script is included as [install.ps1](install.ps1). Before using it against published releases, set the repository owner with `-Repo your-user/winorbit`.
+An optional PowerShell installer script is included as [install.ps1](install.ps1). It defaults to `dfk789/winorbit`, and you can override that with `-Repo owner/name` if you fork it.
 
 ## Configuration
 

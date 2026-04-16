@@ -1,13 +1,9 @@
 param(
-    [string]$Repo = "YOUR_GITHUB_USER/winorbit"
+    [string]$Repo = "dfk789/winorbit"
 )
 
 $command = "winorbit"
 $url = "https://github.com/$Repo"
-
-if ($Repo -like "YOUR_GITHUB_USER/*") {
-    Write-Warning "Set -Repo to your published GitHub repository first, for example 'your-user/winorbit'."
-}
 
 if ($env:OS -like "Windows*") {
     $os = "windows"
