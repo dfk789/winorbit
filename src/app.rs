@@ -462,6 +462,7 @@ impl App {
             apps,
             index,
             render_mode: self.config.switch_apps_render_mode,
+            show_window_count: self.config.switch_apps_show_window_count,
         };
         self.switch_apps_state = Some(state);
         debug!("switch apps, new state:{:?}", self.switch_apps_state);

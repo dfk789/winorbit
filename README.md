@@ -67,7 +67,7 @@ ignore_minimal = no
 #   entries that cannot provide a preview fall back to icons
 render_mode = icon_only
 
-# Whether to show a small per-app window count when supported.
+# Whether to show a small per-app window count for apps with more than one window.
 show_window_count = no
 
 # Which app window to use as the representative target.

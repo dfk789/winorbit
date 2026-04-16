@@ -106,6 +106,7 @@ pub struct SwitchAppsState {
     pub apps: Vec<AppSwitchEntry>,
     pub index: usize,
     pub render_mode: SwitchAppsRenderMode,
+    pub show_window_count: bool,
 }
 
 impl SwitchAppsState {
