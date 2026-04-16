@@ -58,6 +58,15 @@ impl AppSwitchEntry {
                 .any(|window| window.hwnd == representative_hwnd),
             "representative window must be part of the app entry"
         );
+        debug_assert!(
+            matches!(preview, AppPreview::Unavailable(_))
+                || matches!(
+                    preview,
+                    AppPreview::DwmThumbnail(preview)
+                        if preview.source_hwnd == representative_hwnd
+                ),
+            "preview source must match the representative window"
+        );
         Self {
             module_path,
             icon,
@@ -67,6 +76,7 @@ impl AppSwitchEntry {
         }
     }
 
+    #[cfg(test)]
     pub fn from_windows(
         module_path: String,
         icon: HICON,

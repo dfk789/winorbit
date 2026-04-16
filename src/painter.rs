@@ -1,11 +1,18 @@
 use crate::config::SwitchAppsRenderMode;
+use crate::preview::AppPreview;
 use crate::switch_apps::SwitchAppsState;
 use crate::utils::{check_error, get_moinitor_rect, is_light_theme, is_win11};
 
 use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
 use windows::Win32::{
     Foundation::{COLORREF, HWND, POINT, RECT, SIZE},
     Graphics::{
+        Dwm::{
+            DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+            DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY,
+            DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+        },
         Gdi::{
             CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush,
             DeleteDC, DeleteObject, FillRect, FillRgn, GetDC, ReleaseDC, SelectObject,
@@ -52,6 +59,7 @@ pub struct GdiAAPainter {
     hwnd: HWND,
     hdc_screen: HDC,
     rounded_corner: bool,
+    preview_thumbnails: HashMap<isize, RegisteredThumbnail>,
     show: bool,
 }
 
@@ -73,12 +81,14 @@ impl GdiAAPainter {
             hwnd,
             hdc_screen,
             rounded_corner,
+            preview_thumbnails: HashMap::new(),
             show: false,
         })
     }
 
     pub fn paint(&mut self, state: &SwitchAppsState) {
         let layout = OverlayLayout::for_state(state);
+        let live_previews = self.prepare_live_previews(state, &layout);
 
         let corner_radius = if self.rounded_corner {
             layout.overlay_corner_radius
@@ -131,7 +141,14 @@ impl GdiAAPainter {
                 );
             }
 
-            let bitmap_entries = draw_entries(state, &layout, hdc_screen, fg_color, bg_color);
+            let bitmap_entries = draw_entries(
+                state,
+                &layout,
+                &live_previews,
+                hdc_screen,
+                fg_color,
+                bg_color,
+            );
 
             let mut bitmap = GpBitmap::default();
             let mut bitmap_ptr: *mut GpBitmap = &mut bitmap as _;
@@ -192,15 +209,100 @@ impl GdiAAPainter {
     }
 
     pub fn unpaint(&mut self, _state: SwitchAppsState) {
+        self.preview_thumbnails.clear();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.show = false;
     }
+
+    fn prepare_live_previews(
+        &mut self,
+        state: &SwitchAppsState,
+        layout: &OverlayLayout,
+    ) -> Vec<bool> {
+        let mut live_previews = vec![false; state.apps.len()];
+        if state.render_mode != SwitchAppsRenderMode::Preview {
+            self.preview_thumbnails.clear();
+            return live_previews;
+        }
+
+        let mut keep_keys = HashSet::new();
+        let mut failed_keys = HashSet::new();
+
+        for (index, app) in state.apps.iter().enumerate() {
+            let AppPreview::DwmThumbnail(preview) = app.preview else {
+                continue;
+            };
+
+            let key = preview.source_hwnd.0 as isize;
+            keep_keys.insert(key);
+
+            if !self.preview_thumbnails.contains_key(&key) {
+                match RegisteredThumbnail::register(self.hwnd, preview.source_hwnd) {
+                    Ok(thumbnail) => {
+                        self.preview_thumbnails.insert(key, thumbnail);
+                    }
+                    Err(err) => {
+                        debug!(
+                            "preview register failed for hwnd {:?}: {err}",
+                            preview.source_hwnd
+                        );
+                        failed_keys.insert(key);
+                        continue;
+                    }
+                }
+            }
+
+            let Some(thumbnail) = self.preview_thumbnails.get(&key) else {
+                continue;
+            };
+
+            let source_size = match thumbnail.source_size() {
+                Ok(size) => size,
+                Err(err) => {
+                    debug!(
+                        "preview source-size query failed for hwnd {:?}: {err}",
+                        preview.source_hwnd
+                    );
+                    failed_keys.insert(key);
+                    continue;
+                }
+            };
+
+            let Some(destination_rect) =
+                fit_preview_destination(layout.entries[index].preview_rect, source_size)
+            else {
+                debug!(
+                    "preview destination invalid for hwnd {:?}: {:?}",
+                    preview.source_hwnd, layout.entries[index].preview_rect
+                );
+                failed_keys.insert(key);
+                continue;
+            };
+
+            if let Err(err) = thumbnail.show(destination_rect) {
+                debug!(
+                    "preview property update failed for hwnd {:?}: {err}",
+                    preview.source_hwnd
+                );
+                failed_keys.insert(key);
+                continue;
+            }
+
+            live_previews[index] = true;
+        }
+
+        self.preview_thumbnails
+            .retain(|key, _| keep_keys.contains(key) && !failed_keys.contains(key));
+
+        live_previews
+    }
 }
 
 impl Drop for GdiAAPainter {
     fn drop(&mut self) {
+        self.preview_thumbnails.clear();
         unsafe {
             ReleaseDC(Some(self.hwnd), self.hdc_screen);
             GdiplusShutdown(self.token);
@@ -294,6 +396,7 @@ unsafe fn draw_round_rect(
 fn draw_entries(
     state: &SwitchAppsState,
     layout: &OverlayLayout,
+    live_previews: &[bool],
     hdc_screen: HDC,
     fg_color: u32,
     bg_color: u32,
@@ -362,6 +465,9 @@ fn draw_entries(
         }
 
         for (i, app) in state.apps.iter().enumerate() {
+            if live_previews.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             let icon_rect = scale_rect(
                 offset_rect(
                     layout.entries[i].icon_rect,
@@ -409,9 +515,72 @@ fn draw_entries(
     }
 }
 
+#[derive(Debug)]
+struct RegisteredThumbnail {
+    source_hwnd: HWND,
+    handle: isize,
+}
+
+impl RegisteredThumbnail {
+    fn register(destination_hwnd: HWND, source_hwnd: HWND) -> Result<Self> {
+        let handle = unsafe {
+            // The returned thumbnail handle is owned by this struct and released in Drop.
+            DwmRegisterThumbnail(destination_hwnd, source_hwnd)
+        }
+        .with_context(|| format!("failed to register DWM thumbnail for {source_hwnd:?}"))?;
+
+        Ok(Self {
+            source_hwnd,
+            handle,
+        })
+    }
+
+    fn source_size(&self) -> Result<SIZE> {
+        unsafe { DwmQueryThumbnailSourceSize(self.handle) }.with_context(|| {
+            format!(
+                "failed to query DWM thumbnail source size for {:?}",
+                self.source_hwnd
+            )
+        })
+    }
+
+    fn show(&self, destination_rect: RECT) -> Result<()> {
+        let properties = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: DWM_TNP_RECTDESTINATION
+                | DWM_TNP_OPACITY
+                | DWM_TNP_VISIBLE
+                | DWM_TNP_SOURCECLIENTAREAONLY,
+            rcDestination: destination_rect,
+            opacity: 255,
+            fVisible: true.into(),
+            fSourceClientAreaOnly: false.into(),
+            ..Default::default()
+        };
+
+        unsafe { DwmUpdateThumbnailProperties(self.handle, &properties) }.with_context(|| {
+            format!(
+                "failed to update DWM thumbnail properties for {:?}",
+                self.source_hwnd
+            )
+        })
+    }
+}
+
+impl Drop for RegisteredThumbnail {
+    fn drop(&mut self) {
+        if let Err(err) = unsafe { DwmUnregisterThumbnail(self.handle) } {
+            debug!(
+                "preview unregister failed for hwnd {:?}: {err}",
+                self.source_hwnd
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OverlayEntryLayout {
     card_rect: RECT,
+    preview_rect: RECT,
     icon_rect: RECT,
 }
 
@@ -488,13 +657,6 @@ impl OverlayLayout {
             right: outer_padding + content_width,
             bottom: outer_padding + content_height,
         };
-        let icon_size = match render_mode {
-            SwitchAppsRenderMode::IconOnly => card_width - ICON_BORDER_SIZE * 2,
-            SwitchAppsRenderMode::Preview => ICON_SIZE.min(
-                (card_height - PREVIEW_CARD_CONTENT_PADDING * 2)
-                    .min(card_width - PREVIEW_CARD_CONTENT_PADDING * 2),
-            ),
-        };
         let entries = (0..num_apps)
             .map(|index| {
                 let left = content_rect.left + index as i32 * (card_width + gap);
@@ -505,9 +667,20 @@ impl OverlayLayout {
                     right: left + card_width,
                     bottom: top + card_height,
                 };
+                let preview_padding = match render_mode {
+                    SwitchAppsRenderMode::IconOnly => ICON_BORDER_SIZE,
+                    SwitchAppsRenderMode::Preview => PREVIEW_CARD_CONTENT_PADDING
+                        .min((card_width - 1).max(0) / 2)
+                        .min((card_height - 1).max(0) / 2),
+                };
+                let preview_rect = inset_rect(card_rect, preview_padding);
+                let icon_size = ICON_SIZE
+                    .min(rect_width(&preview_rect))
+                    .min(rect_height(&preview_rect));
                 OverlayEntryLayout {
                     card_rect,
-                    icon_rect: centered_rect(card_rect, icon_size, icon_size),
+                    preview_rect,
+                    icon_rect: centered_rect(preview_rect, icon_size, icon_size),
                 }
             })
             .collect();
@@ -555,6 +728,15 @@ fn centered_rect(rect: RECT, width: i32, height: i32) -> RECT {
     }
 }
 
+fn inset_rect(rect: RECT, padding: i32) -> RECT {
+    RECT {
+        left: rect.left + padding,
+        top: rect.top + padding,
+        right: rect.right - padding,
+        bottom: rect.bottom - padding,
+    }
+}
+
 fn offset_rect(rect: RECT, dx: i32, dy: i32) -> RECT {
     RECT {
         left: rect.left + dx,
@@ -585,6 +767,31 @@ fn point_in_rect(rect: &RECT, x: i32, y: i32) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
 }
 
+fn fit_preview_destination(bounds: RECT, source_size: SIZE) -> Option<RECT> {
+    let bounds_width = rect_width(&bounds);
+    let bounds_height = rect_height(&bounds);
+    if bounds_width <= 0 || bounds_height <= 0 || source_size.cx <= 0 || source_size.cy <= 0 {
+        return None;
+    }
+
+    let bounds_width = bounds_width as i64;
+    let bounds_height = bounds_height as i64;
+    let source_width = source_size.cx as i64;
+    let source_height = source_size.cy as i64;
+
+    let (width, height) = if bounds_width * source_height <= bounds_height * source_width {
+        let width = bounds_width as i32;
+        let height = ((bounds_width * source_height) / source_width).max(1) as i32;
+        (width, height)
+    } else {
+        let width = ((bounds_height * source_width) / source_height).max(1) as i32;
+        let height = bounds_height as i32;
+        (width, height)
+    };
+
+    Some(centered_rect(bounds, width, height))
+}
+
 fn blend_color(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
     fn blend_channel(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
         ((start * (denominator - numerator)) + (end * numerator)) / denominator
@@ -608,8 +815,11 @@ fn blend_color(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{hit_test_app_index, OverlayLayout, SwitchAppsRenderMode, WINDOW_BORDER_SIZE};
-    use windows::Win32::Foundation::RECT;
+    use super::{
+        fit_preview_destination, hit_test_app_index, rect_height, rect_width, OverlayLayout,
+        SwitchAppsRenderMode, WINDOW_BORDER_SIZE,
+    };
+    use windows::Win32::Foundation::{RECT, SIZE};
 
     fn fake_monitor_rect(width: i32, height: i32) -> RECT {
         RECT {
@@ -733,6 +943,82 @@ mod tests {
             (preview_layout.entries[0].card_rect.right - preview_layout.entries[0].card_rect.left)
                 > (preview_layout.entries[0].card_rect.bottom
                     - preview_layout.entries[0].card_rect.top)
+        );
+        assert!(
+            preview_layout.entries[0].preview_rect.left > preview_layout.entries[0].card_rect.left
+        );
+        assert!(
+            preview_layout.entries[0].icon_rect.left >= preview_layout.entries[0].preview_rect.left
+        );
+        assert!(
+            preview_layout.entries[0].icon_rect.right
+                <= preview_layout.entries[0].preview_rect.right
+        );
+    }
+
+    #[test]
+    fn fit_preview_destination_preserves_wide_source_aspect_ratio() {
+        let destination = fit_preview_destination(
+            RECT {
+                left: 10,
+                top: 20,
+                right: 210,
+                bottom: 140,
+            },
+            SIZE { cx: 1600, cy: 900 },
+        )
+        .expect("destination rect should be calculated");
+
+        assert_eq!(rect_width(&destination), 200);
+        assert_eq!(rect_height(&destination), 112);
+        assert_eq!(destination.top, 24);
+        assert_eq!(destination.bottom, 136);
+    }
+
+    #[test]
+    fn fit_preview_destination_preserves_tall_source_aspect_ratio() {
+        let destination = fit_preview_destination(
+            RECT {
+                left: 10,
+                top: 20,
+                right: 130,
+                bottom: 220,
+            },
+            SIZE { cx: 900, cy: 1600 },
+        )
+        .expect("destination rect should be calculated");
+
+        assert_eq!(rect_width(&destination), 112);
+        assert_eq!(rect_height(&destination), 200);
+        assert_eq!(destination.left, 14);
+        assert_eq!(destination.right, 126);
+    }
+
+    #[test]
+    fn fit_preview_destination_rejects_zero_sized_inputs() {
+        assert_eq!(
+            fit_preview_destination(
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 100,
+                },
+                SIZE { cx: 800, cy: 600 },
+            ),
+            None
+        );
+        assert_eq!(
+            fit_preview_destination(
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 100,
+                },
+                SIZE { cx: 0, cy: 600 },
+            ),
+            None
         );
     }
 }

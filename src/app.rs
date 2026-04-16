@@ -425,6 +425,7 @@ impl App {
             )
             .map(|index| windows[index].hwnd)
             .unwrap_or(windows[0].hwnd);
+            // Preview and activation stay aligned on the same representative window.
             let preview = preview_source.preview_for_hwnd(representative_hwnd);
             let module_hicon = self
                 .cached_icons
@@ -436,17 +437,13 @@ impl App {
                         representative_hwnd,
                     )
                 });
-            apps.push(
-                AppSwitchEntry::from_windows(
-                    module_path.clone(),
-                    *module_hicon,
-                    preview,
-                    windows,
-                    self.config.switch_apps_representative_window,
-                    |window| is_iconic_window(window.hwnd),
-                )
-                .expect("switch-app entry groups should never be empty"),
-            );
+            apps.push(AppSwitchEntry::new(
+                module_path.clone(),
+                *module_hicon,
+                representative_hwnd,
+                preview,
+                windows,
+            ));
         }
         let num_apps = apps.len() as i32;
         if num_apps == 0 {
