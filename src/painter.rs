@@ -5,7 +5,6 @@ use crate::utils::{check_error, get_moinitor_rect, is_light_theme, is_win11};
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use windows::core::w;
 use windows::Win32::{
     Foundation::{COLORREF, HWND, POINT, RECT, SIZE},
     Graphics::{
@@ -15,13 +14,10 @@ use windows::Win32::{
             DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
         },
         Gdi::{
-            CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateRoundRectRgn,
-            CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect, FillRgn, GetDC,
-            ReleaseDC, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt,
-            AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
-            DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_SWISS,
-            FW_SEMIBOLD, HALFTONE, HBITMAP, HDC, HPALETTE, OUT_DEFAULT_PRECIS, SRCCOPY,
-            TRANSPARENT,
+            CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush,
+            DeleteDC, DeleteObject, FillRect, FillRgn, GetDC, ReleaseDC, SelectObject,
+            SetStretchBltMode, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HALFTONE,
+            HBITMAP, HDC, HPALETTE, SRCCOPY,
         },
         GdiPlus::{
             FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateBitmapFromHBITMAP,
@@ -58,12 +54,6 @@ pub const PREVIEW_CARD_MAX_WIDTH: i32 = 220;
 pub const PREVIEW_CARD_CONTENT_PADDING: i32 = 10;
 pub const PREVIEW_CARD_ASPECT_WIDTH: i32 = 16;
 pub const PREVIEW_CARD_ASPECT_HEIGHT: i32 = 10;
-pub const COUNT_BADGE_ICON_HEIGHT: i32 = 18;
-pub const COUNT_BADGE_PREVIEW_HEIGHT: i32 = 20;
-pub const COUNT_BADGE_ICON_INSET: i32 = 2;
-pub const COUNT_BADGE_PREVIEW_INSET: i32 = 6;
-pub const COUNT_BADGE_HORIZONTAL_PADDING: i32 = 6;
-pub const COUNT_BADGE_DIGIT_WIDTH: i32 = 7;
 
 // GDI Antialiasing Painter
 pub struct GdiAAPainter {
@@ -560,7 +550,7 @@ fn draw_entries(
             SRCCOPY,
         );
 
-        draw_count_badges(
+        draw_dot_indicators(
             state,
             layout,
             hdc_tmp,
@@ -668,76 +658,50 @@ impl Drop for RegisteredThumbnail {
     }
 }
 
-fn draw_count_badges(
+fn draw_dot_indicators(
     state: &SwitchAppsState,
     layout: &OverlayLayout,
     hdc: HDC,
-    palette: &OverlayPalette,
-    unselected_badge_brush: windows::Win32::Graphics::Gdi::HBRUSH,
-    selected_badge_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    _palette: &OverlayPalette,
+    inactive_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    active_brush: windows::Win32::Graphics::Gdi::HBRUSH,
 ) {
     if !state.show_window_count {
         return;
     }
 
-    unsafe {
-        let badge_font = CreateFontW(
-            -count_badge_font_height(state.render_mode),
-            0,
-            0,
-            0,
-            FW_SEMIBOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            DEFAULT_PITCH.0 as u32 | FF_SWISS.0 as u32,
-            w!("Segoe UI"),
-        );
-        let previous_font = SelectObject(hdc, badge_font.into());
-        let _ = SetBkMode(hdc, TRANSPARENT);
+    let active_window_index = if state.show_window_count {
+        state.window_index
+    } else {
+        0
+    };
 
-        for (index, entry) in layout.entries.iter().enumerate() {
-            let (Some(badge_rect), Some(label)) = (entry.badge_rect, entry.badge_label.as_deref())
-            else {
+    unsafe {
+        for (app_index, entry) in layout.entries.iter().enumerate() {
+            let Some(dots) = &entry.dots else {
                 continue;
             };
 
-            fill_round_rect_region(
-                hdc,
-                if index == state.index {
-                    selected_badge_brush
-                } else {
-                    unselected_badge_brush
-                },
-                &badge_rect,
-                rect_height(&badge_rect),
-            );
+            let content_offset_x = layout.content_rect.left;
+            let content_offset_y = layout.content_rect.top;
 
-            let _ = SetTextColor(
-                hdc,
-                COLORREF(if index == state.index {
-                    palette.selected_badge_text
+            for (dot_idx, &(cx, cy)) in dots.centers.iter().enumerate() {
+                let is_active = app_index == state.index && dot_idx == active_window_index;
+                let brush = if is_active {
+                    active_brush
                 } else {
-                    palette.unselected_badge_text
-                }),
-            );
-
-            let mut badge_rect = badge_rect;
-            let mut label_utf16: Vec<u16> = label.encode_utf16().collect();
-            let _ = DrawTextW(
-                hdc,
-                label_utf16.as_mut_slice(),
-                &mut badge_rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
+                    inactive_brush
+                };
+                let r = dots.radius;
+                let dot_rect = RECT {
+                    left: cx - r - content_offset_x,
+                    top: cy - r - content_offset_y,
+                    right: cx + r - content_offset_x,
+                    bottom: cy + r - content_offset_y,
+                };
+                fill_round_rect_region(hdc, brush, &dot_rect, r * 2);
+            }
         }
-
-        let _ = SelectObject(hdc, previous_font);
-        let _ = DeleteObject(badge_font.into());
     }
 }
 
@@ -746,8 +710,15 @@ struct OverlayEntryLayout {
     card_rect: RECT,
     preview_rect: RECT,
     icon_rect: RECT,
-    badge_rect: Option<RECT>,
-    badge_label: Option<String>,
+    /// Center positions and radius for per-window dot indicators.
+    dots: Option<DotIndicatorLayout>,
+}
+
+#[derive(Debug, Clone)]
+struct DotIndicatorLayout {
+    /// (x, y) center for each dot.
+    centers: Vec<(i32, i32)>,
+    radius: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -880,8 +851,7 @@ impl OverlayLayout {
                 let icon_size = scaled_icon_size
                     .min(rect_width(&preview_rect))
                     .min(rect_height(&preview_rect));
-                let badge = badge_layout(
-                    render_mode,
+                let dots = dot_indicator_layout(
                     show_window_count,
                     card_rect,
                     window_counts[index],
@@ -890,8 +860,7 @@ impl OverlayLayout {
                     card_rect,
                     preview_rect,
                     icon_rect: centered_rect(preview_rect, icon_size, icon_size),
-                    badge_rect: badge.as_ref().map(|(rect, _)| *rect),
-                    badge_label: badge.map(|(_, label)| label),
+                    dots,
                 }
             })
             .collect();
@@ -949,43 +918,33 @@ fn inset_rect(rect: RECT, padding: i32) -> RECT {
     }
 }
 
-fn badge_layout(
-    render_mode: SwitchAppsRenderMode,
+const DOT_RADIUS: i32 = 3;
+const DOT_SPACING: i32 = 8;
+const DOT_BOTTOM_INSET: i32 = 6;
+
+fn dot_indicator_layout(
     show_window_count: bool,
     card_rect: RECT,
     window_count: usize,
-) -> Option<(RECT, String)> {
+) -> Option<DotIndicatorLayout> {
     if !show_window_count || window_count <= 1 {
         return None;
     }
 
-    let label = window_count.to_string();
-    let badge_height = match render_mode {
-        SwitchAppsRenderMode::IconOnly => COUNT_BADGE_ICON_HEIGHT,
-        SwitchAppsRenderMode::Preview => COUNT_BADGE_PREVIEW_HEIGHT,
-    };
-    let badge_inset = match render_mode {
-        SwitchAppsRenderMode::IconOnly => COUNT_BADGE_ICON_INSET,
-        SwitchAppsRenderMode::Preview => COUNT_BADGE_PREVIEW_INSET,
-    };
-    let max_badge_width = (rect_width(&card_rect) - badge_inset * 2).max(badge_height);
-    let badge_width = (label.len() as i32 * COUNT_BADGE_DIGIT_WIDTH
-        + COUNT_BADGE_HORIZONTAL_PADDING * 2)
-        .max(badge_height)
-        .min(max_badge_width);
-    let top = card_rect.top + badge_inset;
-    let right = card_rect.right - badge_inset;
-    let left = right - badge_width;
+    let count = window_count as i32;
+    let total_width = DOT_RADIUS * 2 * count + DOT_SPACING * (count - 1);
+    let card_center_x = (card_rect.left + card_rect.right) / 2;
+    let y = card_rect.bottom - DOT_BOTTOM_INSET - DOT_RADIUS;
 
-    Some((
-        RECT {
-            left,
-            top,
-            right,
-            bottom: top + badge_height,
-        },
-        label,
-    ))
+    let start_x = card_center_x - total_width / 2 + DOT_RADIUS;
+    let centers = (0..count)
+        .map(|i| (start_x + i * (DOT_RADIUS * 2 + DOT_SPACING), y))
+        .collect();
+
+    Some(DotIndicatorLayout {
+        centers,
+        radius: DOT_RADIUS,
+    })
 }
 
 fn offset_rect(rect: RECT, dx: i32, dy: i32) -> RECT {
@@ -1043,13 +1002,6 @@ fn fit_preview_destination(bounds: RECT, source_size: SIZE) -> Option<RECT> {
     Some(centered_rect(bounds, width, height))
 }
 
-fn count_badge_font_height(render_mode: SwitchAppsRenderMode) -> i32 {
-    match render_mode {
-        SwitchAppsRenderMode::IconOnly => 12,
-        SwitchAppsRenderMode::Preview => 13,
-    }
-}
-
 fn blend_color(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
     fn blend_channel(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
         ((start * (denominator - numerator)) + (end * numerator)) / denominator
@@ -1074,8 +1026,8 @@ fn blend_color(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        badge_layout, fit_preview_destination, hit_test_app_index, overlay_palette, rect_height,
-        rect_width, OverlayLayout, SwitchAppsRenderMode, WINDOW_BORDER_SIZE,
+        dot_indicator_layout, fit_preview_destination, hit_test_app_index, overlay_palette,
+        rect_height, rect_width, OverlayLayout, SwitchAppsRenderMode, WINDOW_BORDER_SIZE,
     };
     use windows::Win32::Foundation::{RECT, SIZE};
 
@@ -1291,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn badge_layout_only_shows_for_multi_window_entries_when_enabled() {
+    fn dot_indicator_only_shows_for_multi_window_entries_when_enabled() {
         let card_rect = RECT {
             left: 10,
             top: 20,
@@ -1299,18 +1251,29 @@ mod tests {
             bottom: 92,
         };
 
-        let single_window = badge_layout(SwitchAppsRenderMode::IconOnly, true, card_rect, 1);
-        let multi_window = badge_layout(SwitchAppsRenderMode::IconOnly, true, card_rect, 12)
-            .expect("multi-window entry should get a badge");
+        let single_window = dot_indicator_layout(true, card_rect, 1);
+        let multi_window =
+            dot_indicator_layout(true, card_rect, 3).expect("multi-window entry should get dots");
 
         assert!(single_window.is_none());
-        assert_eq!(multi_window.1, "12");
-        assert!(multi_window.0.right <= card_rect.right);
-        assert!(multi_window.0.left >= card_rect.left);
+        assert_eq!(multi_window.centers.len(), 3);
+        assert!(multi_window.radius > 0);
     }
 
     #[test]
-    fn preview_layout_includes_badges_without_changing_card_hit_testing() {
+    fn dot_indicator_hidden_when_show_window_count_is_false() {
+        let card_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 140,
+        };
+
+        assert!(dot_indicator_layout(false, card_rect, 5).is_none());
+    }
+
+    #[test]
+    fn preview_layout_includes_dots_without_changing_card_hit_testing() {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::Preview,
             true,
@@ -1319,13 +1282,10 @@ mod tests {
             fake_monitor_rect(1920, 1080),
         );
 
-        assert_eq!(layout.entries[0].badge_label.as_deref(), Some("3"));
-        assert!(layout.entries[1].badge_rect.is_none());
-        assert_eq!(layout.entries[2].badge_label.as_deref(), Some("24"));
-        assert!(
-            layout.entries[0].badge_rect.expect("badge rect").top
-                >= layout.entries[0].card_rect.top
-        );
+        assert!(layout.entries[0].dots.is_some());
+        assert_eq!(layout.entries[0].dots.as_ref().unwrap().centers.len(), 3);
+        assert!(layout.entries[1].dots.is_none());
+        assert_eq!(layout.entries[2].dots.as_ref().unwrap().centers.len(), 24);
         assert_eq!(
             hit_test_app_index(
                 &layout,
@@ -1337,34 +1297,19 @@ mod tests {
     }
 
     #[test]
-    fn badge_layout_expands_for_multiple_digits() {
-        let small = badge_layout(
-            SwitchAppsRenderMode::Preview,
-            true,
-            RECT {
-                left: 0,
-                top: 0,
-                right: 180,
-                bottom: 110,
-            },
-            3,
-        )
-        .expect("single-digit badge should exist");
-        let large = badge_layout(
-            SwitchAppsRenderMode::Preview,
-            true,
-            RECT {
-                left: 0,
-                top: 0,
-                right: 180,
-                bottom: 110,
-            },
-            128,
-        )
-        .expect("three-digit badge should exist");
+    fn dot_indicator_centers_are_horizontally_centered_in_card() {
+        let card_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 140,
+        };
+        let dots =
+            dot_indicator_layout(true, card_rect, 3).expect("3-window entry should get dots");
+        let card_center = (card_rect.left + card_rect.right) / 2;
 
-        assert!(rect_width(&large.0) > rect_width(&small.0));
-        assert_eq!(rect_height(&small.0), rect_height(&large.0));
+        // The middle dot should be near the card center.
+        assert_eq!(dots.centers[1].0, card_center);
     }
 
     #[test]
