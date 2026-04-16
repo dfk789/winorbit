@@ -227,8 +227,8 @@ impl Config {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SwitchAppsRenderMode {
-    #[default]
     IconOnly,
+    #[default]
     Preview,
 }
 
@@ -469,13 +469,13 @@ representative_window = first_window
     }
 
     #[test]
-    fn test_switch_apps_render_mode_defaults_to_icon_only() {
+    fn test_switch_apps_render_mode_defaults_to_preview() {
         let conf = Ini::load_from_str(DEFAULT_CONFIG).expect("default config should parse");
         let config = Config::load(&conf).expect("config should load");
 
         assert_eq!(
             config.switch_apps_render_mode,
-            SwitchAppsRenderMode::IconOnly
+            SwitchAppsRenderMode::Preview
         );
         assert!(!config.switch_apps_show_window_count);
     }
@@ -513,13 +513,13 @@ show_window_count = maybe
 
         assert_eq!(
             config.switch_apps_render_mode,
-            SwitchAppsRenderMode::IconOnly
+            SwitchAppsRenderMode::Preview
         );
         assert!(!config.switch_apps_show_window_count);
     }
 
     #[test]
-    fn test_switch_apps_render_mode_helpers_keep_icon_only_as_default_fallback() {
+    fn test_switch_apps_render_mode_helpers_keep_preview_enabled_when_requested() {
         assert!(!SwitchAppsRenderMode::IconOnly.uses_preview_cards());
         assert!(SwitchAppsRenderMode::Preview.uses_preview_cards());
     }

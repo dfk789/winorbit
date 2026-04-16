@@ -7,7 +7,7 @@ It keeps the lightweight same-app switching flow, adds an optional card-based `A
 ## Features
 
 - `Alt+\`` cycles windows for the current app.
-- Optional `Alt+Tab` app switcher with `icon_only` or live `preview` cards.
+- Optional `Alt+Tab` app switcher with live `preview` cards by default and `icon_only` fallback mode.
 - Inline same-app cycling inside the `Alt+Tab` overlay with deferred activation.
 - Adaptive multi-row layout with scalable cards.
 - Dot indicators for multi-window apps.
@@ -60,11 +60,11 @@ hotkey = alt+tab
 ignore_minimal = no
 
 # How to render app-switch entries.
-# icon_only = current compact icon strip behavior; recommended when preview cards
-#   are incompatible with an app or when you want the lightest overlay.
-# preview = show live preview cards when DWM thumbnails are available;
+# preview = default; show live preview cards when DWM thumbnails are available;
 #   entries that cannot provide a preview fall back to icons
-render_mode = icon_only
+# icon_only = fallback mode when preview cards are incompatible with an app
+#   or when you want the lightest overlay
+render_mode = preview
 
 # Whether to show per-window dot indicators for apps with more than one window.
 show_window_count = no
@@ -114,7 +114,15 @@ path =
 - Hold `Alt` and tap `Tab` to cycle apps in the overlay.
 - While the `Alt+Tab` overlay is open, press `Alt+\`` to cycle windows inside the selected app without foregrounding each candidate window immediately.
 - Release `Alt` to activate the currently selected app window.
-- `icon_only` remains the safest fallback mode when previews are incompatible with a specific app.
+- `preview` is the shipped default. `icon_only` remains the safest fallback mode when previews are incompatible with a specific app.
+
+## Credits
+
+WinOrbit is a substantial MIT-licensed continuation of the original
+[`sigoden/window-switcher`](https://github.com/sigoden/window-switcher)
+project by [sigoden](https://github.com/sigoden). This codebase keeps that
+upstream lineage visible while carrying its own Windows-first UI, switching,
+and overlay changes forward under the WinOrbit name.
 
 ## Building
 
