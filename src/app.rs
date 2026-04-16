@@ -463,6 +463,9 @@ impl App {
             index,
             render_mode: self.config.switch_apps_render_mode,
             show_window_count: self.config.switch_apps_show_window_count,
+            overlay_scale: self.config.switch_apps_overlay_scale,
+            backdrop_opacity: self.config.switch_apps_backdrop_opacity,
+            backdrop_color: self.config.switch_apps_backdrop_color,
         };
         self.switch_apps_state = Some(state);
         debug!("switch apps, new state:{:?}", self.switch_apps_state);

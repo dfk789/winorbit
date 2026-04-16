@@ -107,6 +107,9 @@ pub struct SwitchAppsState {
     pub index: usize,
     pub render_mode: SwitchAppsRenderMode,
     pub show_window_count: bool,
+    pub overlay_scale: u32,
+    pub backdrop_opacity: u32,
+    pub backdrop_color: Option<u32>,
 }
 
 impl SwitchAppsState {

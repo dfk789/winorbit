@@ -29,6 +29,9 @@ pub struct Config {
     pub switch_apps_render_mode: SwitchAppsRenderMode,
     pub switch_apps_show_window_count: bool,
     pub switch_apps_representative_window: RepresentativeWindowPolicy,
+    pub switch_apps_overlay_scale: u32,
+    pub switch_apps_backdrop_opacity: u32,
+    pub switch_apps_backdrop_color: Option<u32>,
     pub switch_apps_override_icons: IndexMap<String, String>,
     switch_apps_only_current_desktop: Option<bool>,
 }
@@ -55,6 +58,9 @@ impl Default for Config {
             switch_apps_render_mode: SwitchAppsRenderMode::default(),
             switch_apps_show_window_count: false,
             switch_apps_representative_window: RepresentativeWindowPolicy::default(),
+            switch_apps_overlay_scale: 100,
+            switch_apps_backdrop_opacity: 100,
+            switch_apps_backdrop_color: None,
             switch_apps_override_icons: Default::default(),
             switch_apps_only_current_desktop: None,
         }
@@ -138,6 +144,24 @@ impl Config {
                 .and_then(RepresentativeWindowPolicy::parse)
             {
                 conf.switch_apps_representative_window = v;
+            }
+            if let Some(v) = section
+                .get("overlay_scale")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                conf.switch_apps_overlay_scale = v.clamp(50, 200);
+            }
+            if let Some(v) = section
+                .get("backdrop_opacity")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                conf.switch_apps_backdrop_opacity = v.clamp(0, 100);
+            }
+            if let Some(v) = section
+                .get("backdrop_color")
+                .and_then(parse_hex_color)
+            {
+                conf.switch_apps_backdrop_color = Some(v);
             }
             if let Some(v) = section.get("override_icons").map(normalize_path_value) {
                 conf.switch_apps_override_icons = v
@@ -401,6 +425,14 @@ fn normalize_path_value(value: &str) -> String {
     value.replace("\\\\", "\\")
 }
 
+fn parse_hex_color(value: &str) -> Option<u32> {
+    let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if hex.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +525,124 @@ show_window_count = maybe
     fn test_switch_apps_render_mode_helpers_keep_icon_only_as_default_fallback() {
         assert!(!SwitchAppsRenderMode::IconOnly.uses_preview_cards());
         assert!(SwitchAppsRenderMode::Preview.uses_preview_cards());
+    }
+
+    #[test]
+    fn test_overlay_scale_defaults_to_100() {
+        let conf = Ini::load_from_str(DEFAULT_CONFIG).expect("default config should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(config.switch_apps_overlay_scale, 100);
+    }
+
+    #[test]
+    fn test_overlay_scale_clamps_to_valid_range() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+overlay_scale = 250
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_overlay_scale, 200);
+
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+overlay_scale = 10
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_overlay_scale, 50);
+    }
+
+    #[test]
+    fn test_overlay_scale_ignores_invalid_values() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+overlay_scale = big
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_overlay_scale, 100);
+    }
+
+    #[test]
+    fn test_backdrop_opacity_defaults_to_100() {
+        let conf = Ini::load_from_str(DEFAULT_CONFIG).expect("default config should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(config.switch_apps_backdrop_opacity, 100);
+    }
+
+    #[test]
+    fn test_backdrop_opacity_clamps_to_valid_range() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+backdrop_opacity = 150
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_backdrop_opacity, 100);
+    }
+
+    #[test]
+    fn test_backdrop_color_defaults_to_none() {
+        let conf = Ini::load_from_str(DEFAULT_CONFIG).expect("default config should parse");
+        let config = Config::load(&conf).expect("config should load");
+
+        assert_eq!(config.switch_apps_backdrop_color, None);
+    }
+
+    #[test]
+    fn test_backdrop_color_parses_hex_with_and_without_hash() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+backdrop_color = #2d2d2d
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_backdrop_color, Some(0x2d2d2d));
+
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+backdrop_color = ff8800
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_backdrop_color, Some(0xff8800));
+    }
+
+    #[test]
+    fn test_backdrop_color_rejects_invalid_values() {
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+backdrop_color = red
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_backdrop_color, None);
+
+        let conf = Ini::load_from_str(
+            r#"
+[switch-apps]
+backdrop_color = #fff
+"#,
+        )
+        .expect("config snippet should parse");
+        let config = Config::load(&conf).expect("config should load");
+        assert_eq!(config.switch_apps_backdrop_color, None);
     }
 }

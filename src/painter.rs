@@ -123,7 +123,8 @@ impl GdiAAPainter {
         let hwnd = self.hwnd;
         let hdc_screen = self.hdc_screen;
 
-        let palette = overlay_palette(is_light_theme());
+        let palette = overlay_palette(is_light_theme(), state.backdrop_color);
+        let backdrop_alpha = ((state.backdrop_opacity.clamp(0, 100) * 255) / 100) as u8;
 
         unsafe {
             let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
@@ -188,7 +189,7 @@ impl GdiAAPainter {
 
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as _,
-                SourceConstantAlpha: 255,
+                SourceConstantAlpha: backdrop_alpha,
                 AlphaFormat: AC_SRC_ALPHA as _,
                 ..Default::default()
             };
@@ -360,17 +361,18 @@ const fn theme_color(light_theme: bool) -> (u32, u32) {
     }
 }
 
-fn overlay_palette(light_theme: bool) -> OverlayPalette {
+fn overlay_palette(light_theme: bool, backdrop_color: Option<u32>) -> OverlayPalette {
     let (foreground, background) = theme_color(light_theme);
-    let card_background = blend_color(background, foreground, 1, 2);
+    let overlay_background = backdrop_color.unwrap_or(background);
+    let card_background = blend_color(overlay_background, foreground, 1, 2);
 
     OverlayPalette {
-        overlay_background: background,
+        overlay_background,
         card_background,
-        selected_card_background: blend_color(background, SELECTION_OUTLINE_COLOR, 1, 5),
+        selected_card_background: blend_color(overlay_background, SELECTION_OUTLINE_COLOR, 1, 5),
         selection_outline: SELECTION_OUTLINE_COLOR,
         unselected_badge_fill: foreground,
-        unselected_badge_text: background,
+        unselected_badge_text: overlay_background,
         selected_badge_fill: SELECTION_OUTLINE_COLOR,
         selected_badge_text: 0xffffff,
     }
@@ -443,7 +445,7 @@ fn draw_entries(
     let scaled_width = width * SCALE_FACTOR;
     let scaled_height = height * SCALE_FACTOR;
     let scaled_card_corner_radius = layout.card_corner_radius * SCALE_FACTOR;
-    let scaled_selected_outline_width = SELECTED_CARD_OUTLINE_WIDTH * SCALE_FACTOR;
+    let scaled_selected_outline_width = layout.selected_outline_width * SCALE_FACTOR;
 
     unsafe {
         let hdc_tmp = CreateCompatibleDC(Some(hdc_screen));
@@ -757,6 +759,7 @@ struct OverlayLayout {
     content_rect: RECT,
     overlay_corner_radius: i32,
     card_corner_radius: i32,
+    selected_outline_width: i32,
     entries: Vec<OverlayEntryLayout>,
 }
 
@@ -766,6 +769,7 @@ impl OverlayLayout {
         Self::new(
             state.render_mode,
             state.show_window_count,
+            state.overlay_scale,
             &window_counts,
             get_moinitor_rect(),
         )
@@ -774,6 +778,7 @@ impl OverlayLayout {
     fn new(
         render_mode: SwitchAppsRenderMode,
         show_window_count: bool,
+        overlay_scale: u32,
         window_counts: &[usize],
         monitor_rect: RECT,
     ) -> Self {
@@ -781,6 +786,12 @@ impl OverlayLayout {
         let monitor_width = monitor_rect.right - monitor_rect.left;
         let monitor_height = monitor_rect.bottom - monitor_rect.top;
         let outer_padding = WINDOW_BORDER_SIZE;
+        let scale = overlay_scale.clamp(50, 200);
+        let scaled_icon_size = (ICON_SIZE * scale as i32) / 100;
+        let scaled_icon_border = (ICON_BORDER_SIZE * scale as i32) / 100;
+        let scaled_preview_max_width = (PREVIEW_CARD_MAX_WIDTH * scale as i32) / 100;
+        let scaled_preview_gap = (PREVIEW_CARD_GAP * scale as i32) / 100;
+        let scaled_preview_padding = (PREVIEW_CARD_CONTENT_PADDING * scale as i32) / 100;
 
         if num_apps == 0 {
             return Self {
@@ -796,23 +807,24 @@ impl OverlayLayout {
                 },
                 overlay_corner_radius: 0,
                 card_corner_radius: 0,
+                selected_outline_width: 0,
                 entries: vec![],
             };
         }
 
         let gap = match render_mode {
             SwitchAppsRenderMode::IconOnly => 0,
-            SwitchAppsRenderMode::Preview => PREVIEW_CARD_GAP,
+            SwitchAppsRenderMode::Preview => scaled_preview_gap,
         };
         let available_width =
             (monitor_width - outer_padding * 2 - gap * (num_apps as i32 - 1)).max(num_apps as i32);
         let card_width = match render_mode {
             SwitchAppsRenderMode::IconOnly => {
-                ((available_width / num_apps as i32) - ICON_BORDER_SIZE * 2).min(ICON_SIZE)
-                    + ICON_BORDER_SIZE * 2
+                ((available_width / num_apps as i32) - scaled_icon_border * 2).min(scaled_icon_size)
+                    + scaled_icon_border * 2
             }
             SwitchAppsRenderMode::Preview => {
-                (available_width / num_apps as i32).min(PREVIEW_CARD_MAX_WIDTH)
+                (available_width / num_apps as i32).min(scaled_preview_max_width)
             }
         };
         let card_height = match render_mode {
@@ -844,13 +856,13 @@ impl OverlayLayout {
                     bottom: top + card_height,
                 };
                 let preview_padding = match render_mode {
-                    SwitchAppsRenderMode::IconOnly => ICON_BORDER_SIZE,
-                    SwitchAppsRenderMode::Preview => PREVIEW_CARD_CONTENT_PADDING
+                    SwitchAppsRenderMode::IconOnly => scaled_icon_border,
+                    SwitchAppsRenderMode::Preview => scaled_preview_padding
                         .min((card_width - 1).max(0) / 2)
                         .min((card_height - 1).max(0) / 2),
                 };
                 let preview_rect = inset_rect(card_rect, preview_padding);
-                let icon_size = ICON_SIZE
+                let icon_size = scaled_icon_size
                     .min(rect_width(&preview_rect))
                     .min(rect_height(&preview_rect));
                 let badge = badge_layout(
@@ -883,6 +895,7 @@ impl OverlayLayout {
                 SwitchAppsRenderMode::IconOnly => card_height / 4,
                 SwitchAppsRenderMode::Preview => (card_height / 8).max(8),
             },
+            selected_outline_width: ((SELECTED_CARD_OUTLINE_WIDTH * scale as i32) / 100).max(1),
             entries,
         }
     }
@@ -1065,6 +1078,7 @@ mod tests {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::IconOnly,
             false,
+            100,
             &[1, 1, 1],
             fake_monitor_rect(1920, 1080),
         );
@@ -1096,6 +1110,7 @@ mod tests {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::Preview,
             false,
+            100,
             &[1, 1, 1],
             fake_monitor_rect(1920, 1080),
         );
@@ -1131,6 +1146,7 @@ mod tests {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::Preview,
             false,
+            100,
             &[1, 1, 1],
             fake_monitor_rect(1920, 1080),
         );
@@ -1158,12 +1174,14 @@ mod tests {
         let icon_layout = OverlayLayout::new(
             SwitchAppsRenderMode::IconOnly,
             false,
+            100,
             &[1, 1, 1, 1, 1],
             fake_monitor_rect(1920, 1080),
         );
         let preview_layout = OverlayLayout::new(
             SwitchAppsRenderMode::Preview,
             false,
+            100,
             &[1, 1, 1, 1, 1],
             fake_monitor_rect(1920, 1080),
         );
@@ -1281,6 +1299,7 @@ mod tests {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::Preview,
             true,
+            100,
             &[3, 1, 24],
             fake_monitor_rect(1920, 1080),
         );
@@ -1335,7 +1354,7 @@ mod tests {
 
     #[test]
     fn overlay_palette_makes_selected_cards_distinct_in_dark_theme() {
-        let palette = overlay_palette(false);
+        let palette = overlay_palette(false, None);
 
         assert_ne!(palette.selected_card_background, palette.card_background);
         assert_ne!(palette.selection_outline, palette.card_background);
@@ -1344,7 +1363,7 @@ mod tests {
 
     #[test]
     fn overlay_palette_makes_selected_cards_distinct_in_light_theme() {
-        let palette = overlay_palette(true);
+        let palette = overlay_palette(true, None);
 
         assert_ne!(palette.selected_card_background, palette.card_background);
         assert_ne!(palette.selection_outline, palette.overlay_background);
@@ -1356,6 +1375,7 @@ mod tests {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::IconOnly,
             false,
+            100,
             &[1, 1, 1, 1, 1, 1],
             fake_monitor_rect(1920, 1080),
         );
@@ -1380,6 +1400,7 @@ mod tests {
         let layout = OverlayLayout::new(
             SwitchAppsRenderMode::IconOnly,
             false,
+            100,
             &[1, 1, 1, 1],
             fake_monitor_rect(1280, 720),
         );
@@ -1388,5 +1409,88 @@ mod tests {
         assert_eq!(layout.y, (720 - layout.height) / 2);
         assert!(layout.width < 1280);
         assert!(layout.height < 720);
+    }
+
+    #[test]
+    fn overlay_scale_increases_card_size_for_icon_mode() {
+        let default_layout = OverlayLayout::new(
+            SwitchAppsRenderMode::IconOnly,
+            false,
+            100,
+            &[1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+        let scaled_layout = OverlayLayout::new(
+            SwitchAppsRenderMode::IconOnly,
+            false,
+            150,
+            &[1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        let default_card_width =
+            default_layout.entries[0].card_rect.right - default_layout.entries[0].card_rect.left;
+        let scaled_card_width =
+            scaled_layout.entries[0].card_rect.right - scaled_layout.entries[0].card_rect.left;
+
+        assert!(scaled_card_width > default_card_width);
+        assert!(scaled_layout.width <= 1920);
+    }
+
+    #[test]
+    fn overlay_scale_increases_card_size_for_preview_mode() {
+        let default_layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+        let scaled_layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            150,
+            &[1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        let default_card_width =
+            default_layout.entries[0].card_rect.right - default_layout.entries[0].card_rect.left;
+        let scaled_card_width =
+            scaled_layout.entries[0].card_rect.right - scaled_layout.entries[0].card_rect.left;
+
+        assert!(scaled_card_width > default_card_width);
+        assert!(scaled_layout.width <= 1920);
+    }
+
+    #[test]
+    fn overlay_scale_drives_selection_outline_width() {
+        let default_layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            100,
+            &[1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+        let scaled_layout = OverlayLayout::new(
+            SwitchAppsRenderMode::Preview,
+            false,
+            200,
+            &[1, 1, 1],
+            fake_monitor_rect(1920, 1080),
+        );
+
+        assert!(scaled_layout.selected_outline_width >= default_layout.selected_outline_width);
+        assert!(default_layout.selected_outline_width >= 1);
+    }
+
+    #[test]
+    fn overlay_palette_uses_custom_backdrop_color() {
+        let custom = overlay_palette(false, Some(0x112233));
+        let default = overlay_palette(false, None);
+
+        assert_eq!(custom.overlay_background, 0x112233);
+        assert_ne!(custom.overlay_background, default.overlay_background);
+        assert_ne!(custom.card_background, default.card_background);
     }
 }
