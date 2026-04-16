@@ -100,6 +100,13 @@ impl AppSwitchEntry {
     pub fn preview_hwnd(&self) -> HWND {
         self.representative_hwnd
     }
+
+    pub fn hwnd_for_window_index(&self, window_index: usize) -> HWND {
+        self.windows
+            .get(window_index)
+            .map(|window| window.hwnd)
+            .unwrap_or(self.representative_hwnd)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,12 +129,17 @@ impl SwitchAppsState {
     }
 
     pub fn selected_hwnd(&self) -> Option<HWND> {
-        self.selected_app().map(|app| {
-            app.windows
-                .get(self.window_index)
-                .map(|w| w.hwnd)
-                .unwrap_or(app.representative_hwnd)
-        })
+        self.selected_app()
+            .map(|app| app.hwnd_for_window_index(self.window_index))
+    }
+
+    pub fn preview_hwnd_for_app(&self, app_index: usize) -> Option<HWND> {
+        let app = self.apps.get(app_index)?;
+        if app_index == self.index {
+            Some(app.hwnd_for_window_index(self.window_index))
+        } else {
+            Some(app.representative_hwnd)
+        }
     }
 
     pub fn cycle_window(&mut self, reverse: bool) {
@@ -442,6 +454,41 @@ mod tests {
         state.window_index = 99;
         assert_eq!(
             state.selected_hwnd(),
+            Some(state.apps[0].representative_hwnd)
+        );
+    }
+
+    #[test]
+    fn preview_hwnd_for_selected_app_follows_window_index() {
+        let mut state = make_test_state(&[3, 2]);
+        let selected_preview = state.apps[0].windows[0].hwnd;
+        let cycled_preview = state.apps[0].windows[2].hwnd;
+
+        assert_eq!(state.preview_hwnd_for_app(0), Some(selected_preview));
+
+        state.cycle_window(false);
+        state.cycle_window(false);
+
+        assert_eq!(state.preview_hwnd_for_app(0), Some(cycled_preview));
+    }
+
+    #[test]
+    fn preview_hwnd_for_other_apps_stays_on_representative_window() {
+        let mut state = make_test_state(&[2, 3]);
+        let other_representative = state.apps[1].representative_hwnd;
+
+        state.cycle_window(false);
+
+        assert_eq!(state.preview_hwnd_for_app(1), Some(other_representative));
+    }
+
+    #[test]
+    fn preview_hwnd_for_selected_app_falls_back_to_representative_when_stale() {
+        let mut state = make_test_state(&[2, 1]);
+        state.window_index = 99;
+
+        assert_eq!(
+            state.preview_hwnd_for_app(0),
             Some(state.apps[0].representative_hwnd)
         );
     }

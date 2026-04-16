@@ -1,5 +1,5 @@
 use crate::config::SwitchAppsRenderMode;
-use crate::preview::AppPreview;
+use crate::preview::{resolve_preview, AppPreview, PreviewWindowState};
 use crate::switch_apps::SwitchAppsState;
 use crate::utils::{check_error, get_moinitor_rect, is_light_theme, is_win11};
 
@@ -14,19 +14,17 @@ use windows::Win32::{
             DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
         },
         Gdi::{
-            CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush,
-            DeleteDC, DeleteObject, FillRect, FillRgn, GetDC, ReleaseDC, SelectObject,
-            SetStretchBltMode, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HALFTONE,
-            HBITMAP, HDC, HPALETTE, SRCCOPY,
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+            SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC,
         },
         GdiPlus::{
-            FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateBitmapFromHBITMAP,
-            GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipDeleteBrush, GdipDeleteGraphics,
-            GdipDeletePath, GdipDeletePen, GdipDisposeImage, GdipDrawImageRect, GdipFillPath,
-            GdipFillRectangle, GdipGetPenBrushFill, GdipSetInterpolationMode, GdipSetSmoothingMode,
-            GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpGraphics,
-            GpImage, GpPath, GpPen, InterpolationModeHighQualityBicubic, SmoothingModeAntiAlias,
-            Unit,
+            FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC,
+            GdipCreatePath, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics,
+            GdipDeletePath, GdipFillEllipseI, GdipFillPath, GdipFillRectangle,
+            GdipSetInterpolationMode, GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup,
+            GdiplusStartupInput, GpBrush, GpGraphics, GpPath, GpSolidFill,
+            InterpolationModeHighQualityBicubic, SmoothingModeAntiAlias,
         },
     },
     UI::{
@@ -47,7 +45,6 @@ pub const SELECTION_OUTLINE_COLOR: u32 = 0xd77800;
 pub const ICON_SIZE: i32 = 64;
 pub const WINDOW_BORDER_SIZE: i32 = 10;
 pub const ICON_BORDER_SIZE: i32 = 4;
-pub const SCALE_FACTOR: i32 = 6;
 pub const SELECTED_CARD_OUTLINE_WIDTH: i32 = 2;
 pub const PREVIEW_CARD_GAP: i32 = 12;
 pub const PREVIEW_CARD_MAX_WIDTH: i32 = 220;
@@ -114,11 +111,18 @@ impl GdiAAPainter {
         let hdc_screen = self.hdc_screen;
 
         let palette = overlay_palette(is_light_theme(), state.backdrop_color);
-        let backdrop_alpha = ((state.backdrop_opacity.clamp(0, 100) * 255) / 100) as u8;
+        let backdrop_alpha = backdrop_alpha(state.backdrop_opacity);
 
         unsafe {
             let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
-            let bitmap_mem = CreateCompatibleBitmap(hdc_screen, layout.width, layout.height);
+            let bitmap_mem = match create_argb_bitmap(hdc_screen, layout.width, layout.height) {
+                Ok(bitmap) => bitmap,
+                Err(err) => {
+                    error!("failed to create layered overlay bitmap: {err}");
+                    let _ = DeleteDC(hdc_mem);
+                    return;
+                }
+            };
             SelectObject(hdc_mem, bitmap_mem.into());
 
             let mut graphics = GpGraphics::default();
@@ -127,18 +131,8 @@ impl GdiAAPainter {
             GdipSetSmoothingMode(graphics_ptr, SmoothingModeAntiAlias);
             GdipSetInterpolationMode(graphics_ptr, InterpolationModeHighQualityBicubic);
 
-            let mut bg_pen = GpPen::default();
-            let mut bg_pen_ptr: *mut GpPen = &mut bg_pen;
-            GdipCreatePen1(
-                ALPHA_MASK | palette.overlay_background,
-                0.0,
-                Unit(0),
-                &mut bg_pen_ptr as _,
-            );
-
-            let mut bg_brush = GpBrush::default();
-            let mut bg_brush_ptr: *mut GpBrush = &mut bg_brush;
-            GdipGetPenBrushFill(bg_pen_ptr, &mut bg_brush_ptr as _);
+            let bg_brush_ptr =
+                create_solid_brush(argb_color(backdrop_alpha, palette.overlay_background));
 
             if self.rounded_corner {
                 draw_round_rect(
@@ -161,25 +155,13 @@ impl GdiAAPainter {
                 );
             }
 
-            let bitmap_entries = draw_entries(state, &layout, &live_previews, hdc_screen, &palette);
-
-            let mut bitmap = GpBitmap::default();
-            let mut bitmap_ptr: *mut GpBitmap = &mut bitmap as _;
-            GdipCreateBitmapFromHBITMAP(bitmap_entries, HPALETTE::default(), &mut bitmap_ptr as _);
-
-            let image_ptr: *mut GpImage = bitmap_ptr as *mut GpImage;
-            GdipDrawImageRect(
-                graphics_ptr,
-                image_ptr,
-                layout.content_rect.left as f32,
-                layout.content_rect.top as f32,
-                rect_width(&layout.content_rect) as f32,
-                rect_height(&layout.content_rect) as f32,
-            );
+            draw_card_backgrounds(graphics_ptr, state, &layout, &palette);
+            draw_fallback_icons(hdc_mem, state, &layout, &live_previews);
+            draw_dot_indicators(graphics_ptr, state, &layout, &palette);
 
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as _,
-                SourceConstantAlpha: backdrop_alpha,
+                SourceConstantAlpha: 255,
                 AlphaFormat: AC_SRC_ALPHA as _,
                 ..Default::default()
             };
@@ -201,12 +183,9 @@ impl GdiAAPainter {
                 ULW_ALPHA,
             );
 
-            GdipDisposeImage(image_ptr);
             GdipDeleteBrush(bg_brush_ptr);
-            GdipDeletePen(bg_pen_ptr);
             GdipDeleteGraphics(graphics_ptr);
 
-            let _ = DeleteObject(bitmap_entries.into());
             let _ = DeleteObject(bitmap_mem.into());
             let _ = DeleteDC(hdc_mem);
         }
@@ -243,8 +222,9 @@ impl GdiAAPainter {
         let mut keep_keys = HashSet::new();
         let mut failed_keys = HashSet::new();
 
-        for (index, app) in state.apps.iter().enumerate() {
-            let AppPreview::DwmThumbnail(preview) = app.preview else {
+        for (index, live_preview) in live_previews.iter_mut().enumerate() {
+            let Some(AppPreview::DwmThumbnail(preview)) = effective_app_preview(state, index)
+            else {
                 continue;
             };
 
@@ -303,7 +283,7 @@ impl GdiAAPainter {
                 continue;
             }
 
-            live_previews[index] = true;
+            *live_preview = true;
         }
 
         self.preview_thumbnails
@@ -368,6 +348,64 @@ fn overlay_palette(light_theme: bool, backdrop_color: Option<u32>) -> OverlayPal
     }
 }
 
+fn backdrop_alpha(opacity: u32) -> u8 {
+    ((opacity.clamp(0, 100) * 255) / 100) as u8
+}
+
+const fn argb_color(alpha: u8, rgb: u32) -> u32 {
+    ((alpha as u32) << 24) | rgb
+}
+
+unsafe fn create_solid_brush(color: u32) -> *mut GpBrush {
+    let mut brush = std::ptr::null_mut::<GpSolidFill>();
+    unsafe {
+        GdipCreateSolidFill(color, &mut brush);
+    }
+    brush as *mut GpBrush
+}
+
+fn effective_app_preview(state: &SwitchAppsState, app_index: usize) -> Option<AppPreview> {
+    let app = state.apps.get(app_index)?;
+    let preview_hwnd = state.preview_hwnd_for_app(app_index)?;
+    if preview_hwnd == app.representative_hwnd {
+        Some(app.preview)
+    } else {
+        Some(resolve_preview(
+            state.render_mode,
+            preview_hwnd,
+            PreviewWindowState::probe(preview_hwnd),
+        ))
+    }
+}
+
+fn create_argb_bitmap(hdc_screen: HDC, width: i32, height: i32) -> Result<HBITMAP> {
+    let bitmap_info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut bits = std::ptr::null_mut();
+    unsafe {
+        CreateDIBSection(
+            Some(hdc_screen),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+    }
+    .with_context(|| format!("failed to create {width}x{height} ARGB DIB section"))
+}
+
 unsafe fn draw_round_rect(
     graphic_ptr: *mut GpGraphics,
     brush_ptr: *mut GpBrush,
@@ -423,107 +461,68 @@ unsafe fn draw_round_rect(
     }
 }
 
-fn draw_entries(
+fn draw_card_backgrounds(
+    graphics_ptr: *mut GpGraphics,
     state: &SwitchAppsState,
     layout: &OverlayLayout,
-    live_previews: &[bool],
-    hdc_screen: HDC,
     palette: &OverlayPalette,
-) -> HBITMAP {
-    let width = rect_width(&layout.content_rect);
-    let height = rect_height(&layout.content_rect);
-    let scaled_width = width * SCALE_FACTOR;
-    let scaled_height = height * SCALE_FACTOR;
-    let scaled_card_corner_radius = layout.card_corner_radius * SCALE_FACTOR;
-    let scaled_selected_outline_width = layout.selected_outline_width * SCALE_FACTOR;
-
+) {
     unsafe {
-        let hdc_tmp = CreateCompatibleDC(Some(hdc_screen));
-        let bitmap_tmp = CreateCompatibleBitmap(hdc_screen, width, height);
-        SelectObject(hdc_tmp, bitmap_tmp.into());
-
-        let hdc_scaled = CreateCompatibleDC(Some(hdc_screen));
-        let bitmap_scaled = CreateCompatibleBitmap(hdc_screen, scaled_width, scaled_height);
-        SelectObject(hdc_scaled, bitmap_scaled.into());
-
-        let background_brush = CreateSolidBrush(COLORREF(palette.overlay_background));
-        let card_brush = CreateSolidBrush(COLORREF(palette.card_background));
-        let selected_card_brush = CreateSolidBrush(COLORREF(palette.selected_card_background));
-        let selection_outline_brush = CreateSolidBrush(COLORREF(palette.selection_outline));
-        let unselected_badge_brush = CreateSolidBrush(COLORREF(palette.unselected_badge_fill));
-        let selected_badge_brush = CreateSolidBrush(COLORREF(palette.selected_badge_fill));
-
-        let rect = RECT {
-            left: 0,
-            top: 0,
-            right: scaled_width,
-            bottom: scaled_height,
-        };
-
-        FillRect(hdc_scaled, &rect, background_brush);
+        let card_brush = create_solid_brush(ALPHA_MASK | palette.card_background);
+        let selected_card_brush = create_solid_brush(ALPHA_MASK | palette.selected_card_background);
+        let selection_outline_brush = create_solid_brush(ALPHA_MASK | palette.selection_outline);
 
         if state.render_mode.uses_preview_cards() {
-            for (i, _) in state.apps.iter().enumerate() {
-                let entry = &layout.entries[i];
-                let card_rect = scale_rect(
-                    offset_rect(
-                        entry.card_rect,
-                        -layout.content_rect.left,
-                        -layout.content_rect.top,
-                    ),
-                    SCALE_FACTOR,
-                );
+            for (i, entry) in layout.entries.iter().enumerate() {
                 if i == state.index {
                     fill_selected_card(
-                        hdc_scaled,
-                        &card_rect,
-                        scaled_card_corner_radius,
-                        scaled_selected_outline_width,
+                        graphics_ptr,
+                        &entry.card_rect,
+                        layout.card_corner_radius,
+                        layout.selected_outline_width,
                         selection_outline_brush,
                         selected_card_brush,
                     );
                 } else {
-                    fill_round_rect_region(
-                        hdc_scaled,
+                    fill_round_rect(
+                        graphics_ptr,
                         card_brush,
-                        &card_rect,
-                        scaled_card_corner_radius,
+                        &entry.card_rect,
+                        layout.card_corner_radius,
                     );
                 }
             }
         } else if let Some(entry) = layout.entries.get(state.index) {
-            let card_rect = scale_rect(
-                offset_rect(
-                    entry.card_rect,
-                    -layout.content_rect.left,
-                    -layout.content_rect.top,
-                ),
-                SCALE_FACTOR,
-            );
             fill_selected_card(
-                hdc_scaled,
-                &card_rect,
-                scaled_card_corner_radius,
-                scaled_selected_outline_width,
+                graphics_ptr,
+                &entry.card_rect,
+                layout.card_corner_radius,
+                layout.selected_outline_width,
                 selection_outline_brush,
                 selected_card_brush,
             );
         }
 
+        GdipDeleteBrush(card_brush);
+        GdipDeleteBrush(selected_card_brush);
+        GdipDeleteBrush(selection_outline_brush);
+    }
+}
+
+fn draw_fallback_icons(
+    hdc: HDC,
+    state: &SwitchAppsState,
+    layout: &OverlayLayout,
+    live_previews: &[bool],
+) {
+    unsafe {
         for (i, app) in state.apps.iter().enumerate() {
             if live_previews.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let icon_rect = scale_rect(
-                offset_rect(
-                    layout.entries[i].icon_rect,
-                    -layout.content_rect.left,
-                    -layout.content_rect.top,
-                ),
-                SCALE_FACTOR,
-            );
+            let icon_rect = layout.entries[i].icon_rect;
             let _ = DrawIconEx(
-                hdc_scaled,
+                hdc,
                 icon_rect.left,
                 icon_rect.top,
                 app.icon,
@@ -534,66 +533,49 @@ fn draw_entries(
                 DI_NORMAL,
             );
         }
-
-        SetStretchBltMode(hdc_tmp, HALFTONE);
-        let _ = StretchBlt(
-            hdc_tmp,
-            0,
-            0,
-            width,
-            height,
-            Some(hdc_scaled),
-            0,
-            0,
-            scaled_width,
-            scaled_height,
-            SRCCOPY,
-        );
-
-        draw_dot_indicators(
-            state,
-            layout,
-            hdc_tmp,
-            palette,
-            unselected_badge_brush,
-            selected_badge_brush,
-        );
-
-        let _ = DeleteObject(background_brush.into());
-        let _ = DeleteObject(card_brush.into());
-        let _ = DeleteObject(selected_card_brush.into());
-        let _ = DeleteObject(selection_outline_brush.into());
-        let _ = DeleteObject(unselected_badge_brush.into());
-        let _ = DeleteObject(selected_badge_brush.into());
-        let _ = DeleteObject(bitmap_scaled.into());
-        let _ = DeleteDC(hdc_scaled);
-        let _ = DeleteDC(hdc_tmp);
-
-        bitmap_tmp
     }
 }
 
 fn fill_selected_card(
-    hdc: HDC,
+    graphics_ptr: *mut GpGraphics,
     card_rect: &RECT,
     corner_radius: i32,
     outline_width: i32,
-    outline_brush: windows::Win32::Graphics::Gdi::HBRUSH,
-    fill_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    outline_brush: *mut GpBrush,
+    fill_brush: *mut GpBrush,
 ) {
-    fill_round_rect_region(hdc, outline_brush, card_rect, corner_radius);
+    fill_round_rect(graphics_ptr, outline_brush, card_rect, corner_radius);
 
     let inner_rect = inset_rect(*card_rect, outline_width);
     if rect_width(&inner_rect) <= 0 || rect_height(&inner_rect) <= 0 {
         return;
     }
 
-    fill_round_rect_region(
-        hdc,
+    fill_round_rect(
+        graphics_ptr,
         fill_brush,
         &inner_rect,
         (corner_radius - outline_width).max(0),
     );
+}
+
+fn fill_round_rect(
+    graphics_ptr: *mut GpGraphics,
+    brush_ptr: *mut GpBrush,
+    rect: &RECT,
+    corner_radius: i32,
+) {
+    unsafe {
+        draw_round_rect(
+            graphics_ptr,
+            brush_ptr,
+            rect.left as f32,
+            rect.top as f32,
+            rect.right as f32,
+            rect.bottom as f32,
+            corner_radius as f32,
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -659,47 +641,46 @@ impl Drop for RegisteredThumbnail {
 }
 
 fn draw_dot_indicators(
+    graphics_ptr: *mut GpGraphics,
     state: &SwitchAppsState,
     layout: &OverlayLayout,
-    hdc: HDC,
-    _palette: &OverlayPalette,
-    inactive_brush: windows::Win32::Graphics::Gdi::HBRUSH,
-    active_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    palette: &OverlayPalette,
 ) {
     if !state.show_window_count {
         return;
     }
 
-    let active_window_index = if state.show_window_count {
-        state.window_index
-    } else {
-        0
-    };
+    let active_window_index = state.window_index;
 
-    for (app_index, entry) in layout.entries.iter().enumerate() {
-        let Some(dots) = &entry.dots else {
-            continue;
-        };
+    unsafe {
+        let inactive_brush = create_solid_brush(ALPHA_MASK | palette.unselected_badge_fill);
+        let active_brush = create_solid_brush(ALPHA_MASK | palette.selected_badge_fill);
 
-        let content_offset_x = layout.content_rect.left;
-        let content_offset_y = layout.content_rect.top;
-
-        for (dot_idx, &(cx, cy)) in dots.centers.iter().enumerate() {
-            let is_active = app_index == state.index && dot_idx == active_window_index;
-            let brush = if is_active {
-                active_brush
-            } else {
-                inactive_brush
+        for (app_index, entry) in layout.entries.iter().enumerate() {
+            let Some(dots) = &entry.dots else {
+                continue;
             };
-            let r = dots.radius;
-            let dot_rect = RECT {
-                left: cx - r - content_offset_x,
-                top: cy - r - content_offset_y,
-                right: cx + r - content_offset_x,
-                bottom: cy + r - content_offset_y,
-            };
-            fill_round_rect_region(hdc, brush, &dot_rect, r * 2);
+
+            for (dot_idx, &(cx, cy)) in dots.centers.iter().enumerate() {
+                let brush = if app_index == state.index && dot_idx == active_window_index {
+                    active_brush
+                } else {
+                    inactive_brush
+                };
+                let diameter = dots.radius * 2;
+                GdipFillEllipseI(
+                    graphics_ptr,
+                    brush,
+                    cx - dots.radius,
+                    cy - dots.radius,
+                    diameter,
+                    diameter,
+                );
+            }
         }
+
+        GdipDeleteBrush(inactive_brush);
+        GdipDeleteBrush(active_brush);
     }
 }
 
@@ -725,6 +706,7 @@ struct OverlayLayout {
     y: i32,
     width: i32,
     height: i32,
+    #[allow(dead_code)]
     content_rect: RECT,
     overlay_corner_radius: i32,
     card_corner_radius: i32,
@@ -881,19 +863,6 @@ impl OverlayLayout {
     }
 }
 
-fn fill_round_rect_region(
-    hdc: HDC,
-    brush: windows::Win32::Graphics::Gdi::HBRUSH,
-    rect: &RECT,
-    radius: i32,
-) {
-    unsafe {
-        let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right, rect.bottom, radius, radius);
-        let _ = FillRgn(hdc, rgn, brush);
-        let _ = DeleteObject(rgn.into());
-    }
-}
-
 fn centered_rect(rect: RECT, width: i32, height: i32) -> RECT {
     let left = rect.left + (rect_width(&rect) - width) / 2;
     let top = rect.top + (rect_height(&rect) - height) / 2;
@@ -941,24 +910,6 @@ fn dot_indicator_layout(
         centers,
         radius: DOT_RADIUS,
     })
-}
-
-fn offset_rect(rect: RECT, dx: i32, dy: i32) -> RECT {
-    RECT {
-        left: rect.left + dx,
-        top: rect.top + dy,
-        right: rect.right + dx,
-        bottom: rect.bottom + dy,
-    }
-}
-
-fn scale_rect(rect: RECT, scale: i32) -> RECT {
-    RECT {
-        left: rect.left * scale,
-        top: rect.top * scale,
-        right: rect.right * scale,
-        bottom: rect.bottom * scale,
-    }
 }
 
 fn rect_width(rect: &RECT) -> i32 {
@@ -1022,8 +973,9 @@ fn blend_color(start: u32, end: u32, numerator: u32, denominator: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        dot_indicator_layout, fit_preview_destination, hit_test_app_index, overlay_palette,
-        rect_height, rect_width, OverlayLayout, SwitchAppsRenderMode, WINDOW_BORDER_SIZE,
+        argb_color, backdrop_alpha, dot_indicator_layout, fit_preview_destination,
+        hit_test_app_index, overlay_palette, rect_height, rect_width, OverlayLayout,
+        SwitchAppsRenderMode, WINDOW_BORDER_SIZE,
     };
     use windows::Win32::Foundation::{RECT, SIZE};
 
@@ -1034,6 +986,20 @@ mod tests {
             right: width,
             bottom: height,
         }
+    }
+
+    #[test]
+    fn backdrop_alpha_clamps_percentages_to_byte_range() {
+        assert_eq!(backdrop_alpha(0), 0);
+        assert_eq!(backdrop_alpha(50), 127);
+        assert_eq!(backdrop_alpha(100), 255);
+        assert_eq!(backdrop_alpha(250), 255);
+    }
+
+    #[test]
+    fn argb_color_only_changes_alpha_channel() {
+        assert_eq!(argb_color(0x80, 0x112233), 0x80112233);
+        assert_eq!(argb_color(0xff, 0x445566), 0xff445566);
     }
 
     #[test]
