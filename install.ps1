@@ -1,6 +1,13 @@
-$command = "window-switcher"
-$repo = "sigoden/$command"
-$url = "https://github.com/$repo"
+param(
+    [string]$Repo = "YOUR_GITHUB_USER/winorbit"
+)
+
+$command = "winorbit"
+$url = "https://github.com/$Repo"
+
+if ($Repo -like "YOUR_GITHUB_USER/*") {
+    Write-Warning "Set -Repo to your published GitHub repository first, for example 'your-user/winorbit'."
+}
 
 if ($env:OS -like "Windows*") {
     $os = "windows"
@@ -22,12 +29,15 @@ if ($env:PROCESSOR_ARCHITECTURE -eq "x86") {
 
 $target = "$os-$arch"
 
-$tag = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" | select -Expand tag_name
+try {
+    $tag = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" | Select-Object -Expand tag_name
+} catch {
+    Write-Error "Failed to query releases for $Repo. Check the repository name and make sure releases are published."
+    exit 1
+}
 
 $dest = "C:\Users\$env:USERNAME\AppData\Local\Programs\$command"
-
 $archive = "$url/releases/download/$tag/$command-$tag-$target.zip"
-
 $outfile = "$dest\$command.exe"
 
 Write-Host "Repository:  $url"
@@ -42,7 +52,7 @@ $temp = New-TemporaryFile
 try {
     Invoke-WebRequest -Uri $archive -OutFile $temp -UseBasicParsing -ErrorAction Stop | Out-Null
 } catch {
-    Write-Error "Download failed. Please check your internet connection and try again."
+    Write-Error "Download failed. Please check the release archive name and your internet connection."
     exit 1
 }
 
@@ -79,10 +89,10 @@ Write-Host ""
 Write-Host "Installation successful!"
 
 if ($Host.UI.RawUI.KeyAvailable) {
-    $ans = Read-Host -Prompt "Run window-switcher.exe? (y/n)"
+    $ans = Read-Host -Prompt "Run winorbit.exe? (y/n)"
     if ($ans -eq "y") {
         & $outfile
-        Write-Host "Run window-switcher.exe successful!"
+        Write-Host "Run winorbit.exe successful!"
         exit
     }
 }

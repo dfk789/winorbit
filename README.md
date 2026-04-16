@@ -1,41 +1,35 @@
-# Window Switcher
+# WinOrbit
 
-Window-Switcher offers hotkeys for quickly switching windows on Windows OS:
+WinOrbit is a fast, Windows-focused app switcher that sharpens both `Alt+\`` and `Alt+Tab`.
 
-1. ```Alt+`(Backtick)```: switch between windows of the same app.
+It keeps the lightweight same-app switching flow, adds an optional card-based `Alt+Tab` overlay, and supports inline cycling through windows of the selected app before you commit on `Alt` release.
 
-![switch-windows](https://github.com/sigoden/window-switcher/assets/4012553/06d387ce-31fd-450b-adf3-01bfcfc4bce3)
+## Features
 
-2. ```Alt+Tab```: switch between apps. (disabled by default)
-
-![switch-apps](https://github.com/sigoden/window-switcher/assets/4012553/0c74a7ca-3a48-4458-8d2d-b40dc041f067)
-
-**💡 Hold down the `Alt` key and tap the ``` `(Backtick)/Tab ``` key to cycle through windows/apps, Press ```Alt + `(Backtick)/Tab``` and release both keys to switch to the last active window/app.**
-
-**💡 While the `Alt+Tab` overlay is open, press `` Alt+` `` to cycle through windows of the selected app without dismissing the overlay. Release `Alt` to activate the chosen window.**
+- `Alt+\`` cycles windows for the current app.
+- Optional `Alt+Tab` app switcher with `icon_only` or live `preview` cards.
+- Inline same-app cycling inside the `Alt+Tab` overlay with deferred activation.
+- Adaptive multi-row layout with scalable cards.
+- Dot indicators for multi-window apps.
+- Configurable backdrop opacity, backdrop color, representative window policy, and icon overrides.
+- Works in standard-user mode and can optionally handle elevated windows when run as administrator.
 
 ## Installation
 
-1. **Download:** Visit the [Github Release](https://github.com/sigoden/windows-switcher/releases) and download the `windows-switcher.zip` file.
-2. **Extract:** Unzip the downloaded file and extract the `window-switcher.exe` to your preferred location.
-3. **Launch:** `window-switcher.exe` is a standalone executable, no installation is required, just double-click the file to run it.
+1. Download the latest release archive from this repository's Releases page.
+2. Extract `winorbit.exe` and place it wherever you want to run it from.
+3. Put `winorbit.ini` next to `winorbit.exe`.
+4. Launch `winorbit.exe`.
 
-For the tech-savvy, here's a one-liner to automate the installation:
-```ps1
-iwr -useb https://raw.githubusercontent.com/sigoden/window-switcher/main/install.ps1 | iex
-```
+An optional PowerShell installer script is included as [install.ps1](install.ps1). Before using it against published releases, set the repository owner with `-Repo your-user/winorbit`.
 
 ## Configuration
 
-Window-Switcher offers various customization options to tailor its behavior to your preferences. You can define custom keyboard shortcuts, enable or disable specific features, and fine-tune settings through a configuration file.
-
-To personalize Window-Switcher, you'll need a configuration file named `window-switcher.ini`. This file should be placed in the same directory as the `window-switcher.exe` file. Once you've made changes to the configuration, make sure to restart Window-Switcher so your new settings can take effect.
-
-Here is the default configuration:
+WinOrbit reads `winorbit.ini` from the same directory as `winorbit.exe`.
 
 ```ini
 # Whether to show trayicon, yes/no
-trayicon = yes 
+trayicon = yes
 
 [switch-windows]
 
@@ -49,13 +43,15 @@ blacklist =
 # Ignore minimal windows
 ignore_minimal = no
 
-# Only switch within the current virtual desktops: yes/no/auto
+# Switch to windows from only the current virtual desktops instead of all desktops.
+# Defaults to match the Alt-Tab behavior of Windows:
+# Settings > System > Multitasking > Virtual Desktops
 only_current_desktop = auto
 
 [switch-apps]
 
 # Whether to enable switching apps
-enable = no 
+enable = no
 
 # Hotkey to switch apps
 hotkey = alt+tab
@@ -71,16 +67,14 @@ ignore_minimal = no
 render_mode = icon_only
 
 # Whether to show per-window dot indicators for apps with more than one window.
-# When enabled, each dot represents one window; the active dot highlights the
-# currently selected window during Alt+` same-app cycling.
 show_window_count = no
 
 # Scale the overlay card size as a percentage (50-200, default 100).
 # Higher values produce larger cards and previews.
 overlay_scale = 100
 
-# Overall overlay opacity as a percentage (0-100, default 100).
-# Lower values make the overlay more transparent.
+# Overall overlay background opacity as a percentage (0-100, default 100).
+# Lower values make only the container more transparent.
 backdrop_opacity = 100
 
 # Optional hex color for the overlay background (e.g. #2d2d2d).
@@ -88,8 +82,8 @@ backdrop_opacity = 100
 backdrop_color =
 
 # Which app window to use as the representative target.
-# legacy_minimized_fallback = use the original upstream behavior:
-#   if the first grouped window is minimized, fall back to the last window in that app group.
+# legacy_minimized_fallback = if the first grouped window is minimized,
+#   fall back to the last window in that app group.
 # first_window = always use the first window in the existing app-group order.
 representative_window = legacy_minimized_fallback
 
@@ -98,24 +92,50 @@ representative_window = legacy_minimized_fallback
 # The icon format can be ico or png.
 override_icons =
 
-# Only switch apps within the current virtual desktops: yes/no/auto
+# Switch to apps from only the current virtual desktops instead of all desktops.
+# Defaults to match the Alt-Tab behavior of Windows:
+# Settings > System > Multitasking > Virtual Desktops
 only_current_desktop = auto
+
+[log]
+
+# Log level can be one of off,error,warn,info,debug,trace.
+level = info
+
+# Log file path.
+# e.g.
+#   winorbit.log (located in the same directory as winorbit.exe)
+#   C:\Users\you\AppData\Local\Temp\winorbit.log
+path =
 ```
 
-`icon_only` remains the default and the safest fallback mode. Prefer it when preview cards are incompatible with a specific app, when you want the lightest possible overlay for rapid switching, or while validating preview behavior on a new Windows setup.
+## Usage Notes
 
-The overlay automatically adapts to an adaptive multi-row grid when there are more apps than fit in a single row. Use `overlay_scale` to make cards larger or smaller, `backdrop_opacity` to control transparency, and `backdrop_color` to override the theme-derived background.
+- Hold `Alt` and tap `Tab` to cycle apps in the overlay.
+- While the `Alt+Tab` overlay is open, press `Alt+\`` to cycle windows inside the selected app without foregrounding each candidate window immediately.
+- Release `Alt` to activate the currently selected app window.
+- `icon_only` remains the safest fallback mode when previews are incompatible with a specific app.
 
-## Running as Administrator (Optional)
+## Building
 
-The window-switcher works in standard user mode. But only the window-switcher running in administrator mode can manage applications running in administrator mode.
+Build on Windows with the MSVC toolchain:
 
-**Important:** If you enable the startup option while running in standard user mode, it will launch in standard mode upon system reboot. To ensure startup with admin privileges, launch the window-switcher as administrator first before enabling startup.
+```bash
+cargo build --locked --release --target x86_64-pc-windows-msvc
+```
+
+Cross-compile from Linux:
+
+```bash
+cargo build --locked --release --target x86_64-pc-windows-gnu
+```
+
+The resulting executable is:
+
+```text
+target/<target-triple>/release/winorbit.exe
+```
 
 ## License
 
-Copyright (c) 2023-2026 window-switcher developers.
-
-window-switcher is made available under the terms of the MIT License, at your option.
-
-See the LICENSE files for license details.
+WinOrbit is released under the MIT License. See [LICENSE](LICENSE).

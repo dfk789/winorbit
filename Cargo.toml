@@ -1,5 +1,5 @@
 [package]
-name = "window-switcher"
+name = "winorbit"
 version = "1.17.0"
 edition = "2021"
 

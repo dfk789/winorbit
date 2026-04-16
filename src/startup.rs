@@ -5,9 +5,9 @@ use crate::utils::{
     create_scheduled_task, delete_scheduled_task, exist_scheduled_task, get_exe_path, RegKey,
 };
 
-const TASK_NAME: &str = "WindowSwitcher";
+const TASK_NAME: &str = "WinOrbit";
 const HKEY_RUN: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const HKEY_NAME: PCWSTR = w!("Window Switcher");
+const HKEY_NAME: PCWSTR = w!("WinOrbit");
 
 #[derive(Default)]
 pub struct Startup {
@@ -50,7 +50,7 @@ impl Startup {
             }
             (false, false) => {
                 if exist_scheduled_task(TASK_NAME)? {
-                    alert!("To avoid conflicts, please disable 'Startup' feature within Window-Switcher while running it as an administrator. Once disabled, you can safely enable 'Startup' again under normal user permissions.");
+                    alert!("To avoid conflicts, please disable 'Startup' within WinOrbit while running it as an administrator. Once disabled, you can safely enable 'Startup' again under normal user permissions.");
                     return Ok(());
                 }
                 reg_enable(&self.exe_path)?;

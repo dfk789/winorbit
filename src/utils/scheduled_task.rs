@@ -120,7 +120,7 @@ fn create_task_file(name: &str, exe_path: &str) -> Result<String> {
   </Actions>
 </Task>"#
     );
-    let xml_path = env::temp_dir().join("window-switcher-task.xml");
+    let xml_path = env::temp_dir().join("winorbit-task.xml");
     let xml_path = xml_path.display().to_string();
     fs::write(&xml_path, xml_data)
         .map_err(|err| anyhow!("Failed to write task xml file at '{xml_path}', {err}",))?;

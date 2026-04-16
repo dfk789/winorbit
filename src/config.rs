@@ -12,7 +12,7 @@ use crate::utils::{get_exe_folder, RegKey};
 pub const SWITCH_WINDOWS_HOTKEY_ID: u32 = 1;
 pub const SWITCH_APPS_HOTKEY_ID: u32 = 2;
 
-const DEFAULT_CONFIG: &str = include_str!("../window-switcher.ini");
+const DEFAULT_CONFIG: &str = include_str!("../winorbit.ini");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -414,7 +414,7 @@ pub(crate) fn edit_config_file() -> Result<bool> {
 
 fn get_config_path() -> Result<PathBuf> {
     let folder = get_exe_folder()?;
-    let config_path = folder.join("window-switcher.ini");
+    let config_path = folder.join("winorbit.ini");
     Ok(config_path)
 }
 

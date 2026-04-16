@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use window_switcher::utils::*;
+use winorbit::utils::*;
 
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM};

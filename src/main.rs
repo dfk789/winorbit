@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use window_switcher::{alert, load_config, start, utils::SingleInstance};
+use winorbit::{alert, load_config, start, utils::SingleInstance};
 
 fn main() {
     if let Err(err) = run() {
@@ -26,7 +26,7 @@ fn run() -> Result<()> {
         })?;
         simple_logging::log_to(file, config.log_level);
     }
-    let instance = SingleInstance::create("WindowSwitcherMutex")?;
+    let instance = SingleInstance::create("WinOrbitMutex")?;
     if !instance.is_single() {
         bail!("Another instance is running. This instance will abort.")
     }

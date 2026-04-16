@@ -29,11 +29,11 @@ BEGIN
     BEGIN
         BLOCK "040004b0"
         BEGIN
-            VALUE "FileDescription", "Window Switcher"
-            VALUE "InternalName", "window-switcher.exe"
-            VALUE "LegalCopyright", "Copyright (C) 2023"
-            VALUE "OriginalFilename", "window-switcher.exe"
-            VALUE "ProductName", "Window Switcher"
+            VALUE "FileDescription", "WinOrbit"
+            VALUE "InternalName", "winorbit.exe"
+            VALUE "LegalCopyright", "Copyright (C) 2023-2026"
+            VALUE "OriginalFilename", "winorbit.exe"
+            VALUE "ProductName", "WinOrbit"
             VALUE "ProductVersion", "1.17.0.0"
         END
     END

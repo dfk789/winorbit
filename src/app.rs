@@ -30,7 +30,7 @@ use windows::Win32::{
     },
 };
 
-pub const NAME: PCWSTR = w!("Window Switcher");
+pub const NAME: PCWSTR = w!("WinOrbit");
 pub const WM_USER_TRAYICON: u32 = 6000;
 pub const WM_USER_REGISTER_TRAYICON: u32 = 6001;
 pub const WM_USER_SWITCH_APPS: u32 = 6010;
