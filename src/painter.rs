@@ -440,7 +440,7 @@ fn draw_entries(
 
         FillRect(hdc_scaled, &rect, bg_brush);
 
-        if state.render_mode == SwitchAppsRenderMode::Preview {
+        if state.render_mode.uses_preview_cards() {
             for (i, _) in state.apps.iter().enumerate() {
                 let entry = &layout.entries[i];
                 let card_rect = scale_rect(
@@ -1257,5 +1257,42 @@ mod tests {
 
         assert!(rect_width(&large.0) > rect_width(&small.0));
         assert_eq!(rect_height(&small.0), rect_height(&large.0));
+    }
+
+    #[test]
+    fn icon_layout_stays_compact_and_square() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::IconOnly,
+            6,
+            fake_monitor_rect(1920, 1080),
+        );
+        let card = layout.entries[0].card_rect;
+        let icon = layout.entries[0].icon_rect;
+
+        assert_eq!(card.right - card.left, card.bottom - card.top);
+        assert_eq!(
+            card.right - card.left,
+            super::ICON_SIZE + super::ICON_BORDER_SIZE * 2
+        );
+        assert_eq!(icon.right - icon.left, super::ICON_SIZE);
+        assert_eq!(icon.bottom - icon.top, super::ICON_SIZE);
+        assert_eq!(
+            layout.entries[1].card_rect.left,
+            layout.entries[0].card_rect.right
+        );
+    }
+
+    #[test]
+    fn icon_layout_remains_centered_when_preview_mode_exists() {
+        let layout = OverlayLayout::new(
+            SwitchAppsRenderMode::IconOnly,
+            4,
+            fake_monitor_rect(1280, 720),
+        );
+
+        assert_eq!(layout.x, (1280 - layout.width) / 2);
+        assert_eq!(layout.y, (720 - layout.height) / 2);
+        assert!(layout.width < 1280);
+        assert!(layout.height < 720);
     }
 }

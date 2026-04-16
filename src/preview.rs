@@ -63,7 +63,7 @@ impl WindowPreviewSource {
 
 impl PreviewSource for WindowPreviewSource {
     fn preview_for_hwnd(&self, hwnd: HWND) -> AppPreview {
-        if self.render_mode != SwitchAppsRenderMode::Preview {
+        if !self.render_mode.uses_preview_cards() {
             return AppPreview::Unavailable(PreviewUnavailableReason::DisabledByConfig);
         }
         resolve_preview(self.render_mode, hwnd, PreviewWindowState::probe(hwnd))
@@ -75,21 +75,18 @@ pub fn resolve_preview(
     hwnd: HWND,
     state: PreviewWindowState,
 ) -> AppPreview {
-    match render_mode {
-        SwitchAppsRenderMode::IconOnly => {
-            AppPreview::Unavailable(PreviewUnavailableReason::DisabledByConfig)
-        }
-        SwitchAppsRenderMode::Preview => {
-            if state.is_iconic {
-                AppPreview::Unavailable(PreviewUnavailableReason::Minimized)
-            } else if state.is_cloaked() {
-                AppPreview::Unavailable(PreviewUnavailableReason::Cloaked)
-            } else {
-                // This is a descriptor only. S03D owns any future DWM thumbnail
-                // registration handles and their cleanup when the painter renders it.
-                AppPreview::DwmThumbnail(DwmThumbnailPreview::new(hwnd))
-            }
-        }
+    if !render_mode.uses_preview_cards() {
+        return AppPreview::Unavailable(PreviewUnavailableReason::DisabledByConfig);
+    }
+
+    if state.is_iconic {
+        AppPreview::Unavailable(PreviewUnavailableReason::Minimized)
+    } else if state.is_cloaked() {
+        AppPreview::Unavailable(PreviewUnavailableReason::Cloaked)
+    } else {
+        // This is a descriptor only. S03D owns any future DWM thumbnail
+        // registration handles and their cleanup when the painter renders it.
+        AppPreview::DwmThumbnail(DwmThumbnailPreview::new(hwnd))
     }
 }
 

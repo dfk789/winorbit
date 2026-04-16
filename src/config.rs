@@ -219,6 +219,10 @@ impl SwitchAppsRenderMode {
             _ => None,
         }
     }
+
+    pub const fn uses_preview_cards(self) -> bool {
+        matches!(self, Self::Preview)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -483,5 +487,11 @@ show_window_count = maybe
             SwitchAppsRenderMode::IconOnly
         );
         assert!(!config.switch_apps_show_window_count);
+    }
+
+    #[test]
+    fn test_switch_apps_render_mode_helpers_keep_icon_only_as_default_fallback() {
+        assert!(!SwitchAppsRenderMode::IconOnly.uses_preview_cards());
+        assert!(SwitchAppsRenderMode::Preview.uses_preview_cards());
     }
 }

@@ -62,7 +62,8 @@ hotkey = alt+tab
 ignore_minimal = no
 
 # How to render app-switch entries.
-# icon_only = current icon strip behavior
+# icon_only = current compact icon strip behavior; recommended when preview cards
+#   are incompatible with an app or when you want the lightest overlay.
 # preview = show live preview cards when DWM thumbnails are available;
 #   entries that cannot provide a preview fall back to icons
 render_mode = icon_only
@@ -79,6 +80,8 @@ representative_window = legacy_minimized_fallback
 # Only switch apps within the current virtual desktops: yes/no/auto
 only_current_desktop = auto
 ```
+
+`icon_only` remains the default and the safest fallback mode. Prefer it when preview cards are incompatible with a specific app, when you want the lightest possible overlay for rapid switching, or while validating preview behavior on a new Windows setup.
 
 ## Running as Administrator (Optional)
 
