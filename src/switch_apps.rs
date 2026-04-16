@@ -96,6 +96,7 @@ impl AppSwitchEntry {
         ))
     }
 
+    #[allow(dead_code)]
     pub fn preview_hwnd(&self) -> HWND {
         self.representative_hwnd
     }
@@ -417,10 +418,7 @@ mod tests {
 
         state.reset_window_index();
         assert_eq!(state.window_index, 0);
-        assert_eq!(
-            state.selected_hwnd(),
-            Some(state.apps[0].windows[0].hwnd)
-        );
+        assert_eq!(state.selected_hwnd(), Some(state.apps[0].windows[0].hwnd));
     }
 
     #[test]
@@ -434,10 +432,7 @@ mod tests {
         state.index = 1;
         state.reset_window_index();
         assert_eq!(state.window_index, 0);
-        assert_eq!(
-            state.selected_hwnd(),
-            Some(state.apps[1].windows[0].hwnd)
-        );
+        assert_eq!(state.selected_hwnd(), Some(state.apps[1].windows[0].hwnd));
     }
 
     #[test]

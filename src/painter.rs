@@ -676,31 +676,29 @@ fn draw_dot_indicators(
         0
     };
 
-    unsafe {
-        for (app_index, entry) in layout.entries.iter().enumerate() {
-            let Some(dots) = &entry.dots else {
-                continue;
+    for (app_index, entry) in layout.entries.iter().enumerate() {
+        let Some(dots) = &entry.dots else {
+            continue;
+        };
+
+        let content_offset_x = layout.content_rect.left;
+        let content_offset_y = layout.content_rect.top;
+
+        for (dot_idx, &(cx, cy)) in dots.centers.iter().enumerate() {
+            let is_active = app_index == state.index && dot_idx == active_window_index;
+            let brush = if is_active {
+                active_brush
+            } else {
+                inactive_brush
             };
-
-            let content_offset_x = layout.content_rect.left;
-            let content_offset_y = layout.content_rect.top;
-
-            for (dot_idx, &(cx, cy)) in dots.centers.iter().enumerate() {
-                let is_active = app_index == state.index && dot_idx == active_window_index;
-                let brush = if is_active {
-                    active_brush
-                } else {
-                    inactive_brush
-                };
-                let r = dots.radius;
-                let dot_rect = RECT {
-                    left: cx - r - content_offset_x,
-                    top: cy - r - content_offset_y,
-                    right: cx + r - content_offset_x,
-                    bottom: cy + r - content_offset_y,
-                };
-                fill_round_rect_region(hdc, brush, &dot_rect, r * 2);
-            }
+            let r = dots.radius;
+            let dot_rect = RECT {
+                left: cx - r - content_offset_x,
+                top: cy - r - content_offset_y,
+                right: cx + r - content_offset_x,
+                bottom: cy + r - content_offset_y,
+            };
+            fill_round_rect_region(hdc, brush, &dot_rect, r * 2);
         }
     }
 }
@@ -794,7 +792,9 @@ impl OverlayLayout {
         };
 
         // Compute grid dimensions that fit within 85% of the monitor.
-        let max_content_width = (monitor_width * 85 / 100).max(desired_card_width + outer_padding * 2) - outer_padding * 2;
+        let max_content_width = (monitor_width * 85 / 100)
+            .max(desired_card_width + outer_padding * 2)
+            - outer_padding * 2;
         let max_cols = if desired_card_width + gap <= 0 {
             num_apps as i32
         } else {
@@ -851,11 +851,7 @@ impl OverlayLayout {
                 let icon_size = scaled_icon_size
                     .min(rect_width(&preview_rect))
                     .min(rect_height(&preview_rect));
-                let dots = dot_indicator_layout(
-                    show_window_count,
-                    card_rect,
-                    window_counts[index],
-                );
+                let dots = dot_indicator_layout(show_window_count, card_rect, window_counts[index]);
                 OverlayEntryLayout {
                     card_rect,
                     preview_rect,
@@ -1488,11 +1484,8 @@ mod tests {
         );
 
         for (i, entry) in layout.entries.iter().enumerate() {
-            let hit = hit_test_app_index(
-                &layout,
-                entry.card_rect.left + 5,
-                entry.card_rect.top + 5,
-            );
+            let hit =
+                hit_test_app_index(&layout, entry.card_rect.left + 5, entry.card_rect.top + 5);
             assert_eq!(hit, Some(i), "hit test failed for entry {i}");
         }
     }
@@ -1517,8 +1510,14 @@ mod tests {
             .count();
 
         // Should use a balanced layout (e.g. 4+3) rather than all-in-one or 4+3 with big gap.
-        assert!(first_row_count <= 4, "first row has {first_row_count} items, expected balanced grid");
-        assert!(first_row_count >= 3, "first row has {first_row_count} items, expected at least 3");
+        assert!(
+            first_row_count <= 4,
+            "first row has {first_row_count} items, expected balanced grid"
+        );
+        assert!(
+            first_row_count >= 3,
+            "first row has {first_row_count} items, expected at least 3"
+        );
     }
 
     #[test]
@@ -1537,7 +1536,10 @@ mod tests {
             .iter()
             .all(|entry| entry.card_rect.top == first_row_top);
 
-        assert!(all_same_row, "8 icon entries should fit in a single row on 1920px");
+        assert!(
+            all_same_row,
+            "8 icon entries should fit in a single row on 1920px"
+        );
     }
 
     #[test]

@@ -157,10 +157,7 @@ impl Config {
             {
                 conf.switch_apps_backdrop_opacity = v.clamp(0, 100);
             }
-            if let Some(v) = section
-                .get("backdrop_color")
-                .and_then(parse_hex_color)
-            {
+            if let Some(v) = section.get("backdrop_color").and_then(parse_hex_color) {
                 conf.switch_apps_backdrop_color = Some(v);
             }
             if let Some(v) = section.get("override_icons").map(normalize_path_value) {

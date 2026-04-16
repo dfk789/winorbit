@@ -12,6 +12,8 @@ Window-Switcher offers hotkeys for quickly switching windows on Windows OS:
 
 **💡 Hold down the `Alt` key and tap the ``` `(Backtick)/Tab ``` key to cycle through windows/apps, Press ```Alt + `(Backtick)/Tab``` and release both keys to switch to the last active window/app.**
 
+**💡 While the `Alt+Tab` overlay is open, press `` Alt+` `` to cycle through windows of the selected app without dismissing the overlay. Release `Alt` to activate the chosen window.**
+
 ## Installation
 
 1. **Download:** Visit the [Github Release](https://github.com/sigoden/windows-switcher/releases) and download the `windows-switcher.zip` file.
@@ -68,8 +70,22 @@ ignore_minimal = no
 #   entries that cannot provide a preview fall back to icons
 render_mode = icon_only
 
-# Whether to show a small per-app window count for apps with more than one window.
+# Whether to show per-window dot indicators for apps with more than one window.
+# When enabled, each dot represents one window; the active dot highlights the
+# currently selected window during Alt+` same-app cycling.
 show_window_count = no
+
+# Scale the overlay card size as a percentage (50-200, default 100).
+# Higher values produce larger cards and previews.
+overlay_scale = 100
+
+# Overall overlay opacity as a percentage (0-100, default 100).
+# Lower values make the overlay more transparent.
+backdrop_opacity = 100
+
+# Optional hex color for the overlay background (e.g. #2d2d2d).
+# When not set the overlay follows the current Windows light/dark theme.
+backdrop_color =
 
 # Which app window to use as the representative target.
 # legacy_minimized_fallback = use the original upstream behavior:
@@ -77,11 +93,18 @@ show_window_count = no
 # first_window = always use the first window in the existing app-group order.
 representative_window = legacy_minimized_fallback
 
+# List of override icons, syntax: app1.exe=icon1.ico,app2.exe=icon2.png.
+# The icon path can be a full path or a relative path to the app's directory.
+# The icon format can be ico or png.
+override_icons =
+
 # Only switch apps within the current virtual desktops: yes/no/auto
 only_current_desktop = auto
 ```
 
 `icon_only` remains the default and the safest fallback mode. Prefer it when preview cards are incompatible with a specific app, when you want the lightest possible overlay for rapid switching, or while validating preview behavior on a new Windows setup.
+
+The overlay automatically adapts to an adaptive multi-row grid when there are more apps than fit in a single row. Use `overlay_scale` to make cards larger or smaller, `backdrop_opacity` to control transparency, and `backdrop_color` to override the theme-derived background.
 
 ## Running as Administrator (Optional)
 
@@ -91,7 +114,7 @@ The window-switcher works in standard user mode. But only the window-switcher ru
 
 ## License
 
-Copyright (c) 2023-2025 window-switcher developers.
+Copyright (c) 2023-2026 window-switcher developers.
 
 window-switcher is made available under the terms of the MIT License, at your option.
 
