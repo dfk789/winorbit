@@ -240,6 +240,7 @@ struct WindowSink(HWND);
 impl ActionSink for WindowSink {
     fn post(&mut self, action: HotKeyAction) -> bool {
         let Some((message, lparam)) = action_message(action) else {
+            // Actions without a UI message have nothing to deliver.
             return true;
         };
         match unsafe { PostMessageW(Some(self.0), message, WPARAM(0), lparam) } {
@@ -318,7 +319,9 @@ impl KeyboardState {
             let Some(action) = action else {
                 continue;
             };
-            if !sink.post(action) {
+            // `Consume` only swallows a key repeat; nothing goes to the UI.
+            let delivered = action == HotKeyAction::Consume || sink.post(action);
+            if !delivered {
                 // Undo this press so a key repeat retries instead of being
                 // swallowed as a repeat of a switch that never happened.
                 (
