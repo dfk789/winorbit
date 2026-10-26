@@ -8,63 +8,157 @@ use crate::{
 };
 
 use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
-use std::sync::LazyLock;
+use parking_lot::{Condvar, Mutex};
+use std::sync::{atomic::Ordering, mpsc, LazyLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    System::LibraryLoader::GetModuleHandleW,
+    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{SCANCODE_LSHIFT, SCANCODE_RSHIFT},
         WindowsAndMessaging::{
-            CallNextHookEx, SendMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-            KBDLLHOOKSTRUCT, LLKHF_UP, WH_KEYBOARD_LL,
+            CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW,
+            PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+            KBDLLHOOKSTRUCT, LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_QUIT,
         },
     },
 };
 
-static KEYBOARD_STATE: LazyLock<Mutex<Vec<HotKeyState>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static mut WINDOW: HWND = HWND(0 as _);
-static mut IS_SHIFT_PRESSED: bool = false;
+/// State shared with `keyboard_proc`, which only ever runs on the hook thread.
+static KEYBOARD_STATE: LazyLock<Mutex<KeyboardState>> =
+    LazyLock::new(|| Mutex::new(KeyboardState::default()));
 
+#[derive(Debug, Default)]
+struct KeyboardState {
+    /// App window that receives posted switch messages, stored as an integer
+    /// because `HWND` is not `Send`.
+    window: isize,
+    is_shift_pressed: bool,
+    hotkeys: Vec<HotKeyState>,
+}
+
+/// Upper bound on how long the hook waits for the UI thread to finish a commit.
+const COMMIT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Counts commit messages posted by the hook and acknowledged by the UI thread.
+///
+/// The hook waits for each commit to be handled before passing the modifier
+/// release on, so the key-up reaches the newly activated window, exactly as it
+/// did when the hook ran on the UI thread and used `SendMessageW`.
+static COMMIT_SYNC: LazyLock<(Mutex<CommitCounter>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(CommitCounter::default()), Condvar::new()));
+
+#[derive(Debug, Default)]
+struct CommitCounter {
+    posted: u64,
+    acknowledged: u64,
+}
+
+/// Called by the UI thread once it has handled a `*_DONE` commit message.
+pub fn acknowledge_commit() {
+    let (counter, condvar) = &*COMMIT_SYNC;
+    counter.lock().acknowledged += 1;
+    condvar.notify_all();
+}
+
+/// Owns the dedicated thread that installs `WH_KEYBOARD_LL` and pumps its
+/// messages. Low-level hook callbacks run on the installing thread, so keeping
+/// them off the UI thread means overlay painting can never stall global input.
 #[derive(Debug)]
 pub struct KeyboardListener {
-    hook: HHOOK,
+    thread_id: u32,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl KeyboardListener {
     pub fn init(hwnd: HWND, hotkeys: &[&Hotkey]) -> Result<Self> {
-        unsafe { WINDOW = hwnd }
-
-        let keyboard_state = hotkeys
-            .iter()
-            .map(|hotkey| HotKeyState::new((*hotkey).clone()))
-            .collect();
-        *KEYBOARD_STATE.lock() = keyboard_state;
-
-        let hook = unsafe {
-            let hinstance = { GetModuleHandleW(None) }
-                .map_err(|err| anyhow!("Failed to get module handle, {err}"))?;
-            SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(keyboard_proc),
-                Some(hinstance.into()),
-                0,
-            )
+        {
+            let mut state = KEYBOARD_STATE.lock();
+            state.window = hwnd.0 as isize;
+            state.is_shift_pressed = false;
+            state.hotkeys = hotkeys
+                .iter()
+                .map(|hotkey| HotKeyState::new((*hotkey).clone()))
+                .collect();
         }
-        .map_err(|err| anyhow!("Failed to set windows hook, {err}"))?;
+
+        let (tx, rx) = mpsc::channel::<Result<u32>>();
+        let thread = std::thread::Builder::new()
+            .name("keyboard-hook".into())
+            .spawn(move || run_hook_thread(tx))
+            .map_err(|err| anyhow!("Failed to spawn keyboard hook thread, {err}"))?;
+
+        let thread_id = match rx.recv() {
+            Ok(Ok(thread_id)) => thread_id,
+            Ok(Err(err)) => {
+                let _ = thread.join();
+                return Err(err);
+            }
+            Err(_) => {
+                let _ = thread.join();
+                return Err(anyhow!("Keyboard hook thread exited during startup"));
+            }
+        };
         info!("keyboard listener start");
 
-        Ok(Self { hook })
+        Ok(Self {
+            thread_id,
+            thread: Some(thread),
+        })
     }
 }
 
 impl Drop for KeyboardListener {
     fn drop(&mut self) {
         debug!("keyboard listener destroyed");
-        if !self.hook.is_invalid() {
-            let _ = unsafe { UnhookWindowsHookEx(self.hook) };
+        let _ = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
+}
+
+fn run_hook_thread(ready: mpsc::Sender<Result<u32>>) {
+    let mut message = MSG::default();
+    // Force creation of this thread's message queue before reporting the
+    // thread id, so a `WM_QUIT` posted by `Drop` can never be lost.
+    let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
+    let thread_id = unsafe { GetCurrentThreadId() };
+
+    let hook = unsafe {
+        GetModuleHandleW(None)
+            .map_err(|err| anyhow!("Failed to get module handle, {err}"))
+            .and_then(|hinstance| {
+                SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(keyboard_proc),
+                    Some(hinstance.into()),
+                    0,
+                )
+                .map_err(|err| anyhow!("Failed to set windows hook, {err}"))
+            })
+    };
+    let hook = match hook {
+        Ok(hook) => hook,
+        Err(err) => {
+            let _ = ready.send(Err(err));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(thread_id));
+
+    // The hook callback is dispatched from inside this message loop.
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    // Unhook on the thread that installed the hook.
+    let _ = unsafe { UnhookWindowsHookEx(hook) };
+    debug!("keyboard hook thread exited");
 }
 
 #[derive(Debug)]
@@ -190,32 +284,34 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     let mut is_modifier = false;
     let scan_code = kbd_data.scanCode;
     let is_key_pressed = || kbd_data.flags.0 & LLKHF_UP.0 == 0;
-    if [SCANCODE_LSHIFT, SCANCODE_RSHIFT].contains(&scan_code) {
-        IS_SHIFT_PRESSED = is_key_pressed();
-    }
-    let reverse = IS_SHIFT_PRESSED;
     let mut keyboard_state = KEYBOARD_STATE.lock();
-    for state in keyboard_state.iter_mut() {
+    if [SCANCODE_LSHIFT, SCANCODE_RSHIFT].contains(&scan_code) {
+        keyboard_state.is_shift_pressed = is_key_pressed();
+    }
+    let reverse = keyboard_state.is_shift_pressed;
+    let window = HWND(keyboard_state.window as _);
+    let is_foreground_in_blacklist = IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed);
+    for state in keyboard_state.hotkeys.iter_mut() {
         if let Some(action) = state.handle_modifier_event(scan_code, is_key_pressed()) {
             is_modifier = true;
-            dispatch_action(action);
+            dispatch_action(window, action);
         } else if state.hotkey.modifier.contains(&scan_code) {
             is_modifier = true;
         }
     }
     if !is_modifier {
-        for state in keyboard_state.iter_mut() {
+        for state in keyboard_state.hotkeys.iter_mut() {
             if let Some(action) = state.handle_hotkey_event(
                 scan_code,
                 is_key_pressed(),
                 reverse,
-                state.hotkey.id != SWITCH_WINDOWS_HOTKEY_ID || !IS_FOREGROUND_IN_BLACKLIST,
+                state.hotkey.id != SWITCH_WINDOWS_HOTKEY_ID || !is_foreground_in_blacklist,
             ) {
-                dispatch_action(action);
+                dispatch_action(window, action);
                 return LRESULT(1);
             }
             if let Some(action) = state.handle_cancel_event(scan_code, is_key_pressed()) {
-                dispatch_action(action);
+                dispatch_action(window, action);
                 return LRESULT(1);
             }
         }
@@ -223,40 +319,60 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     CallNextHookEx(None, code, w_param, l_param)
 }
 
-fn dispatch_action(action: HotKeyAction) {
+/// Maps a hook action to the app-window message it posts, if any.
+fn action_message(action: HotKeyAction) -> Option<(u32, LPARAM)> {
     match action {
-        HotKeyAction::Consume => {}
-        HotKeyAction::SwitchApps { reverse } => unsafe {
-            let _ = SendMessageW(
-                WINDOW,
-                WM_USER_SWITCH_APPS,
-                None,
-                Some(LPARAM(reverse as isize)),
-            );
-        },
-        HotKeyAction::SwitchAppsDone => unsafe {
-            let _ = SendMessageW(WINDOW, WM_USER_SWITCH_APPS_DONE, None, None);
-        },
-        HotKeyAction::SwitchAppsCancel => unsafe {
-            let _ = SendMessageW(WINDOW, WM_USER_SWITCH_APPS_CANCEL, None, None);
-        },
-        HotKeyAction::SwitchWindows { reverse } => unsafe {
-            let _ = SendMessageW(
-                WINDOW,
-                WM_USER_SWITCH_WINDOWS,
-                None,
-                Some(LPARAM(reverse as isize)),
-            );
-        },
-        HotKeyAction::SwitchWindowsDone => unsafe {
-            let _ = SendMessageW(WINDOW, WM_USER_SWITCH_WINDOWS_DONE, None, None);
-        },
+        HotKeyAction::Consume => None,
+        HotKeyAction::SwitchApps { reverse } => {
+            Some((WM_USER_SWITCH_APPS, LPARAM(reverse as isize)))
+        }
+        HotKeyAction::SwitchAppsDone => Some((WM_USER_SWITCH_APPS_DONE, LPARAM(0))),
+        HotKeyAction::SwitchAppsCancel => Some((WM_USER_SWITCH_APPS_CANCEL, LPARAM(0))),
+        HotKeyAction::SwitchWindows { reverse } => {
+            Some((WM_USER_SWITCH_WINDOWS, LPARAM(reverse as isize)))
+        }
+        HotKeyAction::SwitchWindowsDone => Some((WM_USER_SWITCH_WINDOWS_DONE, LPARAM(0))),
+    }
+}
+
+/// Posts rather than sends so the hook callback never runs app code; the UI
+/// thread handles switching and painting from its own message loop. Commit
+/// messages additionally wait (bounded) for the UI thread to finish.
+fn dispatch_action(window: HWND, action: HotKeyAction) {
+    let Some((message, lparam)) = action_message(action) else {
+        return;
     };
+    let is_commit = matches!(
+        action,
+        HotKeyAction::SwitchAppsDone | HotKeyAction::SwitchWindowsDone
+    );
+    let (counter, condvar) = &*COMMIT_SYNC;
+    let mut counter = counter.lock();
+    if let Err(err) = unsafe { PostMessageW(Some(window), message, WPARAM(0), lparam) } {
+        error!("failed to post keyboard action {action:?}, {err}");
+        return;
+    }
+    if !is_commit {
+        return;
+    }
+    counter.posted += 1;
+    let expected = counter.posted;
+    let deadline = Instant::now() + COMMIT_ACK_TIMEOUT;
+    while counter.acknowledged < expected {
+        if condvar.wait_until(&mut counter, deadline).timed_out() {
+            warn!("timed out waiting for keyboard commit {action:?}");
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HotKeyAction, HotKeyState};
+    use super::{action_message, HotKeyAction, HotKeyState};
+    use crate::app::{
+        WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
+        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
+    };
     use crate::config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID};
 
     fn switch_apps_state() -> HotKeyState {
@@ -345,6 +461,37 @@ mod tests {
         assert_eq!(
             state.handle_modifier_event(0x38, false),
             Some(HotKeyAction::SwitchWindowsDone)
+        );
+    }
+
+    #[test]
+    fn actions_map_to_the_existing_app_messages() {
+        let message = |action| action_message(action).map(|(msg, lparam)| (msg, lparam.0));
+
+        assert_eq!(message(HotKeyAction::Consume), None);
+        assert_eq!(
+            message(HotKeyAction::SwitchApps { reverse: false }),
+            Some((WM_USER_SWITCH_APPS, 0))
+        );
+        assert_eq!(
+            message(HotKeyAction::SwitchApps { reverse: true }),
+            Some((WM_USER_SWITCH_APPS, 1))
+        );
+        assert_eq!(
+            message(HotKeyAction::SwitchAppsDone),
+            Some((WM_USER_SWITCH_APPS_DONE, 0))
+        );
+        assert_eq!(
+            message(HotKeyAction::SwitchAppsCancel),
+            Some((WM_USER_SWITCH_APPS_CANCEL, 0))
+        );
+        assert_eq!(
+            message(HotKeyAction::SwitchWindows { reverse: true }),
+            Some((WM_USER_SWITCH_WINDOWS, 1))
+        );
+        assert_eq!(
+            message(HotKeyAction::SwitchWindowsDone),
+            Some((WM_USER_SWITCH_WINDOWS_DONE, 0))
         );
     }
 }

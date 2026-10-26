@@ -1,6 +1,6 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
-use crate::keyboard::KeyboardListener;
+use crate::keyboard::{acknowledge_commit, KeyboardListener};
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::preview::{PreviewSource, WindowPreviewSource};
 use crate::startup::Startup;
@@ -233,8 +233,13 @@ impl App {
             }
             WM_USER_SWITCH_APPS_DONE => {
                 debug!("message WM_USER_SWITCH_APPS_DONE");
-                let app = get_app(hwnd)?;
-                app.do_switch_app();
+                // Always acknowledge so the keyboard hook stops waiting.
+                let mut app = get_app(hwnd);
+                if let Ok(app) = app.as_deref_mut() {
+                    app.do_switch_app();
+                }
+                acknowledge_commit();
+                app?;
             }
             WM_USER_SWITCH_APPS_CANCEL => {
                 debug!("message WM_USER_SWITCH_APPS_CANCEL");
@@ -259,8 +264,13 @@ impl App {
             }
             WM_USER_SWITCH_WINDOWS_DONE => {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
-                let app = get_app(hwnd)?;
-                app.switch_windows_state.modifier_released = true;
+                // Always acknowledge so the keyboard hook stops waiting.
+                let mut app = get_app(hwnd);
+                if let Ok(app) = app.as_deref_mut() {
+                    app.switch_windows_state.modifier_released = true;
+                }
+                acknowledge_commit();
+                app?;
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
