@@ -21,8 +21,8 @@ use windows::Win32::{
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-            SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY,
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+            KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY,
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW,
@@ -43,8 +43,8 @@ const OWN_INJECTION_MARKER: usize = 0x574F_524B;
 /// How long `KeyboardListener::drop` waits for the hook thread to exit.
 const HOOK_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Hook state. Only `keyboard_proc` (on the hook thread) touches it after
-/// `KeyboardListener::init` has installed it.
+/// Hook state, shared between `keyboard_proc` (hook thread) and the listener's
+/// start/quiesce calls (UI thread).
 static KEYBOARD_STATE: LazyLock<Mutex<KeyboardState>> =
     LazyLock::new(|| Mutex::new(KeyboardState::new(HWND::default(), &[])));
 
@@ -55,9 +55,9 @@ static LISTENER_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// messages. Low-level hook callbacks run on the installing thread, so keeping
 /// them off the UI thread means overlay painting can never stall global input.
 ///
-/// The hook never waits on the UI thread: actions are posted, and ordering of
-/// the modifier release no longer matters because the hook masks the modifier
-/// as soon as it consumes a hotkey press (see `VK_MASK`).
+/// The hook never waits on the UI thread; it only posts. Ordering of the
+/// modifier release does not matter because a hold's mask key is in the input
+/// stream before the hook consumes any key in that hold (see `VK_MASK`).
 #[derive(Debug)]
 pub struct KeyboardListener {
     thread_id: u32,
@@ -116,11 +116,19 @@ impl KeyboardListener {
             exited: exited_rx,
         })
     }
+
+    /// Stops all further messages to the app window. Once this returns the
+    /// hook can never post again, even if its thread keeps running, because
+    /// posting only happens while holding the state lock. Idempotent.
+    pub fn quiesce(&self) {
+        KEYBOARD_STATE.lock().quiesce(&mut SendInputInjector);
+    }
 }
 
 impl Drop for KeyboardListener {
     fn drop(&mut self) {
         debug!("keyboard listener destroyed");
+        self.quiesce();
         if let Err(err) =
             unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
         {
@@ -133,8 +141,8 @@ impl Drop for KeyboardListener {
             }
             LISTENER_ACTIVE.store(false, Ordering::Release);
         } else {
-            // Never block shutdown indefinitely. The detached thread still owns
-            // the hook, so the listener slot stays taken.
+            // Never block shutdown indefinitely. The detached thread is already
+            // quiesced and still owns the hook, so the listener slot stays taken.
             error!("keyboard hook thread did not stop in time; detaching it");
         }
     }
@@ -221,15 +229,6 @@ impl KeyEvent {
     }
 }
 
-/// What the hook does with the current event once state has been updated.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct HookOutcome {
-    /// Swallow the event instead of passing it to the next hook.
-    consume: bool,
-    /// Inject the modifier mask after releasing the state lock.
-    inject_mask: bool,
-}
-
 /// Delivers actions to the UI thread. Returns false if delivery failed.
 trait ActionSink {
     fn post(&mut self, action: HotKeyAction) -> bool;
@@ -253,112 +252,268 @@ impl ActionSink for WindowSink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaskKey {
+    Down,
+    Up,
+}
+
+/// Injects mask key events. Returns how many of `keys` were inserted.
+///
+/// `SendInput` inserts events serially, so a partial result always means a
+/// prefix of `keys` went in.
+trait KeyInjector {
+    fn send(&mut self, keys: &[MaskKey]) -> usize;
+}
+
+struct SendInputInjector;
+
+impl KeyInjector for SendInputInjector {
+    fn send(&mut self, keys: &[MaskKey]) -> usize {
+        let inputs: Vec<INPUT> = keys
+            .iter()
+            .map(|key| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(VK_MASK),
+                        dwFlags: match key {
+                            MaskKey::Down => KEYBD_EVENT_FLAGS(0),
+                            MaskKey::Up => KEYEVENTF_KEYUP,
+                        },
+                        dwExtraInfo: OWN_INJECTION_MARKER,
+                        ..Default::default()
+                    },
+                },
+            })
+            .collect();
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        if sent != inputs.len() {
+            warn!("injected {sent} of {} modifier mask events", inputs.len());
+        }
+        sent
+    }
+}
+
+/// State of one physical modifier hold, shared by every hotkey using that
+/// modifier so masking and ownership are per hold, not per hotkey.
+#[derive(Debug)]
+struct ModifierHold {
+    modifier: [u32; 2],
+    is_pressed: bool,
+    /// The mask key is in the input stream for this hold. Required before
+    /// the hook consumes any key while the modifier is held.
+    is_masked: bool,
+    /// A WinOrbit switch was delivered during this hold, so the hold must not
+    /// leak native shortcuts (Alt+Tab, Alt+Esc) into Windows any more.
+    is_owned: bool,
+}
+
+/// What the UI should be told when the modifier is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseIntent {
+    None,
+    Commit,
+    Cancel,
+}
+
 #[derive(Debug)]
 struct KeyboardState {
     /// App window that receives posted switch messages, stored as an integer
-    /// because `HWND` is not `Send`.
-    window: isize,
+    /// because `HWND` is not `Send`. `None` once quiesced.
+    window: Option<isize>,
     is_shift_pressed: bool,
+    /// A mask key-down went in without its key-up; retried on every event.
+    is_mask_up_pending: bool,
+    holds: Vec<ModifierHold>,
     hotkeys: Vec<HotKeyState>,
 }
 
 impl KeyboardState {
     fn new(hwnd: HWND, hotkeys: &[&Hotkey]) -> Self {
+        let mut holds: Vec<ModifierHold> = vec![];
+        let hotkeys = hotkeys
+            .iter()
+            .map(|hotkey| {
+                let hold = match holds.iter().position(|h| h.modifier == hotkey.modifier) {
+                    Some(index) => index,
+                    None => {
+                        holds.push(ModifierHold {
+                            modifier: hotkey.modifier,
+                            is_pressed: false,
+                            is_masked: false,
+                            is_owned: false,
+                        });
+                        holds.len() - 1
+                    }
+                };
+                HotKeyState::new((*hotkey).clone(), hold)
+            })
+            .collect();
         Self {
-            window: hwnd.0 as isize,
+            window: Some(hwnd.0 as isize),
             is_shift_pressed: false,
-            hotkeys: hotkeys
-                .iter()
-                .map(|hotkey| HotKeyState::new((*hotkey).clone()))
-                .collect(),
+            is_mask_up_pending: false,
+            holds,
+            hotkeys,
         }
     }
 
-    /// Updates hotkey state for one event and delivers resulting actions.
+    fn quiesce(&mut self, injector: &mut impl KeyInjector) {
+        self.window = None;
+        self.flush_pending_mask_up(injector);
+    }
+
+    fn flush_pending_mask_up(&mut self, injector: &mut impl KeyInjector) {
+        if self.is_mask_up_pending && injector.send(&[MaskKey::Up]) == 1 {
+            self.is_mask_up_pending = false;
+        }
+    }
+
+    /// Makes sure the hold's mask is in the input stream. Returns false if no
+    /// mask event could be inserted, in which case the caller must not consume.
+    fn ensure_masked(&mut self, hold: usize, injector: &mut impl KeyInjector) -> bool {
+        if self.holds[hold].is_masked {
+            return true;
+        }
+        match injector.send(&[MaskKey::Down, MaskKey::Up]) {
+            0 => return false,
+            1 => {
+                // The app already saw modifier+mask, so the hold is masked; the
+                // mask key itself is logically down until its key-up goes in.
+                if injector.send(&[MaskKey::Up]) != 1 {
+                    self.is_mask_up_pending = true;
+                }
+            }
+            _ => {}
+        }
+        self.holds[hold].is_masked = true;
+        true
+    }
+
+    /// Updates hotkey state for one event, delivering actions and injecting the
+    /// mask as needed. Returns true to consume the event.
     ///
-    /// Fail-safe rule: if a switch or cancel cannot be delivered, the hotkey
-    /// state is rolled back and the key is passed through, so the hook never
-    /// swallows input or expects a commit for work the UI never received.
+    /// Invariants:
+    /// - Modifier events are never consumed or injected.
+    /// - A key is consumed only after its hold's mask is in the input stream.
+    /// - Before a hold is owned, a failed delivery rolls back and passes the
+    ///   key through, so Windows handles the shortcut natively.
+    /// - Once a hold is owned, failed deliveries still consume the key so
+    ///   native and WinOrbit switching never mix within one hold.
     fn handle_key(
         &mut self,
         event: KeyEvent,
         is_foreground_in_blacklist: bool,
         sink: &mut impl ActionSink,
-    ) -> HookOutcome {
-        let mut outcome = HookOutcome::default();
+        injector: &mut impl KeyInjector,
+    ) -> bool {
+        self.flush_pending_mask_up(injector);
+        if self.window.is_none() {
+            return false;
+        }
         if [SCANCODE_LSHIFT, SCANCODE_RSHIFT].contains(&event.scan_code) {
             self.is_shift_pressed = event.is_pressed;
         }
         let reverse = self.is_shift_pressed;
 
         let mut is_modifier = false;
+        for hold in self.holds.iter_mut() {
+            if !hold.modifier.contains(&event.scan_code) {
+                continue;
+            }
+            is_modifier = true;
+            if event.is_pressed && hold.is_pressed {
+                continue;
+            }
+            // A new hold, or the end of one: start from scratch either way.
+            hold.is_pressed = event.is_pressed;
+            hold.is_masked = false;
+            hold.is_owned = false;
+        }
         for state in self.hotkeys.iter_mut() {
             if let Some(action) = state.handle_modifier_event(event.scan_code, event.is_pressed) {
-                is_modifier = true;
-                // Commit state is already cleared; a failed commit has nothing
-                // to roll back and the modifier always passes through.
+                // Release state is already cleared; a failed post has nothing
+                // to roll back (the UI is unreachable) and is logged by the sink.
                 sink.post(action);
-            } else if state.hotkey.modifier.contains(&event.scan_code) {
-                is_modifier = true;
             }
         }
         if is_modifier {
-            return outcome;
+            return false;
         }
 
-        for state in self.hotkeys.iter_mut() {
-            let saved = (
-                state.is_hotkey_pressed,
-                state.should_commit_on_modifier_release,
-            );
-            let allow_switch =
-                state.hotkey.id != SWITCH_WINDOWS_HOTKEY_ID || !is_foreground_in_blacklist;
+        for index in 0..self.hotkeys.len() {
+            let allow_switch = self.hotkeys[index].hotkey.id != SWITCH_WINDOWS_HOTKEY_ID
+                || !is_foreground_in_blacklist;
+            let state = &mut self.hotkeys[index];
+            let was_hotkey_pressed = state.is_hotkey_pressed;
             let action = state
                 .handle_hotkey_event(event.scan_code, event.is_pressed, reverse, allow_switch)
                 .or_else(|| state.handle_cancel_event(event.scan_code, event.is_pressed));
             let Some(action) = action else {
                 continue;
             };
-            // `Consume` only swallows a key repeat; nothing goes to the UI.
-            let delivered = action == HotKeyAction::Consume || sink.post(action);
-            if !delivered {
-                // Undo this press so a key repeat retries instead of being
-                // swallowed as a repeat of a switch that never happened.
-                (
-                    state.is_hotkey_pressed,
-                    state.should_commit_on_modifier_release,
-                ) = saved;
-                return outcome;
+            let hold = state.hold;
+
+            if !self.ensure_masked(hold, injector) {
+                // Not masked, so not consuming: Windows gets the key natively.
+                self.hotkeys[index].is_hotkey_pressed = was_hotkey_pressed;
+                return false;
             }
-            outcome.consume = true;
-            if action.is_switch() && !state.is_modifier_masked {
-                state.is_modifier_masked = true;
-                outcome.inject_mask = true;
+            if action == HotKeyAction::Consume {
+                return true;
             }
-            return outcome;
+
+            let is_owned = self.holds[hold].is_owned;
+            let state = &mut self.hotkeys[index];
+            let delivered = sink.post(action);
+            match (action, delivered) {
+                (HotKeyAction::SwitchAppsCancel, true) => {
+                    state.release_intent = ReleaseIntent::None;
+                }
+                (HotKeyAction::SwitchAppsCancel, false) => {
+                    // Cancel requires a delivered switch, so the hold is owned.
+                    // Retry the cancel on release instead of committing.
+                    state.release_intent = ReleaseIntent::Cancel;
+                }
+                (_, true) => {
+                    state.release_intent = ReleaseIntent::Commit;
+                    self.holds[hold].is_owned = true;
+                }
+                (_, false) if is_owned => {
+                    // Keep the WinOrbit session; this press just did not advance.
+                }
+                (_, false) => {
+                    // Undo this press so a key repeat retries delivery instead
+                    // of being swallowed as a repeat.
+                    state.is_hotkey_pressed = was_hotkey_pressed;
+                    return false;
+                }
+            }
+            return true;
         }
-        outcome
+        false
     }
 }
 
 #[derive(Debug)]
 struct HotKeyState {
     hotkey: Hotkey,
+    /// Index of this hotkey's modifier in `KeyboardState::holds`.
+    hold: usize,
     is_modifier_pressed: bool,
     is_hotkey_pressed: bool,
-    should_commit_on_modifier_release: bool,
-    /// Whether the mask key was already injected during this modifier hold.
-    is_modifier_masked: bool,
+    release_intent: ReleaseIntent,
 }
 
 impl HotKeyState {
-    fn new(hotkey: Hotkey) -> Self {
+    fn new(hotkey: Hotkey, hold: usize) -> Self {
         Self {
             hotkey,
+            hold,
             is_modifier_pressed: false,
             is_hotkey_pressed: false,
-            should_commit_on_modifier_release: false,
-            is_modifier_masked: false,
+            release_intent: ReleaseIntent::None,
         }
     }
 
@@ -372,30 +527,27 @@ impl HotKeyState {
         }
 
         if is_key_pressed {
-            if !self.is_modifier_pressed {
-                self.is_modifier_masked = false;
-            }
             self.is_modifier_pressed = true;
             return None;
         }
 
         self.is_modifier_pressed = false;
         self.is_hotkey_pressed = false;
-        self.is_modifier_masked = false;
-        let should_commit = self.should_commit_on_modifier_release;
-        self.should_commit_on_modifier_release = false;
+        let release_intent = self.release_intent;
+        self.release_intent = ReleaseIntent::None;
 
-        if !should_commit {
-            return None;
-        }
-
-        match self.hotkey.id {
-            SWITCH_APPS_HOTKEY_ID => Some(HotKeyAction::SwitchAppsDone),
-            SWITCH_WINDOWS_HOTKEY_ID => Some(HotKeyAction::SwitchWindowsDone),
+        match (release_intent, self.hotkey.id) {
+            (ReleaseIntent::Commit, SWITCH_APPS_HOTKEY_ID) => Some(HotKeyAction::SwitchAppsDone),
+            (ReleaseIntent::Commit, SWITCH_WINDOWS_HOTKEY_ID) => {
+                Some(HotKeyAction::SwitchWindowsDone)
+            }
+            (ReleaseIntent::Cancel, SWITCH_APPS_HOTKEY_ID) => Some(HotKeyAction::SwitchAppsCancel),
             _ => None,
         }
     }
 
+    /// Tracks the hotkey's physical state and returns the switch (or repeat
+    /// consume) it triggers. Release intent is set by the caller on delivery.
     fn handle_hotkey_event(
         &mut self,
         scan_code: u32,
@@ -429,7 +581,6 @@ impl HotKeyState {
             return None;
         }
 
-        self.should_commit_on_modifier_release = true;
         match self.hotkey.id {
             SWITCH_APPS_HOTKEY_ID => Some(HotKeyAction::SwitchApps { reverse }),
             SWITCH_WINDOWS_HOTKEY_ID => Some(HotKeyAction::SwitchWindows { reverse }),
@@ -437,20 +588,17 @@ impl HotKeyState {
         }
     }
 
-    fn handle_cancel_event(
-        &mut self,
-        scan_code: u32,
-        is_key_pressed: bool,
-    ) -> Option<HotKeyAction> {
+    /// Esc cancels only while this hold has a WinOrbit switch pending; without
+    /// one, Alt+Esc stays a native Windows shortcut.
+    fn handle_cancel_event(&self, scan_code: u32, is_key_pressed: bool) -> Option<HotKeyAction> {
         if self.hotkey.id != SWITCH_APPS_HOTKEY_ID
             || scan_code != 0x01
             || !is_key_pressed
             || !self.is_modifier_pressed
+            || self.release_intent == ReleaseIntent::None
         {
             return None;
         }
-
-        self.should_commit_on_modifier_release = false;
         Some(HotKeyAction::SwitchAppsCancel)
     }
 }
@@ -465,55 +613,33 @@ enum HotKeyAction {
     SwitchWindowsDone,
 }
 
-impl HotKeyAction {
-    fn is_switch(self) -> bool {
-        matches!(self, Self::SwitchApps { .. } | Self::SwitchWindows { .. })
-    }
-}
-
 unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
         return CallNextHookEx(None, code, w_param, l_param);
     }
+    // No routine logging here: this runs for every key in the system.
     let kbd_data: &KBDLLHOOKSTRUCT = &*(l_param.0 as *const _);
-    debug!("keyboard {kbd_data:?}");
     let Some(event) = KeyEvent::from_hook_data(kbd_data) else {
         return CallNextHookEx(None, code, w_param, l_param);
     };
-    let is_foreground_in_blacklist = IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed);
-    let outcome = {
-        let mut keyboard_state = KEYBOARD_STATE.lock();
-        let mut sink = WindowSink(HWND(keyboard_state.window as _));
-        keyboard_state.handle_key(event, is_foreground_in_blacklist, &mut sink)
+    // `try_lock` so the hook can never block or deadlock on its own state; the
+    // lock is only contended during start/quiesce.
+    let Some(mut keyboard_state) = KEYBOARD_STATE.try_lock() else {
+        return CallNextHookEx(None, code, w_param, l_param);
     };
-    // Injected outside the lock. The mask lands in the input stream ahead of
-    // the later physical modifier release.
-    if outcome.inject_mask {
-        inject_mask_key();
-    }
-    if outcome.consume {
+    let is_foreground_in_blacklist = IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed);
+    let mut sink = WindowSink(HWND(keyboard_state.window.unwrap_or_default() as _));
+    let consume = keyboard_state.handle_key(
+        event,
+        is_foreground_in_blacklist,
+        &mut sink,
+        &mut SendInputInjector,
+    );
+    drop(keyboard_state);
+    if consume {
         return LRESULT(1);
     }
     CallNextHookEx(None, code, w_param, l_param)
-}
-
-fn inject_mask_key() {
-    let key = |flags| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(VK_MASK),
-                dwFlags: flags,
-                dwExtraInfo: OWN_INJECTION_MARKER,
-                ..Default::default()
-            },
-        },
-    };
-    let inputs = [key(Default::default()), key(KEYEVENTF_KEYUP)];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        warn!("failed to inject modifier mask key, sent {sent} of 2");
-    }
 }
 
 /// Maps a hook action to the app-window message it posts, if any.
@@ -535,14 +661,15 @@ fn action_message(action: HotKeyAction) -> Option<(u32, LPARAM)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_message, wait_for_thread_exit, ActionSink, HookOutcome, HotKeyAction, HotKeyState,
-        KeyEvent, KeyboardState, OWN_INJECTION_MARKER,
+        action_message, wait_for_thread_exit, ActionSink, HotKeyAction, KeyEvent, KeyInjector,
+        KeyboardState, MaskKey, OWN_INJECTION_MARKER,
     };
     use crate::app::{
         WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
         WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
     };
     use crate::config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID};
+    use std::collections::VecDeque;
     use std::sync::mpsc;
     use std::time::Duration;
     use windows::Win32::{
@@ -556,6 +683,11 @@ mod tests {
     const BACKTICK: u32 = 0x29;
     const ESC: u32 = 0x01;
     const A: u32 = 0x1e;
+
+    use HotKeyAction::{
+        SwitchApps, SwitchAppsCancel, SwitchAppsDone, SwitchWindows, SwitchWindowsDone,
+    };
+    use MaskKey::{Down, Up};
 
     /// Records posted actions; fails delivery for actions matching `fail`.
     #[derive(Default)]
@@ -574,395 +706,564 @@ mod tests {
         }
     }
 
-    fn keyboard_state() -> KeyboardState {
-        let apps = Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt+tab")
-            .expect("switch-apps hotkey should parse");
-        let windows = Hotkey::create(SWITCH_WINDOWS_HOTKEY_ID, "switch windows", "alt+`")
-            .expect("switch-windows hotkey should parse");
-        KeyboardState::new(HWND::default(), &[&apps, &windows])
+    /// Records every injection request and the keys actually inserted. Each
+    /// call inserts the next scripted count, or everything once the script is
+    /// exhausted.
+    #[derive(Default)]
+    struct FakeInjector {
+        script: VecDeque<usize>,
+        requests: Vec<Vec<MaskKey>>,
+        inserted: Vec<MaskKey>,
     }
 
-    fn down(scan_code: u32) -> KeyEvent {
-        KeyEvent {
-            scan_code,
-            is_pressed: true,
+    impl FakeInjector {
+        fn scripted(counts: &[usize]) -> Self {
+            Self {
+                script: counts.iter().copied().collect(),
+                ..Default::default()
+            }
         }
     }
 
-    fn up(scan_code: u32) -> KeyEvent {
-        KeyEvent {
-            scan_code,
-            is_pressed: false,
+    impl KeyInjector for FakeInjector {
+        fn send(&mut self, keys: &[MaskKey]) -> usize {
+            self.requests.push(keys.to_vec());
+            let count = self
+                .script
+                .pop_front()
+                .unwrap_or(keys.len())
+                .min(keys.len());
+            self.inserted.extend_from_slice(&keys[..count]);
+            count
         }
     }
 
-    const PASS: HookOutcome = HookOutcome {
-        consume: false,
-        inject_mask: false,
-    };
-    const CONSUME: HookOutcome = HookOutcome {
-        consume: true,
-        inject_mask: false,
-    };
-    const CONSUME_AND_MASK: HookOutcome = HookOutcome {
-        consume: true,
-        inject_mask: true,
-    };
-
-    fn switch_apps_state() -> HotKeyState {
-        HotKeyState::new(
-            Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt+tab")
-                .expect("switch-apps hotkey should parse"),
-        )
+    struct Harness {
+        state: KeyboardState,
+        sink: FakeSink,
+        injector: FakeInjector,
+        blacklisted: bool,
     }
 
-    fn switch_windows_state() -> HotKeyState {
-        HotKeyState::new(
-            Hotkey::create(SWITCH_WINDOWS_HOTKEY_ID, "switch windows", "alt+`")
-                .expect("switch-windows hotkey should parse"),
-        )
+    impl Harness {
+        fn new() -> Self {
+            let apps = Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt+tab")
+                .expect("switch-apps hotkey should parse");
+            let windows = Hotkey::create(SWITCH_WINDOWS_HOTKEY_ID, "switch windows", "alt+`")
+                .expect("switch-windows hotkey should parse");
+            Self {
+                state: KeyboardState::new(HWND::default(), &[&windows, &apps]),
+                sink: FakeSink::default(),
+                injector: FakeInjector::default(),
+                blacklisted: false,
+            }
+        }
+
+        fn key(&mut self, scan_code: u32, is_pressed: bool) -> bool {
+            self.state.handle_key(
+                KeyEvent {
+                    scan_code,
+                    is_pressed,
+                },
+                self.blacklisted,
+                &mut self.sink,
+                &mut self.injector,
+            )
+        }
+
+        fn down(&mut self, scan_code: u32) -> bool {
+            self.key(scan_code, true)
+        }
+
+        fn up(&mut self, scan_code: u32) -> bool {
+            self.key(scan_code, false)
+        }
+
+        fn tap(&mut self, scan_code: u32) -> bool {
+            let consumed = self.down(scan_code);
+            self.up(scan_code);
+            consumed
+        }
+
+        fn fail_posts(&mut self, fail: fn(HotKeyAction) -> bool) {
+            self.sink.fail = Some(fail);
+        }
+
+        fn deliver_posts(&mut self) {
+            self.sink.fail = None;
+        }
     }
+
+    // Normal switching
 
     #[test]
-    fn app_switch_repeat_is_consumed_without_advancing_again() {
-        let mut state = switch_apps_state();
+    fn alt_tab_masks_before_switching_and_commits_on_release() {
+        let mut h = Harness::new();
 
-        assert_eq!(state.handle_modifier_event(0x38, true), None);
+        assert!(!h.down(ALT));
+        assert!(h.tap(TAB));
+        assert!(h.tap(TAB));
+        assert!(!h.up(ALT));
         assert_eq!(
-            state.handle_hotkey_event(0x0f, true, false, true),
-            Some(HotKeyAction::SwitchApps { reverse: false })
-        );
-        assert_eq!(
-            state.handle_hotkey_event(0x0f, true, false, true),
-            Some(HotKeyAction::Consume)
-        );
-        assert_eq!(
-            state.handle_modifier_event(0x38, false),
-            Some(HotKeyAction::SwitchAppsDone)
-        );
-    }
-
-    #[test]
-    fn app_switch_allows_a_new_press_after_key_release() {
-        let mut state = switch_apps_state();
-
-        assert_eq!(state.handle_modifier_event(0x38, true), None);
-        assert_eq!(
-            state.handle_hotkey_event(0x0f, true, false, true),
-            Some(HotKeyAction::SwitchApps { reverse: false })
-        );
-        assert_eq!(state.handle_hotkey_event(0x0f, false, false, true), None);
-        assert_eq!(
-            state.handle_hotkey_event(0x0f, true, true, true),
-            Some(HotKeyAction::SwitchApps { reverse: true })
-        );
-    }
-
-    #[test]
-    fn app_switch_cancel_clears_pending_commit() {
-        let mut state = switch_apps_state();
-
-        assert_eq!(state.handle_modifier_event(0x38, true), None);
-        assert_eq!(
-            state.handle_hotkey_event(0x0f, true, false, true),
-            Some(HotKeyAction::SwitchApps { reverse: false })
-        );
-        assert_eq!(
-            state.handle_cancel_event(0x01, true),
-            Some(HotKeyAction::SwitchAppsCancel)
-        );
-        assert_eq!(state.handle_modifier_event(0x38, false), None);
-    }
-
-    #[test]
-    fn switch_windows_only_commits_when_the_switch_was_allowed() {
-        let mut state = switch_windows_state();
-
-        assert_eq!(state.handle_modifier_event(0x38, true), None);
-        assert_eq!(state.handle_hotkey_event(0x29, true, false, false), None);
-        assert_eq!(state.handle_modifier_event(0x38, false), None);
-    }
-
-    #[test]
-    fn switch_windows_still_commits_on_modifier_release_when_allowed() {
-        let mut state = switch_windows_state();
-
-        assert_eq!(state.handle_modifier_event(0x38, true), None);
-        assert_eq!(
-            state.handle_hotkey_event(0x29, true, false, true),
-            Some(HotKeyAction::SwitchWindows { reverse: false })
-        );
-        assert_eq!(
-            state.handle_modifier_event(0x38, false),
-            Some(HotKeyAction::SwitchWindowsDone)
-        );
-    }
-
-    #[test]
-    fn actions_map_to_the_existing_app_messages() {
-        let message = |action| action_message(action).map(|(msg, lparam)| (msg, lparam.0));
-
-        assert_eq!(message(HotKeyAction::Consume), None);
-        assert_eq!(
-            message(HotKeyAction::SwitchApps { reverse: false }),
-            Some((WM_USER_SWITCH_APPS, 0))
-        );
-        assert_eq!(
-            message(HotKeyAction::SwitchApps { reverse: true }),
-            Some((WM_USER_SWITCH_APPS, 1))
-        );
-        assert_eq!(
-            message(HotKeyAction::SwitchAppsDone),
-            Some((WM_USER_SWITCH_APPS_DONE, 0))
-        );
-        assert_eq!(
-            message(HotKeyAction::SwitchAppsCancel),
-            Some((WM_USER_SWITCH_APPS_CANCEL, 0))
-        );
-        assert_eq!(
-            message(HotKeyAction::SwitchWindows { reverse: true }),
-            Some((WM_USER_SWITCH_WINDOWS, 1))
-        );
-        assert_eq!(
-            message(HotKeyAction::SwitchWindowsDone),
-            Some((WM_USER_SWITCH_WINDOWS_DONE, 0))
-        );
-    }
-
-    #[test]
-    fn alt_tab_posts_switch_masks_once_and_commits_on_release() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
-
-        assert_eq!(state.handle_key(down(ALT), false, &mut sink), PASS);
-        assert_eq!(
-            state.handle_key(down(TAB), false, &mut sink),
-            CONSUME_AND_MASK
-        );
-        assert_eq!(state.handle_key(up(TAB), false, &mut sink), PASS);
-        // Further presses in the same hold do not mask again.
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), CONSUME);
-        assert_eq!(state.handle_key(up(ALT), false, &mut sink), PASS);
-        assert_eq!(
-            sink.posted,
+            h.sink.posted,
             vec![
-                HotKeyAction::SwitchApps { reverse: false },
-                HotKeyAction::SwitchApps { reverse: false },
-                HotKeyAction::SwitchAppsDone,
+                SwitchApps { reverse: false },
+                SwitchApps { reverse: false },
+                SwitchAppsDone,
+            ]
+        );
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+    }
+
+    #[test]
+    fn mask_is_injected_once_per_hold_across_hotkeys() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        assert!(h.tap(TAB));
+        assert!(h.tap(BACKTICK));
+        assert!(h.tap(TAB));
+        h.up(ALT);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+        assert_eq!(
+            h.sink.posted,
+            vec![
+                SwitchApps { reverse: false },
+                SwitchWindows { reverse: false },
+                SwitchApps { reverse: false },
+                SwitchWindowsDone,
+                SwitchAppsDone,
             ]
         );
     }
 
     #[test]
-    fn mask_is_injected_again_on_the_next_modifier_hold() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
+    fn mask_is_injected_again_on_the_next_hold() {
+        let mut h = Harness::new();
 
-        state.handle_key(down(ALT), false, &mut sink);
-        assert_eq!(
-            state.handle_key(down(TAB), false, &mut sink),
-            CONSUME_AND_MASK
-        );
-        state.handle_key(up(TAB), false, &mut sink);
-        state.handle_key(up(ALT), false, &mut sink);
+        h.down(ALT);
+        h.tap(TAB);
+        h.up(ALT);
+        h.down(ALT);
+        h.tap(TAB);
+        h.up(ALT);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up], vec![Down, Up]]);
+    }
 
-        state.handle_key(down(ALT), false, &mut sink);
-        assert_eq!(
-            state.handle_key(down(TAB), false, &mut sink),
-            CONSUME_AND_MASK
-        );
+    #[test]
+    fn modifier_auto_repeat_does_not_start_a_new_hold() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.down(ALT);
+        h.down(ALT);
+        h.tap(TAB);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+    }
+
+    #[test]
+    fn modifier_events_are_never_consumed() {
+        let mut h = Harness::new();
+
+        assert!(!h.down(ALT));
+        h.tap(TAB);
+        assert!(!h.down(ALT));
+        assert!(!h.up(ALT));
     }
 
     #[test]
     fn held_tab_repeat_is_consumed_without_posting() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
+        let mut h = Harness::new();
 
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(down(TAB), false, &mut sink);
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), CONSUME);
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), CONSUME);
+        h.down(ALT);
+        assert!(h.down(TAB));
+        assert!(h.down(TAB));
+        assert!(h.down(TAB));
+        assert_eq!(h.sink.posted, vec![SwitchApps { reverse: false }]);
+    }
+
+    #[test]
+    fn app_switch_allows_a_new_press_after_key_release() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.down(SHIFT);
+        h.tap(TAB);
         assert_eq!(
-            sink.posted,
-            vec![HotKeyAction::SwitchApps { reverse: false }]
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchApps { reverse: true }]
         );
     }
 
     #[test]
-    fn shift_reverses_switches() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
+    fn shift_reverses_both_hotkeys() {
+        let mut h = Harness::new();
 
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(down(SHIFT), false, &mut sink);
-        state.handle_key(down(TAB), false, &mut sink);
-        state.handle_key(up(TAB), false, &mut sink);
-        state.handle_key(down(BACKTICK), false, &mut sink);
+        h.down(ALT);
+        h.down(SHIFT);
+        h.tap(TAB);
+        h.tap(BACKTICK);
         assert_eq!(
-            sink.posted,
+            h.sink.posted,
             vec![
-                HotKeyAction::SwitchApps { reverse: true },
-                HotKeyAction::SwitchWindows { reverse: true },
+                SwitchApps { reverse: true },
+                SwitchWindows { reverse: true }
             ]
         );
     }
 
     #[test]
-    fn escape_cancels_and_release_then_does_not_commit() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
+    fn unrelated_keys_and_bare_modifier_pass_through_unmasked() {
+        let mut h = Harness::new();
 
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(down(TAB), false, &mut sink);
-        assert_eq!(state.handle_key(down(ESC), false, &mut sink), CONSUME);
-        assert_eq!(state.handle_key(up(ALT), false, &mut sink), PASS);
-        assert_eq!(
-            sink.posted,
-            vec![
-                HotKeyAction::SwitchApps { reverse: false },
-                HotKeyAction::SwitchAppsCancel,
-            ]
-        );
-    }
-
-    #[test]
-    fn unrelated_keys_and_bare_modifier_pass_through() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
-
-        assert_eq!(state.handle_key(down(A), false, &mut sink), PASS);
-        assert_eq!(state.handle_key(down(ALT), false, &mut sink), PASS);
-        assert_eq!(state.handle_key(down(A), false, &mut sink), PASS);
-        assert_eq!(state.handle_key(up(ALT), false, &mut sink), PASS);
-        assert!(sink.posted.is_empty());
+        assert!(!h.tap(A));
+        h.down(ALT);
+        assert!(!h.tap(A));
+        h.up(ALT);
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
     }
 
     #[test]
     fn blacklisted_foreground_passes_switch_windows_through() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
+        let mut h = Harness::new();
+        h.blacklisted = true;
 
-        state.handle_key(down(ALT), true, &mut sink);
-        assert_eq!(state.handle_key(down(BACKTICK), true, &mut sink), PASS);
-        assert_eq!(state.handle_key(up(ALT), true, &mut sink), PASS);
-        assert!(sink.posted.is_empty());
+        h.down(ALT);
+        assert!(!h.tap(BACKTICK));
+        assert!(!h.up(ALT));
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
     }
 
     #[test]
-    fn failed_switch_post_passes_key_through_and_leaves_no_pending_commit() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink {
-            fail: Some(|action| action.is_switch()),
-            ..Default::default()
-        };
+    fn switch_windows_still_commits_on_release() {
+        let mut h = Harness::new();
 
-        state.handle_key(down(ALT), false, &mut sink);
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), PASS);
-        // A key repeat is not swallowed as a repeat of the failed switch.
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), PASS);
-        assert_eq!(state.handle_key(up(ALT), false, &mut sink), PASS);
-        assert!(sink.posted.is_empty());
-    }
-
-    #[test]
-    fn key_repeat_retries_a_switch_whose_post_failed() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink {
-            fail: Some(|action| action.is_switch()),
-            ..Default::default()
-        };
-
-        state.handle_key(down(ALT), false, &mut sink);
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), PASS);
-        sink.fail = None;
+        h.down(ALT);
+        assert!(h.tap(BACKTICK));
+        h.up(ALT);
         assert_eq!(
-            state.handle_key(down(TAB), false, &mut sink),
-            CONSUME_AND_MASK
+            h.sink.posted,
+            vec![SwitchWindows { reverse: false }, SwitchWindowsDone]
         );
-        state.handle_key(up(ALT), false, &mut sink);
+    }
+
+    // Cancel
+
+    #[test]
+    fn escape_cancels_and_release_then_does_not_commit() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        assert!(h.tap(ESC));
+        assert!(!h.up(ALT));
         assert_eq!(
-            sink.posted,
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsCancel]
+        );
+    }
+
+    #[test]
+    fn alt_escape_without_a_switch_stays_native() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        assert!(!h.tap(ESC));
+        h.up(ALT);
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
+    }
+
+    #[test]
+    fn escape_after_a_cancel_in_the_same_hold_stays_native() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        assert!(h.tap(ESC));
+        assert!(!h.tap(ESC));
+    }
+
+    #[test]
+    fn tab_after_cancel_starts_a_new_switch_that_commits() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.tap(ESC);
+        assert!(h.tap(TAB));
+        h.up(ALT);
+        assert_eq!(
+            h.sink.posted,
             vec![
-                HotKeyAction::SwitchApps { reverse: false },
-                HotKeyAction::SwitchAppsDone,
+                SwitchApps { reverse: false },
+                SwitchAppsCancel,
+                SwitchApps { reverse: false },
+                SwitchAppsDone,
+            ]
+        );
+    }
+
+    // Delivery failures
+
+    #[test]
+    fn first_switch_post_failure_falls_back_to_native() {
+        let mut h = Harness::new();
+        h.fail_posts(|action| action == SwitchApps { reverse: false });
+
+        h.down(ALT);
+        assert!(!h.down(TAB));
+        // The repeat retries delivery instead of being swallowed as a repeat.
+        assert!(!h.down(TAB));
+        h.up(TAB);
+        assert!(!h.up(ALT));
+        assert!(h.sink.posted.is_empty());
+    }
+
+    #[test]
+    fn key_repeat_retries_a_first_switch_whose_post_failed() {
+        let mut h = Harness::new();
+        h.fail_posts(|action| action == SwitchApps { reverse: false });
+
+        h.down(ALT);
+        assert!(!h.down(TAB));
+        h.deliver_posts();
+        assert!(h.down(TAB));
+        h.up(TAB);
+        h.up(ALT);
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsDone]
+        );
+    }
+
+    #[test]
+    fn later_switch_post_failure_stays_inside_the_winorbit_session() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.fail_posts(|action| action == SwitchApps { reverse: false });
+        // Consumed: native Alt+Tab must not open during a WinOrbit session.
+        assert!(h.down(TAB));
+        // Further repeats of that physical press are plain repeats.
+        assert!(h.down(TAB));
+        h.up(TAB);
+        h.deliver_posts();
+        h.up(ALT);
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsDone]
+        );
+    }
+
+    #[test]
+    fn switch_windows_failure_inside_an_app_session_is_consumed() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.fail_posts(|action| matches!(action, SwitchWindows { .. }));
+        assert!(h.tap(BACKTICK));
+        h.deliver_posts();
+        h.up(ALT);
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsDone]
+        );
+    }
+
+    #[test]
+    fn cancel_failure_is_consumed_and_retried_on_release() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.fail_posts(|action| action == SwitchAppsCancel);
+        assert!(h.tap(ESC));
+        h.deliver_posts();
+        assert!(!h.up(ALT));
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsCancel]
+        );
+    }
+
+    #[test]
+    fn switch_after_failed_cancel_commits_again() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.fail_posts(|action| action == SwitchAppsCancel);
+        h.tap(ESC);
+        h.deliver_posts();
+        h.tap(TAB);
+        h.up(ALT);
+        assert_eq!(
+            h.sink.posted,
+            vec![
+                SwitchApps { reverse: false },
+                SwitchApps { reverse: false },
+                SwitchAppsDone,
             ]
         );
     }
 
     #[test]
-    fn failed_later_switch_post_keeps_the_earlier_pending_commit() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
+    fn commit_failure_leaves_no_pending_state() {
+        let mut h = Harness::new();
 
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(down(TAB), false, &mut sink);
-        state.handle_key(up(TAB), false, &mut sink);
-        sink.fail = Some(|action| action.is_switch());
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), PASS);
-        sink.fail = None;
-        state.handle_key(up(ALT), false, &mut sink);
+        h.down(ALT);
+        h.tap(TAB);
+        h.fail_posts(|action| action == SwitchAppsDone);
+        assert!(!h.up(ALT));
+        h.deliver_posts();
+        h.sink.posted.clear();
+
+        // A later bare Alt press must not replay the lost commit.
+        h.down(ALT);
+        h.up(ALT);
+        assert!(h.sink.posted.is_empty());
+    }
+
+    // Mask injection outcomes
+
+    #[test]
+    fn zero_mask_events_inserted_passes_the_key_through_without_posting() {
+        let mut h = Harness::new();
+        h.injector = FakeInjector::scripted(&[0]);
+
+        h.down(ALT);
+        assert!(!h.down(TAB));
+        h.up(TAB);
+        assert!(!h.up(ALT));
+        assert!(h.sink.posted.is_empty());
+    }
+
+    #[test]
+    fn zero_mask_events_inserted_then_retry_succeeds_on_the_next_press() {
+        let mut h = Harness::new();
+        h.injector = FakeInjector::scripted(&[0]);
+
+        h.down(ALT);
+        assert!(!h.tap(TAB));
+        assert!(h.tap(TAB));
+        h.up(ALT);
         assert_eq!(
-            sink.posted,
-            vec![
-                HotKeyAction::SwitchApps { reverse: false },
-                HotKeyAction::SwitchAppsDone,
-            ]
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsDone]
+        );
+        assert_eq!(h.injector.inserted, vec![Down, Up]);
+    }
+
+    #[test]
+    fn zero_mask_events_on_a_repeat_passes_the_repeat_through() {
+        let mut h = Harness::new();
+        // Tab held before Alt: the first repeat under Alt is a consume, which
+        // also needs the mask first.
+        h.injector = FakeInjector::scripted(&[0]);
+
+        h.down(TAB);
+        h.down(ALT);
+        assert!(!h.down(TAB));
+        assert!(h.sink.posted.is_empty());
+    }
+
+    #[test]
+    fn partial_mask_retries_the_key_up_immediately() {
+        let mut h = Harness::new();
+        h.injector = FakeInjector::scripted(&[1, 1]);
+
+        h.down(ALT);
+        assert!(h.tap(TAB));
+        assert_eq!(h.injector.inserted, vec![Down, Up]);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up], vec![Up]]);
+        assert!(!h.state.is_mask_up_pending);
+    }
+
+    #[test]
+    fn partial_mask_keeps_retrying_the_key_up_until_it_goes_in() {
+        let mut h = Harness::new();
+        h.injector = FakeInjector::scripted(&[1, 0, 0, 1]);
+
+        h.down(ALT);
+        // The hold counts as masked: the app already saw Alt+mask.
+        assert!(h.down(TAB));
+        assert!(h.state.is_mask_up_pending);
+        h.up(TAB);
+        assert!(h.state.is_mask_up_pending);
+        h.up(ALT);
+        assert!(!h.state.is_mask_up_pending);
+        assert_eq!(h.injector.inserted, vec![Down, Up]);
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsDone]
         );
     }
 
     #[test]
-    fn failed_cancel_post_passes_escape_through_and_keeps_the_commit() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
+    fn mask_is_never_requested_for_a_switch_that_is_not_allowed() {
+        let mut h = Harness::new();
+        h.blacklisted = true;
 
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(down(TAB), false, &mut sink);
-        sink.fail = Some(|action| action == HotKeyAction::SwitchAppsCancel);
-        assert_eq!(state.handle_key(down(ESC), false, &mut sink), PASS);
-        state.handle_key(up(ALT), false, &mut sink);
-        assert_eq!(
-            sink.posted,
-            vec![
-                HotKeyAction::SwitchApps { reverse: false },
-                HotKeyAction::SwitchAppsDone,
-            ]
-        );
+        h.down(ALT);
+        h.tap(BACKTICK);
+        assert!(h.injector.requests.is_empty());
+    }
+
+    // Lifecycle
+
+    #[test]
+    fn quiesced_state_never_posts_or_consumes_even_mid_session() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.state.quiesce(&mut h.injector);
+        h.sink.posted.clear();
+        assert!(!h.tap(TAB));
+        assert!(!h.tap(ESC));
+        assert!(!h.up(ALT));
+        assert!(h.sink.posted.is_empty());
     }
 
     #[test]
-    fn failed_commit_post_still_resets_state_for_the_next_hold() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink {
-            fail: Some(|action| action == HotKeyAction::SwitchAppsDone),
-            ..Default::default()
-        };
+    fn quiesce_flushes_a_pending_mask_up() {
+        let mut h = Harness::new();
+        h.injector = FakeInjector::scripted(&[1, 0]);
 
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(down(TAB), false, &mut sink);
-        assert_eq!(state.handle_key(up(ALT), false, &mut sink), PASS);
-        sink.fail = None;
-        sink.posted.clear();
-
-        // A bare Alt press/release afterwards must not replay the lost commit.
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(up(ALT), false, &mut sink);
-        assert!(sink.posted.is_empty());
+        h.down(ALT);
+        h.down(TAB);
+        assert!(h.state.is_mask_up_pending);
+        h.state.quiesce(&mut h.injector);
+        assert!(!h.state.is_mask_up_pending);
+        assert_eq!(h.injector.inserted, vec![Down, Up]);
     }
 
     #[test]
-    fn restarted_state_has_no_pending_commit_or_modifier() {
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
-        state.handle_key(down(ALT), false, &mut sink);
-        state.handle_key(down(SHIFT), false, &mut sink);
-        state.handle_key(down(TAB), false, &mut sink);
+    fn restarted_state_has_no_pending_hold_or_commit() {
+        let mut h = Harness::new();
+        h.down(ALT);
+        h.down(SHIFT);
+        h.tap(TAB);
 
         // `KeyboardListener::start` replaces the state wholesale.
-        let mut state = keyboard_state();
-        let mut sink = FakeSink::default();
-        assert_eq!(state.handle_key(up(ALT), false, &mut sink), PASS);
-        assert_eq!(state.handle_key(down(TAB), false, &mut sink), PASS);
-        assert!(sink.posted.is_empty());
+        let mut h = Harness::new();
+        assert!(!h.up(ALT));
+        assert!(!h.down(TAB));
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
+    }
+
+    #[test]
+    fn hotkeys_with_the_same_modifier_share_one_hold() {
+        let h = Harness::new();
+        assert_eq!(h.state.holds.len(), 1);
     }
 
     #[test]
@@ -975,10 +1276,22 @@ mod tests {
         assert_eq!(KeyEvent::from_hook_data(&data), None);
 
         data.dwExtraInfo = 0;
-        assert_eq!(KeyEvent::from_hook_data(&data), Some(down(TAB)));
+        assert_eq!(
+            KeyEvent::from_hook_data(&data),
+            Some(KeyEvent {
+                scan_code: TAB,
+                is_pressed: true
+            })
+        );
 
         data.flags = KBDLLHOOKSTRUCT_FLAGS(LLKHF_UP.0);
-        assert_eq!(KeyEvent::from_hook_data(&data), Some(up(TAB)));
+        assert_eq!(
+            KeyEvent::from_hook_data(&data),
+            Some(KeyEvent {
+                scan_code: TAB,
+                is_pressed: false
+            })
+        );
     }
 
     #[test]
@@ -992,6 +1305,34 @@ mod tests {
     #[test]
     fn thread_exit_wait_is_bounded_when_the_thread_never_stops() {
         let (_exited_tx, exited_rx) = mpsc::channel::<()>();
-        assert!(!wait_for_thread_exit(&exited_rx, Duration::from_millis(10)));
+        assert!(!wait_for_thread_exit(&exited_rx, Duration::ZERO));
+    }
+
+    #[test]
+    fn actions_map_to_the_existing_app_messages() {
+        let message = |action| action_message(action).map(|(msg, lparam)| (msg, lparam.0));
+
+        assert_eq!(message(HotKeyAction::Consume), None);
+        assert_eq!(
+            message(SwitchApps { reverse: false }),
+            Some((WM_USER_SWITCH_APPS, 0))
+        );
+        assert_eq!(
+            message(SwitchApps { reverse: true }),
+            Some((WM_USER_SWITCH_APPS, 1))
+        );
+        assert_eq!(message(SwitchAppsDone), Some((WM_USER_SWITCH_APPS_DONE, 0)));
+        assert_eq!(
+            message(SwitchAppsCancel),
+            Some((WM_USER_SWITCH_APPS_CANCEL, 0))
+        );
+        assert_eq!(
+            message(SwitchWindows { reverse: true }),
+            Some((WM_USER_SWITCH_WINDOWS, 1))
+        );
+        assert_eq!(
+            message(SwitchWindowsDone),
+            Some((WM_USER_SWITCH_WINDOWS_DONE, 0))
+        );
     }
 }
