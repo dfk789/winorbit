@@ -376,16 +376,15 @@ impl KeyboardState {
         if self.holds[hold].is_masked {
             return true;
         }
-        match injector.send(&[MaskKey::Down, MaskKey::Up]) {
-            0 => return false,
-            1 => {
-                // The app already saw modifier+mask, so the hold is masked; the
-                // mask key itself is logically down until its key-up goes in.
-                if injector.send(&[MaskKey::Up]) != 1 {
-                    self.is_mask_up_pending = true;
-                }
-            }
-            _ => {}
+        let inserted = injector.send(&[MaskKey::Down, MaskKey::Up]);
+        if inserted == 0 {
+            return false;
+        }
+        // With only the key-down inserted the app already saw modifier+mask, so
+        // the hold is masked; the mask key stays logically down until its
+        // key-up goes in.
+        if inserted == 1 && injector.send(&[MaskKey::Up]) != 1 {
+            self.is_mask_up_pending = true;
         }
         self.holds[hold].is_masked = true;
         true
