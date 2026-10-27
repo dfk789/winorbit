@@ -80,9 +80,14 @@ function Start-WinOrbit {
     $deadline = (Get-Date).AddSeconds(5)
     do {
         Start-Sleep -Milliseconds 50
-        $hwnd = [W]::FindWindow("WinOrbit", $null)
+        # [NullString]::Value, not $null: PowerShell turns $null into "" for a
+        # string argument, and FindWindow would then only match an empty title.
+        $hwnd = [W]::FindWindow("WinOrbit", [NullString]::Value)
     } while ($hwnd -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
-    if ($hwnd -eq [IntPtr]::Zero) { throw "WinOrbit window did not appear" }
+    if ($hwnd -eq [IntPtr]::Zero) {
+        if (-not $p.HasExited) { $p.Kill() }
+        throw "WinOrbit window did not appear"
+    }
     Start-Sleep -Milliseconds 200
     return @{ Process = $p; Hwnd = $hwnd }
 }
@@ -219,6 +224,10 @@ try {
     $result = Stop-WinOrbit $app
     Write-Host "  final exit: exited=$($result.Exited) code=$($result.Code)"
     if (-not $result.Exited -or $result.Code -ne 0) { $failures.Add("final exit failed") }
+} catch {
+    # A run that aborts part-way must never report PASS.
+    $failures.Add("aborted: $_")
+    Get-Process -Name winorbit -ErrorAction SilentlyContinue | Stop-Process -Force
 } finally {
     Release-All
     # 4. Nothing left logically down.
