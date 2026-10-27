@@ -13,7 +13,7 @@ use crate::utils::{
     is_running_as_admin, list_windows, set_foreground_window, set_window_user_data,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use indexmap::IndexSet;
 use std::collections::HashMap;
 use windows::core::{w, PCWSTR};
@@ -60,6 +60,8 @@ pub struct App {
     switch_apps_state: Option<SwitchAppsState>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
+    /// Owned by the app so it is stopped before the app state is freed.
+    keyboard_listener: KeyboardListener,
 }
 
 impl App {
@@ -68,7 +70,7 @@ impl App {
         let painter = GdiAAPainter::new(hwnd)?;
 
         let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
-        let _keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
+        let keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
 
         let trayicon = match config.trayicon {
             true => Some(TrayIcon::create()),
@@ -93,6 +95,7 @@ impl App {
             switch_apps_state: None,
             cached_icons: Default::default(),
             painter,
+            keyboard_listener,
         };
 
         app.set_trayicon();
@@ -101,7 +104,11 @@ impl App {
         check_error(|| set_window_user_data(hwnd, app_ptr))
             .map_err(|err| anyhow!("Failed to set window ptr, {err}"))?;
 
-        Self::eventloop()
+        let result = Self::eventloop();
+        // The app is freed only here, after the message loop, never from inside
+        // a message handler that may itself be running under a `get_app` borrow.
+        drop(take_app(hwnd));
+        result
     }
 
     fn eventloop() -> Result<()> {
@@ -276,8 +283,10 @@ impl App {
                 if kind == 0 {
                     match id {
                         IDM_EXIT => {
+                            // Stop keyboard messages now; the app itself is
+                            // freed after the message loop ends.
                             if let Ok(app) = get_app(hwnd) {
-                                unsafe { drop(Box::from_raw(app)) }
+                                app.keyboard_listener.quiesce();
                             }
                             unsafe { PostQuitMessage(0) }
                         }
@@ -504,13 +513,36 @@ impl App {
     }
 }
 
+/// Returns the app stored in the window's user data.
+///
+/// The pointer is null before `App::start` stores it and after `take_app`
+/// clears it, so messages still queued from the keyboard hook, the tray retry
+/// thread or `TaskbarCreated` broadcasts are rejected instead of dereferenced.
 fn get_app(hwnd: HWND) -> Result<&'static mut App> {
-    unsafe {
-        let ptr = check_error(|| get_window_user_data(hwnd))
-            .map_err(|err| anyhow!("Failed to get window ptr, {err}"))?;
-        let tx: &mut App = &mut *(ptr as *mut App);
-        Ok(tx)
+    let ptr = check_error(|| get_window_user_data(hwnd))
+        .map_err(|err| anyhow!("Failed to get window ptr, {err}"))?;
+    if ptr == 0 {
+        bail!("App is not available");
     }
+    // SAFETY: a non-null pointer was stored by `App::start` from `Box::into_raw`
+    // and stays valid until `take_app` clears it on this same UI thread.
+    Ok(unsafe { &mut *(ptr as *mut App) })
+}
+
+/// Clears the window's app pointer and returns ownership of the app, if any.
+fn take_app(hwnd: HWND) -> Option<Box<App>> {
+    let ptr = get_window_user_data(hwnd);
+    if ptr == 0 {
+        return None;
+    }
+    if let Err(err) = check_error(|| set_window_user_data(hwnd, 0)) {
+        // Leaking is safer than freeing an app the window may still reach.
+        error!("Failed to clear window ptr, {err}");
+        return None;
+    }
+    // SAFETY: the pointer came from `Box::into_raw` in `App::start` and has just
+    // been removed from the window, so this is the only owner.
+    Some(unsafe { Box::from_raw(ptr as *mut App) })
 }
 
 #[derive(Debug)]
