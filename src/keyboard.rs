@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicIsize, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError},
     LazyLock,
 };
@@ -27,7 +27,8 @@ use windows::Win32::{
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW,
             PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-            HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_QUIT,
+            HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
+            WM_QUIT,
         },
     },
 };
@@ -43,12 +44,70 @@ const OWN_INJECTION_MARKER: usize = 0x574F_524B;
 /// How long `KeyboardListener::drop` waits for the hook thread to exit.
 const HOOK_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Hook state, shared between `keyboard_proc` (hook thread) and the listener's
-/// start/quiesce calls (UI thread).
-static KEYBOARD_STATE: LazyLock<Mutex<KeyboardState>> =
-    LazyLock::new(|| Mutex::new(KeyboardState::new(HWND::default(), &[])));
+/// Everything the hook thread can reach.
+///
+/// Ownership invariant: the hook callback touches only this `'static` value
+/// (never freed) and the app window's HWND *value*, which it passes to
+/// `PostMessageW`. It never dereferences `App`. `App` is reachable only through
+/// the window's user data on the UI thread, and `app::take_app` clears that
+/// pointer before freeing the `Box<App>`. So a hook thread that is stuck,
+/// late, or detached can never reach freed memory: a message it posts is
+/// either handled while `App` is alive or dropped/rejected afterwards.
+///
+/// Quiescing (`target` = 0) is a "stop producing" signal, not the safety gate
+/// above. It never waits, so shutdown never depends on the hook finishing.
+struct HookShared {
+    /// App window the hook posts to, as an integer because `HWND` is not
+    /// `Send`. 0 once quiesced.
+    target: AtomicIsize,
+    state: Mutex<KeyboardState>,
+}
 
-/// At most one listener may own `KEYBOARD_STATE` and the hook at a time.
+impl HookShared {
+    fn new() -> Self {
+        Self {
+            target: AtomicIsize::new(0),
+            state: Mutex::new(KeyboardState::new(&[])),
+        }
+    }
+
+    /// Stops the hook from starting new work for the app. Never blocks. A hook
+    /// event that already read the target may still post once; see the
+    /// ownership invariant on `HookShared` for why that is safe.
+    fn quiesce(&self) {
+        self.target.store(0, Ordering::Release);
+    }
+
+    /// Hook-thread side of one key event. Never blocks: a contended state lock
+    /// passes the key through. Returns true to consume the event.
+    fn on_key<S: ActionSink>(
+        &self,
+        event: KeyEvent,
+        is_foreground_in_blacklist: bool,
+        sink_for: impl FnOnce(isize) -> S,
+        injector: &mut impl KeyInjector,
+    ) -> bool {
+        let Some(mut state) = self.state.try_lock() else {
+            return false;
+        };
+        // Retried even after quiesce, so the mask key gets every chance to go up.
+        state.flush_pending_mask_up(injector);
+        let target = self.target.load(Ordering::Acquire);
+        if target == 0 {
+            return false;
+        }
+        state.handle_key(
+            event,
+            is_foreground_in_blacklist,
+            &mut sink_for(target),
+            injector,
+        )
+    }
+}
+
+static HOOK: LazyLock<HookShared> = LazyLock::new(HookShared::new);
+
+/// At most one listener (or detached hook thread) may own `HOOK` at a time.
 static LISTENER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Owns the dedicated thread that installs `WH_KEYBOARD_LL` and pumps its
@@ -77,6 +136,7 @@ impl KeyboardListener {
         match Self::start(hwnd, hotkeys) {
             Ok(listener) => Ok(listener),
             Err(err) => {
+                HOOK.quiesce();
                 LISTENER_ACTIVE.store(false, Ordering::Release);
                 Err(err)
             }
@@ -84,8 +144,11 @@ impl KeyboardListener {
     }
 
     fn start(hwnd: HWND, hotkeys: &[&Hotkey]) -> Result<Self> {
-        // Fresh state on every start, so nothing leaks across restarts.
-        *KEYBOARD_STATE.lock() = KeyboardState::new(hwnd, hotkeys);
+        // Fresh state on every start, so nothing leaks across restarts. This
+        // lock is uncontended: holding `LISTENER_ACTIVE` means no hook thread
+        // exists, because a detached one keeps the slot taken forever.
+        *HOOK.state.lock() = KeyboardState::new(hotkeys);
+        HOOK.target.store(hwnd.0 as isize, Ordering::Release);
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32>>();
         let (exited_tx, exited_rx) = mpsc::channel::<()>();
@@ -117,33 +180,87 @@ impl KeyboardListener {
         })
     }
 
-    /// Stops all further messages to the app window. Once this returns the
-    /// hook can never post again, even if its thread keeps running, because
-    /// posting only happens while holding the state lock. Idempotent.
+    /// Stops all new keyboard messages to the app window. Never blocks, even
+    /// if the hook thread is stuck holding its state. Idempotent.
     pub fn quiesce(&self) {
-        KEYBOARD_STATE.lock().quiesce(&mut SendInputInjector);
+        HOOK.quiesce();
     }
 }
 
 impl Drop for KeyboardListener {
     fn drop(&mut self) {
         debug!("keyboard listener destroyed");
-        self.quiesce();
+        HOOK.quiesce();
         if let Err(err) =
             unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
         {
             // The thread may already have exited; the bounded wait covers both.
             error!("failed to signal keyboard hook thread to stop, {err}");
         }
-        if wait_for_thread_exit(&self.exited, HOOK_THREAD_STOP_TIMEOUT) {
+        let thread_exited = wait_for_thread_exit(&self.exited, HOOK_THREAD_STOP_TIMEOUT);
+        if thread_exited {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
+        }
+        report_mask_cleanup(finish_shutdown(
+            &HOOK,
+            thread_exited,
+            &mut SendInputInjector,
+        ));
+        if thread_exited {
             LISTENER_ACTIVE.store(false, Ordering::Release);
         } else {
-            // Never block shutdown indefinitely. The detached thread is already
-            // quiesced and still owns the hook, so the listener slot stays taken.
+            // Never block shutdown indefinitely. The detached thread is
+            // quiesced and only ever touches `HOOK`, which is never freed. It
+            // keeps the listener slot so no restart can share its state.
             error!("keyboard hook thread did not stop in time; detaching it");
+        }
+    }
+}
+
+/// Outcome of releasing a mask key whose key-up never went in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaskCleanup {
+    /// No mask key-up was pending.
+    NotNeeded,
+    /// The pending key-up was injected.
+    Released,
+    /// Injection failed again; vkE8 may stay logically down. Best effort only:
+    /// `SendInput` can keep failing (or be blocked by UIPI) and nothing else
+    /// can release a key this process pressed.
+    StillDown,
+    /// The hook thread still holds the state, so cleanup was not attempted.
+    Skipped,
+}
+
+/// Final mask cleanup once the hook has been quiesced. Bounded: it takes the
+/// state lock normally only after the hook thread has exited (nothing else
+/// can hold it then) and otherwise only tries it once.
+fn finish_shutdown(
+    shared: &HookShared,
+    thread_exited: bool,
+    injector: &mut impl KeyInjector,
+) -> MaskCleanup {
+    let state = if thread_exited {
+        Some(shared.state.lock())
+    } else {
+        shared.state.try_lock()
+    };
+    match state {
+        Some(mut state) => state.release_pending_mask(injector),
+        None => MaskCleanup::Skipped,
+    }
+}
+
+fn report_mask_cleanup(cleanup: MaskCleanup) {
+    match cleanup {
+        MaskCleanup::NotNeeded | MaskCleanup::Released => {}
+        MaskCleanup::StillDown => {
+            error!("mask key vkE8 may still be logically down: its key-up could not be injected")
+        }
+        MaskCleanup::Skipped => {
+            error!("keyboard hook still holds its state; skipped releasing a pending mask key")
         }
     }
 }
@@ -213,6 +330,8 @@ fn run_hook_thread(ready: mpsc::Sender<Result<u32>>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyEvent {
     scan_code: u32,
+    /// Only used to tell apart modifier sides that share a scan code.
+    is_extended: bool,
     is_pressed: bool,
 }
 
@@ -224,14 +343,50 @@ impl KeyEvent {
         }
         Some(Self {
             scan_code: data.scanCode,
+            is_extended: data.flags.0 & LLKHF_EXTENDED.0 != 0,
             is_pressed: data.flags.0 & LLKHF_UP.0 == 0,
         })
+    }
+}
+
+/// Bit identifying one physical side of a two-sided key, or `None` if the
+/// event is not one of `sides`. Sides with their own scan code (LWin/RWin,
+/// LShift/RShift) are told apart by scan code; sides that share one
+/// (LAlt/RAlt, LCtrl/RCtrl) by the extended-key flag.
+fn side_bit(sides: [u32; 2], event: KeyEvent) -> Option<u8> {
+    let index = sides.iter().position(|&code| code == event.scan_code)?;
+    Some(1 << (index * 2 + event.is_extended as usize))
+}
+
+/// Physical sides of a two-sided key that are currently down, one bit each.
+/// Setting or clearing a bit is idempotent, so a repeated key-down or a stray
+/// key-up can never corrupt the state the way a counter could.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SidesDown(u8);
+
+impl SidesDown {
+    fn is_down(self) -> bool {
+        self.0 != 0
+    }
+
+    fn apply(&mut self, bit: u8, is_pressed: bool) {
+        if is_pressed {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
     }
 }
 
 /// Delivers actions to the UI thread. Returns false if delivery failed.
 trait ActionSink {
     fn post(&mut self, action: HotKeyAction) -> bool;
+}
+
+impl<T: ActionSink> ActionSink for &mut T {
+    fn post(&mut self, action: HotKeyAction) -> bool {
+        (**self).post(action)
+    }
 }
 
 struct WindowSink(HWND);
@@ -297,10 +452,14 @@ impl KeyInjector for SendInputInjector {
 
 /// State of one physical modifier hold, shared by every hotkey using that
 /// modifier so masking and ownership are per hold, not per hotkey.
+///
+/// A hold starts when the first side goes down, lasts while either side is
+/// down, and ends only when the last side goes up. Releasing one side while
+/// the other is still down changes nothing else.
 #[derive(Debug)]
 struct ModifierHold {
     modifier: [u32; 2],
-    is_pressed: bool,
+    sides: SidesDown,
     /// The mask key is in the input stream for this hold. Required before
     /// the hook consumes any key while the modifier is held.
     is_masked: bool,
@@ -319,10 +478,7 @@ enum ReleaseIntent {
 
 #[derive(Debug)]
 struct KeyboardState {
-    /// App window that receives posted switch messages, stored as an integer
-    /// because `HWND` is not `Send`. `None` once quiesced.
-    window: Option<isize>,
-    is_shift_pressed: bool,
+    shift: SidesDown,
     /// A mask key-down went in without its key-up; retried on every event.
     is_mask_up_pending: bool,
     holds: Vec<ModifierHold>,
@@ -330,7 +486,7 @@ struct KeyboardState {
 }
 
 impl KeyboardState {
-    fn new(hwnd: HWND, hotkeys: &[&Hotkey]) -> Self {
+    fn new(hotkeys: &[&Hotkey]) -> Self {
         let mut holds: Vec<ModifierHold> = vec![];
         let hotkeys = hotkeys
             .iter()
@@ -340,7 +496,7 @@ impl KeyboardState {
                     None => {
                         holds.push(ModifierHold {
                             modifier: hotkey.modifier,
-                            is_pressed: false,
+                            sides: SidesDown::default(),
                             is_masked: false,
                             is_owned: false,
                         });
@@ -351,22 +507,29 @@ impl KeyboardState {
             })
             .collect();
         Self {
-            window: Some(hwnd.0 as isize),
-            is_shift_pressed: false,
+            shift: SidesDown::default(),
             is_mask_up_pending: false,
             holds,
             hotkeys,
         }
     }
 
-    fn quiesce(&mut self, injector: &mut impl KeyInjector) {
-        self.window = None;
-        self.flush_pending_mask_up(injector);
-    }
-
     fn flush_pending_mask_up(&mut self, injector: &mut impl KeyInjector) {
         if self.is_mask_up_pending && injector.send(&[MaskKey::Up]) == 1 {
             self.is_mask_up_pending = false;
+        }
+    }
+
+    /// Last attempt at a pending mask key-up, reporting what happened.
+    fn release_pending_mask(&mut self, injector: &mut impl KeyInjector) -> MaskCleanup {
+        if !self.is_mask_up_pending {
+            return MaskCleanup::NotNeeded;
+        }
+        self.flush_pending_mask_up(injector);
+        if self.is_mask_up_pending {
+            MaskCleanup::StillDown
+        } else {
+            MaskCleanup::Released
         }
     }
 
@@ -381,13 +544,50 @@ impl KeyboardState {
             return false;
         }
         // With only the key-down inserted the app already saw modifier+mask, so
-        // the hold is masked; the mask key stays logically down until its
-        // key-up goes in.
+        // the hold is masked. The key-up is retried (best effort) until it goes
+        // in; see `MaskCleanup::StillDown`.
         if inserted == 1 && injector.send(&[MaskKey::Up]) != 1 {
             self.is_mask_up_pending = true;
         }
         self.holds[hold].is_masked = true;
         true
+    }
+
+    /// Updates modifier holds for a modifier event and posts the release
+    /// action of every hotkey whose hold just ended. Returns false if the
+    /// event is not a configured modifier.
+    fn handle_modifier_key(&mut self, event: KeyEvent, sink: &mut impl ActionSink) -> bool {
+        let mut is_modifier = false;
+        let mut ended_holds = 0u32;
+        for (index, hold) in self.holds.iter_mut().enumerate() {
+            let Some(bit) = side_bit(hold.modifier, event) else {
+                continue;
+            };
+            is_modifier = true;
+            let was_held = hold.sides.is_down();
+            hold.sides.apply(bit, event.is_pressed);
+            if event.is_pressed && !was_held {
+                // First side down: a new hold.
+                hold.is_masked = false;
+                hold.is_owned = false;
+            } else if !event.is_pressed && !hold.sides.is_down() {
+                // Last side up: the hold is over.
+                hold.is_masked = false;
+                hold.is_owned = false;
+                ended_holds |= 1 << index;
+            }
+        }
+        for state in self.hotkeys.iter_mut() {
+            if ended_holds & (1 << state.hold) == 0 {
+                continue;
+            }
+            if let Some(action) = state.end_hold() {
+                // Release state is already cleared; a failed post has nothing
+                // to roll back (the UI is unreachable) and is logged by the sink.
+                sink.post(action);
+            }
+        }
+        is_modifier
     }
 
     /// Updates hotkey state for one event, delivering actions and injecting the
@@ -407,52 +607,28 @@ impl KeyboardState {
         sink: &mut impl ActionSink,
         injector: &mut impl KeyInjector,
     ) -> bool {
-        self.flush_pending_mask_up(injector);
-        if self.window.is_none() {
-            return false;
+        if let Some(bit) = side_bit([SCANCODE_LSHIFT, SCANCODE_RSHIFT], event) {
+            self.shift.apply(bit, event.is_pressed);
         }
-        if [SCANCODE_LSHIFT, SCANCODE_RSHIFT].contains(&event.scan_code) {
-            self.is_shift_pressed = event.is_pressed;
-        }
-        let reverse = self.is_shift_pressed;
+        let reverse = self.shift.is_down();
 
-        let mut is_modifier = false;
-        for hold in self.holds.iter_mut() {
-            if !hold.modifier.contains(&event.scan_code) {
-                continue;
-            }
-            is_modifier = true;
-            if event.is_pressed && hold.is_pressed {
-                continue;
-            }
-            // A new hold, or the end of one: start from scratch either way.
-            hold.is_pressed = event.is_pressed;
-            hold.is_masked = false;
-            hold.is_owned = false;
-        }
-        for state in self.hotkeys.iter_mut() {
-            if let Some(action) = state.handle_modifier_event(event.scan_code, event.is_pressed) {
-                // Release state is already cleared; a failed post has nothing
-                // to roll back (the UI is unreachable) and is logged by the sink.
-                sink.post(action);
-            }
-        }
-        if is_modifier {
+        if self.handle_modifier_key(event, sink) {
             return false;
         }
 
         for index in 0..self.hotkeys.len() {
             let allow_switch = self.hotkeys[index].hotkey.id != SWITCH_WINDOWS_HOTKEY_ID
                 || !is_foreground_in_blacklist;
+            let hold = self.hotkeys[index].hold;
+            let is_held = self.holds[hold].sides.is_down();
             let state = &mut self.hotkeys[index];
             let was_hotkey_pressed = state.is_hotkey_pressed;
             let action = state
-                .handle_hotkey_event(event.scan_code, event.is_pressed, reverse, allow_switch)
-                .or_else(|| state.handle_cancel_event(event.scan_code, event.is_pressed));
+                .handle_hotkey_event(event, is_held, reverse, allow_switch)
+                .or_else(|| state.handle_cancel_event(event, is_held));
             let Some(action) = action else {
                 continue;
             };
-            let hold = state.hold;
 
             if !self.ensure_masked(hold, injector) {
                 // Not masked, so not consuming: Windows gets the key natively.
@@ -498,9 +674,9 @@ impl KeyboardState {
 #[derive(Debug)]
 struct HotKeyState {
     hotkey: Hotkey,
-    /// Index of this hotkey's modifier in `KeyboardState::holds`.
+    /// Index of this hotkey's modifier in `KeyboardState::holds`; whether the
+    /// modifier is held is read from there, never tracked per hotkey.
     hold: usize,
-    is_modifier_pressed: bool,
     is_hotkey_pressed: bool,
     release_intent: ReleaseIntent,
 }
@@ -510,27 +686,13 @@ impl HotKeyState {
         Self {
             hotkey,
             hold,
-            is_modifier_pressed: false,
             is_hotkey_pressed: false,
             release_intent: ReleaseIntent::None,
         }
     }
 
-    fn handle_modifier_event(
-        &mut self,
-        scan_code: u32,
-        is_key_pressed: bool,
-    ) -> Option<HotKeyAction> {
-        if !self.hotkey.modifier.contains(&scan_code) {
-            return None;
-        }
-
-        if is_key_pressed {
-            self.is_modifier_pressed = true;
-            return None;
-        }
-
-        self.is_modifier_pressed = false;
+    /// Called when the last side of this hotkey's modifier is released.
+    fn end_hold(&mut self) -> Option<HotKeyAction> {
         self.is_hotkey_pressed = false;
         let release_intent = self.release_intent;
         self.release_intent = ReleaseIntent::None;
@@ -549,16 +711,16 @@ impl HotKeyState {
     /// consume) it triggers. Release intent is set by the caller on delivery.
     fn handle_hotkey_event(
         &mut self,
-        scan_code: u32,
-        is_key_pressed: bool,
+        event: KeyEvent,
+        is_modifier_held: bool,
         reverse: bool,
         allow_switch: bool,
     ) -> Option<HotKeyAction> {
-        if scan_code != self.hotkey.code {
+        if event.scan_code != self.hotkey.code {
             return None;
         }
 
-        if !is_key_pressed {
+        if !event.is_pressed {
             self.is_hotkey_pressed = false;
             return None;
         }
@@ -566,7 +728,7 @@ impl HotKeyState {
         let is_repeat = self.is_hotkey_pressed;
         self.is_hotkey_pressed = true;
 
-        if !self.is_modifier_pressed {
+        if !is_modifier_held {
             return None;
         }
 
@@ -589,11 +751,11 @@ impl HotKeyState {
 
     /// Esc cancels only while this hold has a WinOrbit switch pending; without
     /// one, Alt+Esc stays a native Windows shortcut.
-    fn handle_cancel_event(&self, scan_code: u32, is_key_pressed: bool) -> Option<HotKeyAction> {
+    fn handle_cancel_event(&self, event: KeyEvent, is_modifier_held: bool) -> Option<HotKeyAction> {
         if self.hotkey.id != SWITCH_APPS_HOTKEY_ID
-            || scan_code != 0x01
-            || !is_key_pressed
-            || !self.is_modifier_pressed
+            || event.scan_code != 0x01
+            || !event.is_pressed
+            || !is_modifier_held
             || self.release_intent == ReleaseIntent::None
         {
             return None;
@@ -621,20 +783,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     let Some(event) = KeyEvent::from_hook_data(kbd_data) else {
         return CallNextHookEx(None, code, w_param, l_param);
     };
-    // `try_lock` so the hook can never block or deadlock on its own state; the
-    // lock is only contended during start/quiesce.
-    let Some(mut keyboard_state) = KEYBOARD_STATE.try_lock() else {
-        return CallNextHookEx(None, code, w_param, l_param);
-    };
     let is_foreground_in_blacklist = IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed);
-    let mut sink = WindowSink(HWND(keyboard_state.window.unwrap_or_default() as _));
-    let consume = keyboard_state.handle_key(
+    let consume = HOOK.on_key(
         event,
         is_foreground_in_blacklist,
-        &mut sink,
+        |target| WindowSink(HWND(target as _)),
         &mut SendInputInjector,
     );
-    drop(keyboard_state);
     if consume {
         return LRESULT(1);
     }
@@ -660,24 +815,31 @@ fn action_message(action: HotKeyAction) -> Option<(u32, LPARAM)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_message, wait_for_thread_exit, ActionSink, HotKeyAction, KeyEvent, KeyInjector,
-        KeyboardState, MaskKey, OWN_INJECTION_MARKER,
+        action_message, finish_shutdown, wait_for_thread_exit, ActionSink, HookShared,
+        HotKeyAction, KeyEvent, KeyInjector, KeyboardListener, KeyboardState, MaskCleanup, MaskKey,
+        LISTENER_ACTIVE, OWN_INJECTION_MARKER,
     };
     use crate::app::{
         WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
         WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
     };
     use crate::config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID};
+    use parking_lot::MutexGuard;
     use std::collections::VecDeque;
-    use std::sync::mpsc;
+    use std::sync::{atomic::Ordering, mpsc};
     use std::time::Duration;
     use windows::Win32::{
         Foundation::HWND,
-        UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_UP},
+        UI::WindowsAndMessaging::{
+            KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_EXTENDED, LLKHF_UP,
+        },
     };
 
     const ALT: u32 = 0x38;
     const SHIFT: u32 = 0x2a;
+    const RSHIFT: u32 = 0x36;
+    const LWIN: u32 = 0x5b;
+    const RWIN: u32 = 0x5c;
     const TAB: u32 = 0x0f;
     const BACKTICK: u32 = 0x29;
     const ESC: u32 = 0x01;
@@ -707,10 +869,11 @@ mod tests {
 
     /// Records every injection request and the keys actually inserted. Each
     /// call inserts the next scripted count, or everything once the script is
-    /// exhausted.
+    /// exhausted. With `fail_up`, every mask key-up fails forever.
     #[derive(Default)]
     struct FakeInjector {
         script: VecDeque<usize>,
+        fail_up: bool,
         requests: Vec<Vec<MaskKey>>,
         inserted: Vec<MaskKey>,
     }
@@ -727,18 +890,34 @@ mod tests {
     impl KeyInjector for FakeInjector {
         fn send(&mut self, keys: &[MaskKey]) -> usize {
             self.requests.push(keys.to_vec());
-            let count = self
-                .script
-                .pop_front()
-                .unwrap_or(keys.len())
-                .min(keys.len());
+            let count = if self.fail_up {
+                keys.iter().take_while(|key| **key == Down).count()
+            } else {
+                self.script
+                    .pop_front()
+                    .unwrap_or(keys.len())
+                    .min(keys.len())
+            };
             self.inserted.extend_from_slice(&keys[..count]);
             count
         }
     }
 
+    /// Shared hook state for one listener, driven through the same
+    /// `HookShared::on_key` entry point the real hook uses.
+    fn shared_with(hotkeys: [&str; 2]) -> HookShared {
+        let windows = Hotkey::create(SWITCH_WINDOWS_HOTKEY_ID, "switch windows", hotkeys[0])
+            .expect("switch-windows hotkey should parse");
+        let apps = Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", hotkeys[1])
+            .expect("switch-apps hotkey should parse");
+        let shared = HookShared::new();
+        *shared.state.lock() = KeyboardState::new(&[&windows, &apps]);
+        shared.target.store(1, Ordering::Release);
+        shared
+    }
+
     struct Harness {
-        state: KeyboardState,
+        shared: HookShared,
         sink: FakeSink,
         injector: FakeInjector,
         blacklisted: bool,
@@ -746,28 +925,38 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            let apps = Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt+tab")
-                .expect("switch-apps hotkey should parse");
-            let windows = Hotkey::create(SWITCH_WINDOWS_HOTKEY_ID, "switch windows", "alt+`")
-                .expect("switch-windows hotkey should parse");
+            Self::with_hotkeys(["alt+`", "alt+tab"])
+        }
+
+        fn with_hotkeys(hotkeys: [&str; 2]) -> Self {
             Self {
-                state: KeyboardState::new(HWND::default(), &[&windows, &apps]),
+                shared: shared_with(hotkeys),
                 sink: FakeSink::default(),
                 injector: FakeInjector::default(),
                 blacklisted: false,
             }
         }
 
-        fn key(&mut self, scan_code: u32, is_pressed: bool) -> bool {
-            self.state.handle_key(
+        fn state(&self) -> MutexGuard<'_, KeyboardState> {
+            self.shared.state.lock()
+        }
+
+        fn event(&mut self, scan_code: u32, is_extended: bool, is_pressed: bool) -> bool {
+            let sink = &mut self.sink;
+            self.shared.on_key(
                 KeyEvent {
                     scan_code,
+                    is_extended,
                     is_pressed,
                 },
                 self.blacklisted,
-                &mut self.sink,
+                move |_| sink,
                 &mut self.injector,
             )
+        }
+
+        fn key(&mut self, scan_code: u32, is_pressed: bool) -> bool {
+            self.event(scan_code, false, is_pressed)
         }
 
         fn down(&mut self, scan_code: u32) -> bool {
@@ -776,6 +965,15 @@ mod tests {
 
         fn up(&mut self, scan_code: u32) -> bool {
             self.key(scan_code, false)
+        }
+
+        /// Key-down of an extended key (RAlt, RCtrl, both Win keys).
+        fn down_ext(&mut self, scan_code: u32) -> bool {
+            self.event(scan_code, true, true)
+        }
+
+        fn up_ext(&mut self, scan_code: u32) -> bool {
+            self.event(scan_code, true, false)
         }
 
         fn tap(&mut self, scan_code: u32) -> bool {
@@ -1182,7 +1380,7 @@ mod tests {
         assert!(h.tap(TAB));
         assert_eq!(h.injector.inserted, vec![Down, Up]);
         assert_eq!(h.injector.requests, vec![vec![Down, Up], vec![Up]]);
-        assert!(!h.state.is_mask_up_pending);
+        assert!(!h.state().is_mask_up_pending);
     }
 
     #[test]
@@ -1193,11 +1391,11 @@ mod tests {
         h.down(ALT);
         // The hold counts as masked: the app already saw Alt+mask.
         assert!(h.down(TAB));
-        assert!(h.state.is_mask_up_pending);
+        assert!(h.state().is_mask_up_pending);
         h.up(TAB);
-        assert!(h.state.is_mask_up_pending);
+        assert!(h.state().is_mask_up_pending);
         h.up(ALT);
-        assert!(!h.state.is_mask_up_pending);
+        assert!(!h.state().is_mask_up_pending);
         assert_eq!(h.injector.inserted, vec![Down, Up]);
         assert_eq!(
             h.sink.posted,
@@ -1223,7 +1421,7 @@ mod tests {
 
         h.down(ALT);
         h.tap(TAB);
-        h.state.quiesce(&mut h.injector);
+        h.shared.quiesce();
         h.sink.posted.clear();
         assert!(!h.tap(TAB));
         assert!(!h.tap(ESC));
@@ -1232,16 +1430,141 @@ mod tests {
     }
 
     #[test]
-    fn quiesce_flushes_a_pending_mask_up() {
+    fn shutdown_after_the_hook_thread_exits_releases_a_pending_mask_up() {
         let mut h = Harness::new();
         h.injector = FakeInjector::scripted(&[1, 0]);
 
         h.down(ALT);
         h.down(TAB);
-        assert!(h.state.is_mask_up_pending);
-        h.state.quiesce(&mut h.injector);
-        assert!(!h.state.is_mask_up_pending);
+        assert!(h.state().is_mask_up_pending);
+        h.shared.quiesce();
+        assert_eq!(
+            finish_shutdown(&h.shared, true, &mut h.injector),
+            MaskCleanup::Released
+        );
+        assert!(!h.state().is_mask_up_pending);
         assert_eq!(h.injector.inserted, vec![Down, Up]);
+    }
+
+    #[test]
+    fn shutdown_without_a_pending_mask_up_injects_nothing() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        h.shared.quiesce();
+        let requests = h.injector.requests.len();
+        assert_eq!(
+            finish_shutdown(&h.shared, true, &mut h.injector),
+            MaskCleanup::NotNeeded
+        );
+        assert_eq!(h.injector.requests.len(), requests);
+    }
+
+    #[test]
+    fn persistent_mask_up_failure_is_reported_and_shutdown_still_completes() {
+        let mut h = Harness::new();
+        h.injector.fail_up = true;
+
+        h.down(ALT);
+        // Only the mask key-down went in; the hold still counts as masked.
+        assert!(h.down(TAB));
+        h.up(TAB);
+        h.up(ALT);
+        h.shared.quiesce();
+        // The hook keeps retrying after quiesce without posting anything.
+        h.sink.posted.clear();
+        assert!(!h.tap(A));
+        assert!(h.sink.posted.is_empty());
+
+        assert_eq!(
+            finish_shutdown(&h.shared, true, &mut h.injector),
+            MaskCleanup::StillDown
+        );
+        // Every event and the shutdown retried the key-up; none went in, so
+        // vkE8 may still be logically down. That is reported, not hidden.
+        assert!(h.state().is_mask_up_pending);
+        assert_eq!(h.injector.inserted, vec![Down]);
+        assert_eq!(
+            h.injector.requests,
+            vec![
+                vec![Down, Up],
+                vec![Up], // immediate retry
+                vec![Up], // Tab up
+                vec![Up], // Alt up
+                vec![Up], // A down, after quiesce
+                vec![Up], // A up, after quiesce
+                vec![Up], // shutdown
+            ]
+        );
+    }
+
+    #[test]
+    fn quiesce_and_shutdown_never_wait_for_a_hook_stuck_holding_its_state() {
+        // Leaked so the "hook" (this thread) and the shutdown thread share it
+        // the way the real hook thread shares the never-freed `HOOK`.
+        let shared: &'static HookShared = Box::leak(Box::new(shared_with(["alt+`", "alt+tab"])));
+        let stuck_hook = shared.state.lock();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            shared.quiesce();
+            let cleanup = finish_shutdown(shared, false, &mut FakeInjector::default());
+            let _ = done_tx.send(cleanup);
+        });
+        // A hang guard only: shutdown never waits on the state lock, so it
+        // finishes as soon as its thread runs.
+        let cleanup = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("shutdown must not wait for the hook's state lock");
+        assert_eq!(cleanup, MaskCleanup::Skipped);
+        assert_eq!(shared.target.load(Ordering::Acquire), 0);
+
+        // The stuck hook's state is still valid memory after shutdown
+        // returned, and once it resumes it posts and consumes nothing.
+        assert!(stuck_hook.hotkeys.len() == 2);
+        drop(stuck_hook);
+        let mut sink = FakeSink::default();
+        let mut injector = FakeInjector::default();
+        for (scan_code, is_pressed) in [(ALT, true), (TAB, true), (TAB, false), (ALT, false)] {
+            let event = KeyEvent {
+                scan_code,
+                is_extended: false,
+                is_pressed,
+            };
+            assert!(!shared.on_key(event, false, |_| &mut sink, &mut injector));
+        }
+        assert!(sink.posted.is_empty());
+        assert!(injector.requests.is_empty());
+    }
+
+    #[test]
+    fn contended_state_passes_the_key_through_without_posting() {
+        let mut h = Harness::new();
+        h.down(ALT);
+        let held = h.shared.state.lock();
+        let mut sink = FakeSink::default();
+        let event = KeyEvent {
+            scan_code: TAB,
+            is_extended: false,
+            is_pressed: true,
+        };
+        assert!(!h
+            .shared
+            .on_key(event, false, |_| &mut sink, &mut FakeInjector::default()));
+        drop(held);
+        assert!(sink.posted.is_empty());
+    }
+
+    #[test]
+    fn listener_slot_stays_taken_while_a_listener_or_detached_hook_owns_it() {
+        // A detached hook thread never releases the slot, so `start` (which
+        // takes the state lock) can never run alongside it.
+        LISTENER_ACTIVE.store(true, Ordering::Release);
+        let result = KeyboardListener::init(HWND::default(), &[]);
+        assert!(LISTENER_ACTIVE.load(Ordering::Acquire));
+        LISTENER_ACTIVE.store(false, Ordering::Release);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1262,7 +1585,111 @@ mod tests {
     #[test]
     fn hotkeys_with_the_same_modifier_share_one_hold() {
         let h = Harness::new();
-        assert_eq!(h.state.holds.len(), 1);
+        assert_eq!(h.state().holds.len(), 1);
+    }
+
+    // Left/right modifier sides
+
+    #[test]
+    fn win_hold_lasts_until_both_win_keys_are_released() {
+        let mut h = Harness::with_hotkeys(["win+`", "win+tab"]);
+
+        assert!(!h.down_ext(LWIN));
+        assert!(!h.down_ext(RWIN));
+        assert!(h.tap(TAB));
+        // Releasing one side keeps the hold, its mask, ownership and intent.
+        assert!(!h.up_ext(LWIN));
+        assert_eq!(h.sink.posted, vec![SwitchApps { reverse: false }]);
+        assert!(h.tap(TAB));
+        assert!(h.tap(BACKTICK));
+        assert!(!h.up_ext(RWIN));
+        assert_eq!(
+            h.sink.posted,
+            vec![
+                SwitchApps { reverse: false },
+                SwitchApps { reverse: false },
+                SwitchWindows { reverse: false },
+                SwitchWindowsDone,
+                SwitchAppsDone,
+            ]
+        );
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+
+        // The hold really ended: Tab alone is not a hotkey any more.
+        assert!(!h.tap(TAB));
+    }
+
+    #[test]
+    fn win_hold_survives_pressing_the_other_side_again() {
+        let mut h = Harness::with_hotkeys(["win+`", "win+tab"]);
+
+        h.down_ext(LWIN);
+        h.tap(TAB);
+        h.down_ext(RWIN);
+        h.up_ext(LWIN);
+        h.down_ext(LWIN);
+        h.up_ext(RWIN);
+        assert!(h.tap(TAB));
+        h.up_ext(LWIN);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+        assert_eq!(
+            h.sink.posted,
+            vec![
+                SwitchApps { reverse: false },
+                SwitchApps { reverse: false },
+                SwitchAppsDone,
+            ]
+        );
+    }
+
+    #[test]
+    fn left_and_right_alt_share_one_hold_and_auto_repeat_is_idempotent() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.down(ALT);
+        h.down_ext(ALT);
+        h.down_ext(ALT);
+        assert!(h.tap(TAB));
+        // Left Alt up once, although it auto-repeated: right Alt still holds.
+        assert!(!h.up(ALT));
+        assert!(h.tap(TAB));
+        assert_eq!(h.sink.posted.len(), 2);
+        assert!(!h.up_ext(ALT));
+        assert_eq!(h.sink.posted.last(), Some(&SwitchAppsDone));
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+    }
+
+    #[test]
+    fn a_stray_modifier_release_without_a_hold_does_nothing() {
+        let mut h = Harness::new();
+
+        assert!(!h.up_ext(ALT));
+        assert!(!h.up(ALT));
+        assert!(h.sink.posted.is_empty());
+        assert!(!h.tap(TAB));
+    }
+
+    #[test]
+    fn releasing_one_shift_keeps_reverse_switching() {
+        let mut h = Harness::new();
+
+        h.down(SHIFT);
+        h.down(RSHIFT);
+        h.down(ALT);
+        h.tap(TAB);
+        h.up(SHIFT);
+        h.tap(TAB);
+        h.up(RSHIFT);
+        h.tap(TAB);
+        assert_eq!(
+            h.sink.posted,
+            vec![
+                SwitchApps { reverse: true },
+                SwitchApps { reverse: true },
+                SwitchApps { reverse: false },
+            ]
+        );
     }
 
     #[test]
@@ -1279,15 +1706,17 @@ mod tests {
             KeyEvent::from_hook_data(&data),
             Some(KeyEvent {
                 scan_code: TAB,
+                is_extended: false,
                 is_pressed: true
             })
         );
 
-        data.flags = KBDLLHOOKSTRUCT_FLAGS(LLKHF_UP.0);
+        data.flags = KBDLLHOOKSTRUCT_FLAGS(LLKHF_UP.0 | LLKHF_EXTENDED.0);
         assert_eq!(
             KeyEvent::from_hook_data(&data),
             Some(KeyEvent {
                 scan_code: TAB,
+                is_extended: true,
                 is_pressed: false
             })
         );
