@@ -36,9 +36,11 @@
                      2. Tray "Exit" while injected keys keep invoking the
                         hook, repeated; every run must exit 0 in time.
                      3. UI thread stalled (every thread except
-                        "keyboard-hook" suspended): filtered-path latency,
-                        a physical Alt+Tab and typing during the stall, and
-                        recovery afterwards.
+                        "keyboard-hook" suspended): injected input must still
+                        pass without delay (WinOrbit does not block it; this
+                        alone does not prove the hook is alive), a physical
+                        Alt+Tab and typing during the stall, which WinOrbit's
+                        log must show handled after resume, and recovery.
                      4. No Alt, Tab, Shift, Esc, mask (vkE8) or probe key
                         left down.
       Injected       Step 1 only.
@@ -348,9 +350,11 @@ function Invoke-Full {
 
     # 3. Stalled UI thread.
     Write-Host "`n[3] UI thread stalled for $StallSeconds s"
+    $logInfo = Get-LogInfo
     $app = Start-WinOrbit
     [void](Wait-PhysicalAltTab $app "before the stall")
     $baseline = Wait-InputDrained
+    $stallFrom = $app.Clock.Elapsed.TotalSeconds
     $suspended = @()
     $hookThreadFound = $false
     try {
@@ -374,8 +378,11 @@ function Invoke-Full {
         $drains = @()
         for ($i = 0; $i -lt 5; $i++) { $drains += Wait-InputDrained }
         $worst = ($drains | Measure-Object -Maximum).Maximum
-        Write-Host ("  filtered-path latency (injected sentinel through the hook): baseline {0} ms, during stall max {1} ms" -f $baseline, $worst)
-        if ($worst -gt $DRAIN_LIMIT_MS) { $failures.Add("stall: hook took $worst ms to pass injected input") }
+        # A missing hook would also pass the sentinel at once, so this shows
+        # only that WinOrbit does not block injected input; the physical
+        # presses below are the evidence the hook still works.
+        Write-Host ("  injected sentinel pass-through: baseline {0} ms, during stall max {1} ms (non-blocking check only)" -f $baseline, $worst)
+        if ($worst -gt $DRAIN_LIMIT_MS) { $failures.Add("stall: injected input delayed $worst ms while the UI was stalled") }
         Write-Host ""
         Write-Host "  >>> NOW, within $StallSeconds s: hold Alt, tap Tab twice, release Alt," -ForegroundColor Yellow
         Write-Host "  >>> then type a few words anywhere. Typing must not lag. (Nothing will appear yet.)" -ForegroundColor Yellow
@@ -390,10 +397,25 @@ function Invoke-Full {
     Write-Host "  UI responsive after resume: $responsive"
     if (-not $responsive) { $failures.Add("ui: not responsive after resume") }
     Wait-OverlayHidden $app 10
+    $stallTo = $app.Clock.Elapsed.TotalSeconds
     [void](Wait-PhysicalAltTab $app "after the stall")
     $result = Stop-WinOrbit $app
     Write-Host "  final exit: exited=$($result.Exited) code=$($result.Code)"
     if (-not $result.Exited -or $result.Code -ne 0) { $failures.Add("final exit failed") }
+
+    # The physical Alt+Tab+Tab typed during the stall was queued by the hook
+    # and must have been handled once the UI resumed: two switches and a
+    # commit. The window runs from the stall's start (the control before it
+    # ended at least 1.5 s earlier) to before the prompt for the control after
+    # it; log times run slightly behind the script clock, which only moves
+    # them earlier.
+    $messages = @(Read-SwitchMessages $logInfo | Where-Object { $_.T -ge $stallFrom -and $_.T -lt $stallTo })
+    $switches = @($messages | Where-Object { $_.Message -eq 'WM_USER_SWITCH_APPS' }).Count
+    $commits = @($messages | Where-Object { $_.Message -eq 'WM_USER_SWITCH_APPS_DONE' }).Count
+    Write-Host ("  physical Alt+Tab+Tab during the stall, handled after resume: {0} switch(es), {1} commit(s) ({2:N1}-{3:N1} s)" -f $switches, $commits, $stallFrom, $stallTo)
+    if ($switches -lt 2 -or $commits -lt 1) {
+        $failures.Add("stall: WinOrbit's log does not show the physical Alt+Tab+Tab from the stall handled after resume ($switches switches, $commits commits)")
+    }
 }
 
 try {
