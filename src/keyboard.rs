@@ -27,8 +27,8 @@ use windows::Win32::{
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW,
             PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-            HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
-            WM_QUIT,
+            HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
+            LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_QUIT,
         },
     },
 };
@@ -38,8 +38,16 @@ use windows::Win32::{
 /// Win alone opens Start). Same technique as AutoHotkey's menu mask.
 const VK_MASK: u16 = 0xE8;
 
-/// `dwExtraInfo` tag on input injected by this module, so the hook skips it.
+/// `dwExtraInfo` tag on the mask events this module injects. Provenance only:
+/// the hook ignores those events because Windows flags them as injected, the
+/// same as any other injected input. Nothing checks this value.
 const OWN_INJECTION_MARKER: usize = 0x574F_524B;
+
+/// `KBDLLHOOKSTRUCT` flags Windows sets on synthesized input (`SendInput`,
+/// `keybd_event`). `LLKHF_LOWER_IL_INJECTED` (sent from a lower integrity
+/// level) is documented to come with `LLKHF_INJECTED`; both are checked so
+/// neither alone can get through.
+const INJECTED_FLAGS: u32 = LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0;
 
 /// How long `KeyboardListener::drop` waits for the hook thread to exit.
 const HOOK_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -336,9 +344,11 @@ struct KeyEvent {
 }
 
 impl KeyEvent {
-    /// Returns `None` for input this module injected itself.
+    /// Returns `None` for any event carrying Windows' injected-input flags,
+    /// including this module's own mask key. Every other event is treated as
+    /// ordinary keyboard input: the hook only knows what Windows reports.
     fn from_hook_data(data: &KBDLLHOOKSTRUCT) -> Option<Self> {
-        if data.dwExtraInfo == OWN_INJECTION_MARKER {
+        if data.flags.0 & INJECTED_FLAGS != 0 {
             return None;
         }
         Some(Self {
@@ -774,18 +784,33 @@ enum HotKeyAction {
     SwitchWindowsDone,
 }
 
+/// Hook-thread handling of one raw event. Injected input is rejected here,
+/// before the state is even locked, so it can never change modifier, Shift or
+/// hotkey state, start/advance/cancel/commit a switch, inject a mask, post a
+/// UI action, or be consumed: it always passes on to the next hook.
+fn handle_hook_data<S: ActionSink>(
+    shared: &HookShared,
+    data: &KBDLLHOOKSTRUCT,
+    is_foreground_in_blacklist: bool,
+    sink_for: impl FnOnce(isize) -> S,
+    injector: &mut impl KeyInjector,
+) -> bool {
+    match KeyEvent::from_hook_data(data) {
+        Some(event) => shared.on_key(event, is_foreground_in_blacklist, sink_for, injector),
+        None => false,
+    }
+}
+
 unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
         return CallNextHookEx(None, code, w_param, l_param);
     }
     // No routine logging here: this runs for every key in the system.
     let kbd_data: &KBDLLHOOKSTRUCT = &*(l_param.0 as *const _);
-    let Some(event) = KeyEvent::from_hook_data(kbd_data) else {
-        return CallNextHookEx(None, code, w_param, l_param);
-    };
     let is_foreground_in_blacklist = IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed);
-    let consume = HOOK.on_key(
-        event,
+    let consume = handle_hook_data(
+        &HOOK,
+        kbd_data,
         is_foreground_in_blacklist,
         |target| WindowSink(HWND(target as _)),
         &mut SendInputInjector,
@@ -815,9 +840,9 @@ fn action_message(action: HotKeyAction) -> Option<(u32, LPARAM)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_message, finish_shutdown, wait_for_thread_exit, ActionSink, HookShared,
-        HotKeyAction, KeyEvent, KeyInjector, KeyboardListener, KeyboardState, MaskCleanup, MaskKey,
-        LISTENER_ACTIVE, OWN_INJECTION_MARKER,
+        action_message, finish_shutdown, handle_hook_data, wait_for_thread_exit, ActionSink,
+        HookShared, HotKeyAction, KeyEvent, KeyInjector, KeyboardListener, KeyboardState,
+        MaskCleanup, MaskKey, LISTENER_ACTIVE, OWN_INJECTION_MARKER, VK_MASK,
     };
     use crate::app::{
         WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
@@ -831,7 +856,8 @@ mod tests {
     use windows::Win32::{
         Foundation::HWND,
         UI::WindowsAndMessaging::{
-            KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_EXTENDED, LLKHF_UP,
+            KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_EXTENDED, LLKHF_INJECTED,
+            LLKHF_LOWER_IL_INJECTED, LLKHF_UP,
         },
     };
 
@@ -903,6 +929,34 @@ mod tests {
         }
     }
 
+    /// Flag combinations Windows can report for injected input. The last one
+    /// is not expected from Windows, but must be rejected all the same.
+    const INJECTED_VARIANTS: [u32; 3] = [
+        LLKHF_INJECTED.0,
+        LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0,
+        LLKHF_LOWER_IL_INJECTED.0,
+    ];
+
+    fn hook_data(
+        scan_code: u32,
+        is_extended: bool,
+        is_pressed: bool,
+        flags: u32,
+    ) -> KBDLLHOOKSTRUCT {
+        let mut flags = flags;
+        if is_extended {
+            flags |= LLKHF_EXTENDED.0;
+        }
+        if !is_pressed {
+            flags |= LLKHF_UP.0;
+        }
+        KBDLLHOOKSTRUCT {
+            scanCode: scan_code,
+            flags: KBDLLHOOKSTRUCT_FLAGS(flags),
+            ..Default::default()
+        }
+    }
+
     /// Shared hook state for one listener, driven through the same
     /// `HookShared::on_key` entry point the real hook uses.
     fn shared_with(hotkeys: [&str; 2]) -> HookShared {
@@ -941,18 +995,38 @@ mod tests {
             self.shared.state.lock()
         }
 
-        fn event(&mut self, scan_code: u32, is_extended: bool, is_pressed: bool) -> bool {
+        /// Feeds one raw hook event through the same entry point as the real
+        /// hook, including the injected-input filter.
+        fn raw(&mut self, data: KBDLLHOOKSTRUCT) -> bool {
             let sink = &mut self.sink;
-            self.shared.on_key(
-                KeyEvent {
-                    scan_code,
-                    is_extended,
-                    is_pressed,
-                },
+            handle_hook_data(
+                &self.shared,
+                &data,
                 self.blacklisted,
                 move |_| sink,
                 &mut self.injector,
             )
+        }
+
+        /// A key event without injected flags, as a physical key produces.
+        /// "Physical" in these tests means exactly that.
+        fn event(&mut self, scan_code: u32, is_extended: bool, is_pressed: bool) -> bool {
+            self.raw(hook_data(scan_code, is_extended, is_pressed, 0))
+        }
+
+        /// An event Windows flagged as injected (`LLKHF_INJECTED`).
+        fn injected(&mut self, scan_code: u32, is_extended: bool, is_pressed: bool) -> bool {
+            self.raw(hook_data(
+                scan_code,
+                is_extended,
+                is_pressed,
+                LLKHF_INJECTED.0,
+            ))
+        }
+
+        /// Debug rendering of all hook state, to prove an event changed nothing.
+        fn snapshot(&self) -> String {
+            format!("{:?}", *self.state())
         }
 
         fn key(&mut self, scan_code: u32, is_pressed: bool) -> bool {
@@ -1692,34 +1766,268 @@ mod tests {
         );
     }
 
-    #[test]
-    fn own_injected_input_is_ignored_but_other_input_is_processed() {
-        let mut data = KBDLLHOOKSTRUCT {
-            scanCode: TAB,
-            dwExtraInfo: OWN_INJECTION_MARKER,
-            ..Default::default()
-        };
-        assert_eq!(KeyEvent::from_hook_data(&data), None);
+    // Injected input (TASK-S06C)
 
-        data.dwExtraInfo = 0;
+    #[test]
+    fn physical_hook_data_becomes_a_key_event() {
+        let event = |scan_code, is_extended, is_pressed| {
+            KeyEvent::from_hook_data(&hook_data(scan_code, is_extended, is_pressed, 0))
+        };
         assert_eq!(
-            KeyEvent::from_hook_data(&data),
+            event(TAB, false, true),
             Some(KeyEvent {
                 scan_code: TAB,
                 is_extended: false,
                 is_pressed: true
             })
         );
-
-        data.flags = KBDLLHOOKSTRUCT_FLAGS(LLKHF_UP.0 | LLKHF_EXTENDED.0);
         assert_eq!(
-            KeyEvent::from_hook_data(&data),
+            event(TAB, false, false),
             Some(KeyEvent {
                 scan_code: TAB,
+                is_extended: false,
+                is_pressed: false
+            })
+        );
+        // Right Alt and both Win keys arrive extended.
+        assert_eq!(
+            event(ALT, true, true),
+            Some(KeyEvent {
+                scan_code: ALT,
+                is_extended: true,
+                is_pressed: true
+            })
+        );
+        assert_eq!(
+            event(RWIN, true, false),
+            Some(KeyEvent {
+                scan_code: RWIN,
                 is_extended: true,
                 is_pressed: false
             })
         );
+    }
+
+    #[test]
+    fn injected_hook_data_never_becomes_a_key_event() {
+        for flags in INJECTED_VARIANTS {
+            for (scan_code, is_extended) in [(TAB, false), (ALT, false), (ALT, true), (LWIN, true)]
+            {
+                for is_pressed in [true, false] {
+                    let data = hook_data(scan_code, is_extended, is_pressed, flags);
+                    assert_eq!(KeyEvent::from_hook_data(&data), None, "{data:?}");
+                }
+            }
+        }
+        // WinOrbit's own mask key is ignored because Windows flags it as
+        // injected, not because of its marker: the marker alone is not enough.
+        let own_mask = KBDLLHOOKSTRUCT {
+            vkCode: VK_MASK as u32,
+            flags: KBDLLHOOKSTRUCT_FLAGS(LLKHF_INJECTED.0),
+            dwExtraInfo: OWN_INJECTION_MARKER,
+            ..Default::default()
+        };
+        assert_eq!(KeyEvent::from_hook_data(&own_mask), None);
+        let marker_without_flag = KBDLLHOOKSTRUCT {
+            flags: KBDLLHOOKSTRUCT_FLAGS(0),
+            ..own_mask
+        };
+        assert!(KeyEvent::from_hook_data(&marker_without_flag).is_some());
+    }
+
+    #[test]
+    fn injected_events_change_nothing_and_are_never_consumed() {
+        // Every key WinOrbit cares about, both sides, down and up, with each
+        // injected flag combination: from idle, from a physical hold of the
+        // configured modifier, and from a live switch session started with
+        // it. Each modifier side is used for the hold.
+        let keys = [
+            (ALT, false),
+            (ALT, true),
+            (LWIN, true),
+            (RWIN, true),
+            (SHIFT, false),
+            (RSHIFT, false),
+            (TAB, false),
+            (BACKTICK, false),
+            (ESC, false),
+            (A, false),
+        ];
+        let modifiers = [
+            (["alt+`", "alt+tab"], ALT, false),
+            (["alt+`", "alt+tab"], ALT, true),
+            (["win+`", "win+tab"], LWIN, true),
+            (["win+`", "win+tab"], RWIN, true),
+        ];
+        #[derive(Clone, Copy, Debug)]
+        enum Setup {
+            Idle,
+            Hold,
+            Session,
+        }
+        for (hotkeys, modifier, is_extended) in modifiers {
+            for setup in [Setup::Idle, Setup::Hold, Setup::Session] {
+                let mut h = Harness::with_hotkeys(hotkeys);
+                let idle = h.snapshot();
+                match setup {
+                    Setup::Idle => {}
+                    Setup::Hold => {
+                        assert!(!h.event(modifier, is_extended, true));
+                        assert_ne!(h.snapshot(), idle, "{hotkeys:?}: no hold");
+                    }
+                    Setup::Session => {
+                        assert!(!h.event(modifier, is_extended, true));
+                        assert!(h.tap(TAB), "{hotkeys:?}: Tab not consumed");
+                        assert_eq!(h.sink.posted, vec![SwitchApps { reverse: false }]);
+                    }
+                }
+                let posted = h.sink.posted.clone();
+                let requests = h.injector.requests.clone();
+                for flags in INJECTED_VARIANTS {
+                    for (scan_code, key_extended) in keys {
+                        for is_pressed in [true, false] {
+                            let data = hook_data(scan_code, key_extended, is_pressed, flags);
+                            let before = h.snapshot();
+                            assert!(!h.raw(data), "{hotkeys:?} {setup:?}: consumed {data:?}");
+                            assert_eq!(h.snapshot(), before, "{hotkeys:?} {setup:?}: {data:?}");
+                            assert_eq!(h.sink.posted, posted, "{hotkeys:?} {setup:?}: {data:?}");
+                            assert_eq!(
+                                h.injector.requests, requests,
+                                "{hotkeys:?} {setup:?}: {data:?}"
+                            );
+                        }
+                    }
+                }
+                // The physical state survived intact: releasing the physical
+                // modifier ends the hold, committing a live session.
+                assert!(!h.event(modifier, is_extended, false));
+                match setup {
+                    Setup::Idle | Setup::Hold => assert_eq!(h.sink.posted, posted),
+                    Setup::Session => assert_eq!(
+                        h.sink.posted,
+                        vec![SwitchApps { reverse: false }, SwitchAppsDone]
+                    ),
+                }
+                assert_eq!(
+                    h.snapshot(),
+                    idle,
+                    "{hotkeys:?} {setup:?}: not back to idle"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn injected_tab_under_a_physical_alt_does_not_switch() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        assert!(!h.injected(TAB, false, true));
+        assert!(!h.injected(TAB, false, false));
+        assert!(!h.up(ALT));
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
+    }
+
+    #[test]
+    fn injected_alt_down_does_not_start_a_hold() {
+        let mut h = Harness::new();
+
+        h.injected(ALT, false, true);
+        assert!(!h.tap(TAB));
+        assert!(!h.tap(BACKTICK));
+        h.injected(ALT, false, false);
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
+    }
+
+    #[test]
+    fn injected_alt_up_does_not_end_a_physical_hold() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        assert!(h.tap(TAB));
+        assert!(!h.injected(ALT, false, false));
+        assert!(!h.injected(ALT, true, false));
+        // Still the same session: Tab advances it without a new mask.
+        assert!(h.tap(TAB));
+        assert!(!h.up(ALT));
+        assert_eq!(
+            h.sink.posted,
+            vec![
+                SwitchApps { reverse: false },
+                SwitchApps { reverse: false },
+                SwitchAppsDone,
+            ]
+        );
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+    }
+
+    #[test]
+    fn injected_escape_does_not_cancel_a_session() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.tap(TAB);
+        assert!(!h.injected(ESC, false, true));
+        assert!(!h.injected(ESC, false, false));
+        h.up(ALT);
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsDone]
+        );
+    }
+
+    #[test]
+    fn injected_shift_does_not_change_reverse_switching() {
+        let mut h = Harness::new();
+
+        h.down(ALT);
+        h.injected(SHIFT, false, true);
+        h.tap(TAB);
+        h.down(RSHIFT);
+        h.injected(RSHIFT, false, false);
+        h.tap(TAB);
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchApps { reverse: true }]
+        );
+    }
+
+    #[test]
+    fn injected_win_events_do_not_change_the_win_hold() {
+        let mut h = Harness::with_hotkeys(["win+`", "win+tab"]);
+
+        h.down_ext(LWIN);
+        assert!(h.tap(TAB));
+        // An injected right Win down does not count as a second held side...
+        h.injected(RWIN, true, true);
+        // ...and an injected left Win up does not end the physical hold.
+        h.injected(LWIN, true, false);
+        assert!(h.tap(TAB));
+        assert!(!h.up_ext(LWIN));
+        assert_eq!(
+            h.sink.posted,
+            vec![
+                SwitchApps { reverse: false },
+                SwitchApps { reverse: false },
+                SwitchAppsDone,
+            ]
+        );
+        // The hold is over although the injected right Win never came up.
+        assert!(!h.tap(TAB));
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+    }
+
+    #[test]
+    fn injected_win_down_does_not_start_a_win_hold() {
+        let mut h = Harness::with_hotkeys(["win+`", "win+tab"]);
+
+        h.injected(LWIN, true, true);
+        assert!(!h.tap(TAB));
+        h.injected(LWIN, true, false);
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
     }
 
     #[test]

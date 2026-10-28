@@ -1,38 +1,49 @@
 <#
 .SYNOPSIS
-    Windows stress checks for the WinOrbit keyboard hook lifecycle.
+    Windows checks for the WinOrbit keyboard hook: injected input is ignored,
+    and the hook lifecycle survives exit and a stalled UI thread.
 
 .DESCRIPTION
-    Drives a WinOrbit build with injected Alt+Tab / Alt+` input. The hook only
-    ignores input it injected itself, so this exercises the real hook path.
+    Since TASK-S06C WinOrbit ignores every key event Windows flags as injected
+    (LLKHF_INJECTED / LLKHF_LOWER_IL_INJECTED). Everything this script sends
+    with keybd_event is injected, so it can no longer drive WinOrbit's hotkey
+    state at all. The script therefore:
 
-    Hook liveness and overlay latency are measured separately:
+      * checks that injected input is ignored: injected keys must pass
+        through WinOrbit (Windows marks them down), the overlay must stay
+        hidden, and WinOrbit's debug log must show no switch messages;
+      * uses YOUR physical Alt+Tab, when prompted, as the positive control
+        that the hook is alive and handles real keys, before and after the
+        injected phase and around the UI stall;
+      * keeps the lifecycle checks that stay honest with injected input:
+        exit while the hook callback is being invoked, and responsiveness of
+        the hook's filtered path while the UI thread is suspended.
 
-      * Hook probe: holds Alt, presses Tab, then presses an unassigned sentinel
-        key and waits until Windows reports the sentinel down. Input is
-        processed in order, so by then Tab has been through every keyboard
-        hook. If WinOrbit's hook consumed Tab, Windows never marks Tab down;
-        if Tab is down, the hook did not intercept it. This does not depend on
-        the UI thread or on the overlay painting. A detector check (Alt + an
-        unassigned key WinOrbit ignores, which must be seen down) proves the
-        method works on this machine before any probe is trusted.
-      * Overlay latency: time from Alt+Tab until the overlay window becomes
-        visible. Reported as a measurement, never as hook health.
+    Retired after S06C, because their premise needed WinOrbit to act on
+    injected input: the injected-Alt+Tab interception probe, the periodic
+    liveness probes, and ColdStart overlay latency (it opened the overlay with
+    injected Alt+Tab). Overlay latency now needs physical input.
 
-    Probes cancel with Esc before releasing Alt, so they do not switch windows.
+    How "passed through" is detected: after the keys, an unassigned sentinel
+    key is injected and the script waits until Windows reports it down. Input
+    is processed in order, so by then the earlier keys have been through all
+    keyboard hooks, and Windows only marks a key down if no hook consumed it.
+    A detector check (an unassigned key, which must be seen down) proves this
+    works on the machine before any result is trusted.
 
     Modes:
-      Full           1. Detector check, cold and warm overlay latency.
-                     2. Tray "Exit" while hotkey traffic is in flight, repeated.
-                        Every run must exit within the timeout with code 0.
-                     3. UI thread stalled (every thread except "keyboard-hook"
-                        suspended) while hotkey traffic continues; hook probes
-                        during the stall; recovery after resume.
-                     4. Hook probe repeated over a longer period.
-                     5. No Alt, Tab, mask (vkE8) or probe key left down.
-      ColdStart      Fresh launches only, measuring cold (first) and warm
-                     (second) overlay latency. Run it against each build to
-                     compare them.
+      Full           1. Injected-input check with physical controls.
+                     2. Tray "Exit" while injected keys keep invoking the
+                        hook, repeated; every run must exit 0 in time.
+                     3. UI thread stalled (every thread except
+                        "keyboard-hook" suspended): injected input must still
+                        pass without delay (WinOrbit does not block it; this
+                        alone does not prove the hook is alive), a physical
+                        Alt+Tab and typing during the stall, which WinOrbit's
+                        log must show handled after resume, and recovery.
+                     4. No Alt, Tab, Shift, Esc, mask (vkE8) or probe key
+                        left down.
+      Injected       Step 1 only.
       SelfTestPass   Sends no input. Exits 0.
       SelfTestFail   Sends no input. Records one failure; exits non-zero.
       SelfTestAbort  Sends no input. Throws mid-run; exits non-zero.
@@ -40,15 +51,14 @@
     Exit code: 0 only if the run completed and recorded no failure; 1
     otherwise (including aborted runs).
 
-    Requirements for Full and ColdStart:
+    Requirements for Full and Injected:
       - No other WinOrbit instance running.
-      - winorbit.ini next to the exe with [switch-apps] enable = yes, and at
-        least one normal app window open.
+      - winorbit.ini next to the exe with [switch-apps] enable = yes and
+        [log] level = debug with a log path (the switch messages are read
+        from the log), and at least two normal app windows open.
 
-    WARNING: Full and ColdStart send real Alt+Tab input and switch between your
-    windows while they run. Full takes about 4 minutes, ColdStart about 30 s.
-    Use a separate virtual desktop with a few windows and do not type into
-    anything important meanwhile.
+    The injected Alt+Tab opens the NATIVE Windows switcher for a moment; that
+    is expected, because WinOrbit ignores it. The script closes it with Esc.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File hook-lifecycle.ps1 -Exe .\winorbit.exe
@@ -57,114 +67,168 @@
 #>
 param(
     [string] $Exe,
-    [ValidateSet('Full', 'ColdStart', 'SelfTestPass', 'SelfTestFail', 'SelfTestAbort')]
+    [ValidateSet('Full', 'Injected', 'SelfTestPass', 'SelfTestFail', 'SelfTestAbort')]
     [string] $Mode = 'Full',
     [int] $ExitIterations = 25,
-    [int] $StallSeconds = 5,
-    [int] $ProbeMinutes = 2,
-    [int] $ColdRuns = 5
+    [int] $StallSeconds = 10
 )
 
 $ErrorActionPreference = 'Stop'
 $failures = New-Object System.Collections.Generic.List[string]
 $log = Join-Path (Get-Location) ("winorbit-stress-{0}-{1:yyyyMMdd-HHmmss}.log" -f $Mode, (Get-Date))
-$sendsInput = $Mode -in @('Full', 'ColdStart')
+$sendsInput = $Mode -in @('Full', 'Injected')
 $transcriptStarted = $false
 $exitCode = 1
 $helperLoaded = $false
 
-$SC_ALT = 0x38; $SC_TAB = 0x0F; $SC_BACKTICK = 0x29; $SC_ESC = 0x01
-$VK_ALT = 0x12; $VK_TAB = 0x09; $VK_MASK = 0xE8
+$SC_ALT = 0x38; $SC_TAB = 0x0F; $SC_BACKTICK = 0x29; $SC_ESC = 0x01; $SC_SHIFT = 0x2A
+$VK_ALT = 0x12; $VK_TAB = 0x09; $VK_SHIFT = 0x10; $VK_ESC = 0x1B; $VK_MASK = 0xE8
 # Unassigned virtual keys: no app reacts to them and WinOrbit ignores them.
-$VK_SENTINEL = 0x97; $VK_DETECTOR = 0x98
+$VK_SENTINEL = 0x97; $VK_DETECTOR = 0x98; $VK_TRAFFIC = 0x99
 $WM_COMMAND = 0x0111; $IDM_EXIT = 1
+# Two blocked hook calls (sentinel down and up) would cost at least two system
+# hook timeouts; a healthy filtered path takes a few milliseconds.
+$DRAIN_LIMIT_MS = 1000
 
 function Release-All {
     [W]::Key($SC_TAB, $true); [W]::Key($SC_BACKTICK, $true); [W]::Key($SC_ESC, $true)
-    [W]::Vk($VK_DETECTOR, $true); [W]::Vk($VK_SENTINEL, $true)
+    [W]::Key($SC_SHIFT, $true)
+    [W]::Vk($VK_DETECTOR, $true); [W]::Vk($VK_SENTINEL, $true); [W]::Vk($VK_TRAFFIC, $true)
     [W]::Key($SC_ALT, $true)
 }
 
 # Waits until every key injected so far has been through all keyboard hooks,
-# using the sentinel key as an in-order marker. The deadline is a hang guard:
-# a dead hook only delays input by the system hook timeout (at most ~1 s).
+# using the sentinel key as an in-order marker. Returns the milliseconds it
+# took. The deadline is a hang guard only.
 function Wait-InputDrained {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     [W]::Vk($VK_SENTINEL, $false)
-    $deadline = (Get-Date).AddSeconds(10)
     while (-not [W]::IsDown($VK_SENTINEL)) {
-        if ((Get-Date) -gt $deadline) { throw "sentinel key never arrived; input is stuck" }
+        if ($watch.ElapsedMilliseconds -gt 10000) { throw "sentinel key never arrived; input is stuck" }
         Start-Sleep -Milliseconds 2
     }
     [W]::Vk($VK_SENTINEL, $true)
     while ([W]::IsDown($VK_SENTINEL)) {
-        if ((Get-Date) -gt $deadline) { throw "sentinel key never released; input is stuck" }
+        if ($watch.ElapsedMilliseconds -gt 10000) { throw "sentinel key never released; input is stuck" }
         Start-Sleep -Milliseconds 2
     }
+    return $watch.ElapsedMilliseconds
 }
 
-# Alt + an unassigned key WinOrbit passes through: must be seen down, which
-# proves "consumed" and "passed through" can be told apart on this machine.
+# An unassigned key must be seen down: proves "passed through" is observable.
 function Test-Detector {
     try {
-        [W]::Key($SC_ALT, $false)
         [W]::Vk($VK_DETECTOR, $false)
-        Wait-InputDrained
+        [void](Wait-InputDrained)
         return [W]::IsDown($VK_DETECTOR)
     } finally {
         [W]::Vk($VK_DETECTOR, $true)
-        [W]::Key($SC_ALT, $true)
     }
 }
 
-# 'Intercepted' if WinOrbit's hook consumed Alt+Tab, 'PassedThrough' if not.
-# Cancels with Esc before releasing Alt so nothing is switched.
-function Test-HookIntercepts {
-    try {
-        [W]::Key($SC_ALT, $false)
-        [W]::Key($SC_TAB, $false)
-        Wait-InputDrained
-        $tabDown = [W]::IsDown($VK_TAB)
-        [W]::Key($SC_TAB, $true)
-        [W]::Key($SC_ESC, $false); [W]::Key($SC_ESC, $true)
-    } finally {
-        [W]::Key($SC_TAB, $true)
-        [W]::Key($SC_ALT, $true)
-    }
-    Wait-InputDrained
-    if ($tabDown) { return 'PassedThrough' }
-    return 'Intercepted'
-}
-
-function Wait-OverlayHidden($app) {
-    $deadline = (Get-Date).AddSeconds(5)
+function Wait-OverlayHidden($app, [int] $seconds = 5) {
+    $deadline = (Get-Date).AddSeconds($seconds)
     while ([W]::IsWindowVisible($app.Hwnd) -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 10
     }
 }
 
-# Milliseconds from Alt+Tab until the overlay is visible, or $null if it does
-# not appear within 10 s. Cancels with Esc so nothing is switched.
-function Measure-OverlayMs($app) {
-    $ms = $null
+# Injects the held keys, then $key, and reports whether $key passed through
+# WinOrbit and whether the overlay ever became visible. Cancels a native
+# switcher with Esc before releasing the held keys. The key is checked under
+# the virtual key it was injected as, which depends on the keyboard layout
+# (scan 0x29 is VK_OEM_3 on US layouts but VK_OEM_8 on UK ones).
+function Test-InjectedChord($app, [string] $label, [uint32[]] $holdScans, [uint32] $keyScan) {
+    $keyVk = [W]::VkOf($keyScan)
+    $passed = $false
+    $overlay = $false
     try {
-        [W]::Key($SC_ALT, $false)
-        $watch = [Diagnostics.Stopwatch]::StartNew()
-        [W]::Key($SC_TAB, $false); [W]::Key($SC_TAB, $true)
-        while ($watch.ElapsedMilliseconds -lt 10000) {
-            if ([W]::IsWindowVisible($app.Hwnd)) { $ms = $watch.ElapsedMilliseconds; break }
-            Start-Sleep -Milliseconds 1
+        foreach ($scan in $holdScans) { [W]::Key($scan, $false) }
+        [W]::Key($keyScan, $false)
+        [void](Wait-InputDrained)
+        $passed = [W]::IsDown($keyVk)
+        [W]::Key($keyScan, $true)
+        $deadline = (Get-Date).AddMilliseconds(400)
+        while ((Get-Date) -lt $deadline) {
+            if ([W]::IsWindowVisible($app.Hwnd)) { $overlay = $true }
+            Start-Sleep -Milliseconds 10
         }
-        [W]::Key($SC_ESC, $false); [W]::Key($SC_ESC, $true)
+        if ($holdScans.Count -gt 0 -and $keyScan -ne $SC_ESC) { [W]::Key($SC_ESC, $false); [W]::Key($SC_ESC, $true) }
     } finally {
-        [W]::Key($SC_ALT, $true)
+        [W]::Key($keyScan, $true)
+        [array]::Reverse($holdScans)
+        foreach ($scan in $holdScans) { [W]::Key($scan, $true) }
     }
-    Wait-OverlayHidden $app
-    return $ms
+    [void](Wait-InputDrained)
+    if ([W]::IsWindowVisible($app.Hwnd)) { $overlay = $true }
+    Write-Host ("  injected {0,-22} (vk 0x{3:X2}) passed through: {1,-5} WinOrbit overlay shown: {2}" -f $label, $passed, $overlay, $keyVk)
+    if (-not $passed) { $failures.Add("injected: $label was consumed") }
+    if ($overlay) { $failures.Add("injected: $label showed the WinOrbit overlay") }
 }
 
-function Format-Ms($ms) {
-    if ($null -eq $ms) { return 'not shown in 10 s' }
-    return "$ms ms"
+# Prompts for a physical Alt+Tab and waits for the overlay. Returns whether it
+# was seen. This is the positive control that the hook handles real keys.
+function Wait-PhysicalAltTab($app, [string] $when) {
+    Write-Host ""
+    Write-Host "  >>> NOW, on your keyboard: hold Alt, tap Tab once, release Alt  ($when)" -ForegroundColor Yellow
+    $seen = $false
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        if ([W]::IsWindowVisible($app.Hwnd)) { $seen = $true; break }
+        Start-Sleep -Milliseconds 10
+    }
+    if ($seen) { Wait-OverlayHidden $app 60 }
+    Write-Host "  physical Alt+Tab $when -> WinOrbit overlay shown: $seen"
+    if (-not $seen) { $failures.Add("physical: no WinOrbit overlay for physical Alt+Tab $when") }
+    Start-Sleep -Milliseconds 1500
+    return $seen
+}
+
+function Get-IniValue([string] $ini, [string] $section, [string] $key) {
+    $current = ''
+    foreach ($line in Get-Content $ini) {
+        if ($line -match '^\s*\[(.+)\]\s*$') { $current = $Matches[1]; continue }
+        if ($current -eq $section -and $line -match "^\s*$key\s*=\s*(.*?)\s*$") { return $Matches[1] }
+    }
+    return ''
+}
+
+# WinOrbit's log file and its current length, so only this run is read back.
+function Get-LogInfo {
+    $ini = Join-Path (Split-Path $Exe) 'winorbit.ini'
+    $level = Get-IniValue $ini 'log' 'level'
+    $path = Get-IniValue $ini 'log' 'path'
+    if ($level -ne 'debug' -or -not $path) {
+        throw "winorbit.ini must set [log] level = debug and a path; the switch messages are read from the log"
+    }
+    if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path (Split-Path $Exe) $path }
+    $offset = 0
+    if (Test-Path $path) { $offset = (Get-Item $path).Length }
+    return @{ Path = $path; Offset = $offset }
+}
+
+# Switch messages WinOrbit handled during this run, with their log time in
+# seconds since WinOrbit started logging.
+function Read-SwitchMessages($logInfo) {
+    $stream = [IO.File]::Open($logInfo.Path, 'Open', 'Read', 'ReadWrite')
+    try {
+        [void]$stream.Seek($logInfo.Offset, 'Begin')
+        $text = (New-Object IO.StreamReader($stream)).ReadToEnd()
+    } finally {
+        $stream.Dispose()
+    }
+    $messages = @()
+    foreach ($line in $text -split "`n") {
+        if ($line -match '^\[(\d+):(\d+):(\d+)\.(\d+)\].*message (WM_USER_\w+)') {
+            $t = [int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3] + [int]$Matches[4] / 1000.0
+            $messages += [pscustomobject]@{ T = $t; Message = $Matches[5] }
+        }
+    }
+    return $messages
+}
+
+function Count-Messages($messages, [double] $from, [double] $to) {
+    return @($messages | Where-Object { $_.T -ge $from -and $_.T -le $to }).Count
 }
 
 function Start-WinOrbit {
@@ -172,6 +236,7 @@ function Start-WinOrbit {
         throw "Another WinOrbit is running; exit it first."
     }
     $p = Start-Process -FilePath $Exe -WorkingDirectory (Split-Path $Exe) -PassThru
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $deadline = (Get-Date).AddSeconds(5)
     do {
         Start-Sleep -Milliseconds 50
@@ -184,7 +249,8 @@ function Start-WinOrbit {
         throw "WinOrbit window did not appear"
     }
     Start-Sleep -Milliseconds 200
-    return @{ Process = $p; Hwnd = $hwnd }
+    # Clock starts at launch, so it is at or ahead of WinOrbit's log clock.
+    return @{ Process = $p; Hwnd = $hwnd; Clock = $clock }
 }
 
 function Stop-WinOrbit($app, [int] $timeoutMs = 5000) {
@@ -197,21 +263,18 @@ function Stop-WinOrbit($app, [int] $timeoutMs = 5000) {
     return @{ Exited = $true; Code = $app.Process.ExitCode }
 }
 
-# Runs Alt+Tab / Alt+` traffic on a background runspace until stopped.
+# Injects an unassigned key on a background runspace until stopped, so the
+# hook callback keeps being invoked. It does not switch anything.
 function Start-Traffic {
     $script:trafficFlag = [hashtable]::Synchronized(@{ Stop = $false })
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript({
-        param($flag)
+        param($flag, $vk)
         while (-not $flag.Stop) {
-            [W]::Key(0x38, $false)
-            for ($i = 0; $i -lt 3; $i++) { [W]::Key(0x0F, $false); [W]::Key(0x0F, $true); Start-Sleep -Milliseconds 5 }
-            for ($i = 0; $i -lt 2; $i++) { [W]::Key(0x29, $false); [W]::Key(0x29, $true); Start-Sleep -Milliseconds 5 }
-            [W]::Key(0x38, $true)
-            Start-Sleep -Milliseconds 10
+            [W]::Vk($vk, $false); [W]::Vk($vk, $true)
+            Start-Sleep -Milliseconds 2
         }
-        [W]::Key(0x38, $true)
-    }).AddArgument($script:trafficFlag)
+    }).AddArgument($script:trafficFlag).AddArgument([byte]$VK_TRAFFIC)
     $handle = $ps.BeginInvoke()
     return @{ PS = $ps; Handle = $handle }
 }
@@ -223,50 +286,57 @@ function Stop-Traffic($traffic) {
     Release-All
 }
 
-function Get-Median([double[]] $values) {
-    $sorted = @($values | Sort-Object)
-    $n = $sorted.Count
-    if ($n % 2 -eq 1) { return $sorted[($n - 1) / 2] }
-    return ($sorted[$n / 2 - 1] + $sorted[$n / 2]) / 2
-}
+function Invoke-InjectedCheck {
+    Write-Host "`n[1] Injected input is ignored (physical Alt+Tab as control)"
+    $logInfo = Get-LogInfo
+    $app = Start-WinOrbit
+    try {
+        $detector = Test-Detector
+        Write-Host "  detector (unassigned key seen down): $detector"
+        if (-not $detector) { throw "detector check failed; pass-through cannot be observed on this machine" }
 
-function Write-LatencySummary([string] $label, $samples) {
-    $shown = @($samples | Where-Object { $null -ne $_ })
-    $missing = $samples.Count - $shown.Count
-    if ($shown.Count -eq 0) {
-        Write-Host ("  {0}: overlay never shown in {1} run(s)" -f $label, $samples.Count)
-        return
+        [void](Wait-PhysicalAltTab $app "before the injected keys")
+        Write-Host "`n  Injecting keys now. The native Windows switcher may flash; that is expected."
+        $injectedFrom = $app.Clock.Elapsed.TotalSeconds
+        Test-InjectedChord $app "Alt+Tab" @($SC_ALT) $SC_TAB
+        Test-InjectedChord $app "Shift+Alt+Tab" @($SC_ALT, $SC_SHIFT) $SC_TAB
+        Test-InjectedChord $app "Alt+`` (backtick)" @($SC_ALT) $SC_BACKTICK
+        Test-InjectedChord $app "Alt (down/up)" @() $SC_ALT
+        Test-InjectedChord $app "Shift (down/up)" @() $SC_SHIFT
+        Test-InjectedChord $app "Esc" @() $SC_ESC
+        # Let any (wrongly) posted message reach the log before the window ends.
+        Start-Sleep -Milliseconds 1000
+        $injectedTo = $app.Clock.Elapsed.TotalSeconds
+
+        [void](Wait-PhysicalAltTab $app "after the injected keys")
+    } finally {
+        $result = Stop-WinOrbit $app
     }
-    $min = ($shown | Measure-Object -Minimum).Minimum
-    $max = ($shown | Measure-Object -Maximum).Maximum
-    Write-Host ("  {0}: min {1} ms, median {2} ms, max {3} ms over {4} run(s); not shown: {5}" -f `
-        $label, $min, (Get-Median $shown), $max, $shown.Count, $missing)
-}
+    if (-not $result.Exited -or $result.Code -ne 0) { $failures.Add("exit after [1] failed (code $($result.Code))") }
 
-function Assert-Intercepted([string] $where) {
-    $result = Test-HookIntercepts
-    Write-Host ("  hook probe {0}: {1}" -f $where, $result)
-    if ($result -ne 'Intercepted') { $failures.Add("hook: Alt+Tab not intercepted $where") }
+    # Read after exit so nothing is still buffered.
+    $messages = Read-SwitchMessages $logInfo
+    # WinOrbit's log clock starts a little after the script's launch clock, so
+    # log times run slightly behind; widen the start of the window by 1 s. The
+    # physical control before it always ends at least 1.5 s earlier.
+    $injectedFrom = [Math]::Max(0, $injectedFrom - 1.0)
+    $injected = Count-Messages $messages $injectedFrom $injectedTo
+    $total = @($messages).Count
+    Write-Host ("  WinOrbit switch messages: {0} in total, {1} during the injected keys ({2:N1}-{3:N1} s)" -f $total, $injected, $injectedFrom, $injectedTo)
+    if ($injected -ne 0) {
+        $failures.Add("injected: WinOrbit handled $injected switch message(s) during injected input")
+        $messages | Where-Object { $_.T -ge $injectedFrom -and $_.T -le $injectedTo } | ForEach-Object { Write-Host ("    {0:N3} s {1}" -f $_.T, $_.Message) }
+    }
+    if ($total -eq 0) { $failures.Add("log: no switch messages at all; the physical controls or log reading did not work") }
 }
 
 function Invoke-Full {
-    # 1. Detector, then cold/warm overlay latency on a fresh launch.
-    Write-Host "`n[1] Detector check and overlay latency"
-    $app = Start-WinOrbit
-    $detector = Test-Detector
-    Write-Host "  detector (Alt + unassigned key seen down): $detector"
-    if (-not $detector) { throw "detector check failed; hook probes cannot be trusted on this machine" }
-    $cold = Measure-OverlayMs $app
-    Start-Sleep -Milliseconds 500
-    $warm = Measure-OverlayMs $app
-    Write-Host ("  overlay latency: cold {0}, warm {1}" -f (Format-Ms $cold), (Format-Ms $warm))
-    if ($null -eq $cold -or $null -eq $warm) { $failures.Add("ui: overlay not shown within 10 s after launch") }
-    Assert-Intercepted "after launch"
-    $result = Stop-WinOrbit $app
-    if (-not $result.Exited -or $result.Code -ne 0) { $failures.Add("exit after [1] failed") }
+    Invoke-InjectedCheck
 
-    # 2. Exit under hotkey traffic.
-    Write-Host "`n[2] Exit while hotkey traffic is in flight x$ExitIterations"
+    # 2. Exit while the hook callback is being invoked. Injected events return
+    # before the hook state is locked, so this covers the hook thread and the
+    # exit path, not state-lock contention (unit-tested instead).
+    Write-Host "`n[2] Exit while injected keys keep invoking the hook x$ExitIterations"
     for ($i = 1; $i -le $ExitIterations; $i++) {
         $app = Start-WinOrbit
         $traffic = Start-Traffic
@@ -279,10 +349,12 @@ function Invoke-Full {
     }
 
     # 3. Stalled UI thread.
-    Write-Host "`n[3] UI thread stalled for $StallSeconds s while hotkeys keep firing"
+    Write-Host "`n[3] UI thread stalled for $StallSeconds s"
+    $logInfo = Get-LogInfo
     $app = Start-WinOrbit
-    Write-Host ("  warm-up overlay: {0}" -f (Format-Ms (Measure-OverlayMs $app)))
-    Assert-Intercepted "before stall"
+    [void](Wait-PhysicalAltTab $app "before the stall")
+    $baseline = Wait-InputDrained
+    $stallFrom = $app.Clock.Elapsed.TotalSeconds
     $suspended = @()
     $hookThreadFound = $false
     try {
@@ -302,11 +374,19 @@ function Invoke-Full {
             $suspended += $h
         }
         if (-not $hookThreadFound) { $failures.Add("stall: keyboard-hook thread not found") }
-        Write-Host "  suspended $($suspended.Count) thread(s); type in another window now - it must not lag"
-        $traffic = Start-Traffic
+        Write-Host "  suspended $($suspended.Count) thread(s)"
+        $drains = @()
+        for ($i = 0; $i -lt 5; $i++) { $drains += Wait-InputDrained }
+        $worst = ($drains | Measure-Object -Maximum).Maximum
+        # A missing hook would also pass the sentinel at once, so this shows
+        # only that WinOrbit does not block injected input; the physical
+        # presses below are the evidence the hook still works.
+        Write-Host ("  injected sentinel pass-through: baseline {0} ms, during stall max {1} ms (non-blocking check only)" -f $baseline, $worst)
+        if ($worst -gt $DRAIN_LIMIT_MS) { $failures.Add("stall: injected input delayed $worst ms while the UI was stalled") }
+        Write-Host ""
+        Write-Host "  >>> NOW, within $StallSeconds s: hold Alt, tap Tab twice, release Alt," -ForegroundColor Yellow
+        Write-Host "  >>> then type a few words anywhere. Typing must not lag. (Nothing will appear yet.)" -ForegroundColor Yellow
         Start-Sleep -Seconds $StallSeconds
-        Stop-Traffic $traffic
-        for ($i = 1; $i -le 3; $i++) { Assert-Intercepted "during stall #$i" }
     } finally {
         foreach ($h in $suspended) { [void][W]::ResumeThread($h); [void][W]::CloseHandle($h) }
         Release-All
@@ -316,42 +396,26 @@ function Invoke-Full {
     $responsive = [W]::SendMessageTimeout($app.Hwnd, 0, [IntPtr]::Zero, [IntPtr]::Zero, 2, 5000, [ref]$out) -ne [IntPtr]::Zero
     Write-Host "  UI responsive after resume: $responsive"
     if (-not $responsive) { $failures.Add("ui: not responsive after resume") }
-    Wait-OverlayHidden $app
-    Assert-Intercepted "after stall"
-    $after = Measure-OverlayMs $app
-    Write-Host ("  overlay after resume: {0}" -f (Format-Ms $after))
-    if ($null -eq $after) { $failures.Add("ui: overlay not shown within 10 s after resume") }
-
-    # 4. Liveness over time.
-    Write-Host "`n[4] Hook probe every 15 s for $ProbeMinutes min"
-    $deadline = (Get-Date).AddMinutes($ProbeMinutes)
-    $n = 0
-    while ((Get-Date) -lt $deadline) {
-        $n++
-        Assert-Intercepted ("#{0} at {1:HH:mm:ss}" -f $n, (Get-Date))
-        Start-Sleep -Seconds 15
-    }
-
+    Wait-OverlayHidden $app 10
+    $stallTo = $app.Clock.Elapsed.TotalSeconds
+    [void](Wait-PhysicalAltTab $app "after the stall")
     $result = Stop-WinOrbit $app
     Write-Host "  final exit: exited=$($result.Exited) code=$($result.Code)"
     if (-not $result.Exited -or $result.Code -ne 0) { $failures.Add("final exit failed") }
-}
 
-function Invoke-ColdStart {
-    Write-Host "`nCold-start overlay latency x$ColdRuns (fresh launch each run)"
-    $cold = @(); $warm = @()
-    for ($i = 1; $i -le $ColdRuns; $i++) {
-        $app = Start-WinOrbit
-        $c = Measure-OverlayMs $app
-        Start-Sleep -Milliseconds 500
-        $w = Measure-OverlayMs $app
-        $result = Stop-WinOrbit $app
-        Write-Host ("  run {0}: cold {1}, warm {2}, exit code {3}" -f $i, (Format-Ms $c), (Format-Ms $w), $result.Code)
-        $cold += , $c; $warm += , $w
-        Start-Sleep -Milliseconds 500
+    # The physical Alt+Tab+Tab typed during the stall was queued by the hook
+    # and must have been handled once the UI resumed: two switches and a
+    # commit. The window runs from the stall's start (the control before it
+    # ended at least 1.5 s earlier) to before the prompt for the control after
+    # it; log times run slightly behind the script clock, which only moves
+    # them earlier.
+    $messages = @(Read-SwitchMessages $logInfo | Where-Object { $_.T -ge $stallFrom -and $_.T -lt $stallTo })
+    $switches = @($messages | Where-Object { $_.Message -eq 'WM_USER_SWITCH_APPS' }).Count
+    $commits = @($messages | Where-Object { $_.Message -eq 'WM_USER_SWITCH_APPS_DONE' }).Count
+    Write-Host ("  physical Alt+Tab+Tab during the stall, handled after resume: {0} switch(es), {1} commit(s) ({2:N1}-{3:N1} s)" -f $switches, $commits, $stallFrom, $stallTo)
+    if ($switches -lt 2 -or $commits -lt 1) {
+        $failures.Add("stall: WinOrbit's log does not show the physical Alt+Tab+Tab from the stall handled after resume ($switches switches, $commits commits)")
     }
-    Write-LatencySummary "cold" $cold
-    Write-LatencySummary "warm" $warm
 }
 
 try {
@@ -390,10 +454,15 @@ public static class W {
     [DllImport("kernel32.dll")] public static extern int GetThreadDescription(IntPtr h, out IntPtr desc);
     [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr p);
 
-    // Scan-code based so the hook (which matches scan codes) sees real keys.
+    // Scan code plus its virtual key, like a real key. Windows still flags it
+    // as injected (LLKHF_INJECTED).
     public static void Key(uint scan, bool up) {
-        uint vk = MapVirtualKey(scan, 1);
-        keybd_event((byte)vk, (byte)scan, up ? 2u : 0u, UIntPtr.Zero);
+        keybd_event(VkOf(scan), (byte)scan, up ? 2u : 0u, UIntPtr.Zero);
+    }
+
+    // The virtual key Key() sends for a scan code, in the active layout.
+    public static byte VkOf(uint scan) {
+        return (byte)MapVirtualKey(scan, 1);
     }
 
     // Virtual-key only (scan code 0), for keys WinOrbit never matches.
@@ -412,7 +481,7 @@ public static class W {
 
     switch ($Mode) {
         'Full' { Invoke-Full }
-        'ColdStart' { Invoke-ColdStart }
+        'Injected' { Invoke-InjectedCheck }
         'SelfTestPass' { Write-Host "self-test: no failures recorded" }
         'SelfTestFail' { $failures.Add("self-test: forced failure") }
         'SelfTestAbort' { throw "self-test: forced abort" }
@@ -430,10 +499,10 @@ public static class W {
             # Nothing may be left logically down.
             Start-Sleep -Milliseconds 200
             $stuck = @()
-            foreach ($key in @(@('Alt', $VK_ALT), @('Tab', $VK_TAB), @('mask vkE8', $VK_MASK), @('sentinel', $VK_SENTINEL), @('detector', $VK_DETECTOR))) {
+            foreach ($key in @(@('Alt', $VK_ALT), @('Tab', $VK_TAB), @('Shift', $VK_SHIFT), @('Esc', $VK_ESC), @('backtick', [W]::VkOf($SC_BACKTICK)), @('mask vkE8', $VK_MASK), @('sentinel', $VK_SENTINEL), @('detector', $VK_DETECTOR), @('traffic', $VK_TRAFFIC))) {
                 if ([W]::IsDown($key[1])) { $stuck += $key[0] }
             }
-            Write-Host ("`n[5] keys left down: {0}" -f $(if ($stuck.Count) { $stuck -join ', ' } else { 'none' }))
+            Write-Host ("`n[4] keys left down: {0}" -f $(if ($stuck.Count) { $stuck -join ', ' } else { 'none' }))
             foreach ($name in $stuck) { $failures.Add("$name left down") }
         } catch {
             $failures.Add("cleanup failed: $_")
