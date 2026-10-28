@@ -344,9 +344,9 @@ struct KeyEvent {
 }
 
 impl KeyEvent {
-    /// Returns `None` for any input Windows marks as injected, including this
-    /// module's own mask key, so only physical keyboard input becomes a
-    /// `KeyEvent`.
+    /// Returns `None` for any event carrying Windows' injected-input flags,
+    /// including this module's own mask key. Every other event is treated as
+    /// ordinary keyboard input: the hook only knows what Windows reports.
     fn from_hook_data(data: &KBDLLHOOKSTRUCT) -> Option<Self> {
         if data.flags.0 & INJECTED_FLAGS != 0 {
             return None;

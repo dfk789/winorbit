@@ -115,7 +115,7 @@ path =
 - While the `Alt+Tab` overlay is open, press `Alt+\`` to cycle windows inside the selected app without foregrounding each candidate window immediately.
 - Release `Alt` to activate the currently selected app window.
 - Press `Esc` while the overlay is open to cancel. `Alt+Esc` without an open overlay is left to Windows.
-- Only physical keyboard input triggers WinOrbit. Keys that Windows reports as software-generated (key remappers, macro tools, on-screen or touch keyboards, KVM and remote-control tools, tablet button software) are ignored by WinOrbit and passed on to Windows, so for example a software-sent `Alt+Tab` opens the native Windows switcher.
+- WinOrbit ignores key events that Windows marks as injected, and passes them on to Windows unchanged. Software input sent through mechanisms such as `SendInput` is reported this way, so for example an `Alt+Tab` produced by a key remapper such as PowerToys Keyboard Manager opens the native Windows switcher rather than WinOrbit. Other tools (macro tools, on-screen keyboards, remote-control or KVM software, tablet drivers) are affected only if the keys they produce carry that mark. All other key events are treated as ordinary keyboard input.
 - `preview` is the shipped default. `icon_only` remains the safest fallback mode when previews are incompatible with a specific app.
 
 ## Credits
