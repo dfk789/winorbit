@@ -20,6 +20,13 @@
             key-up; consume the physical up only if all 3 went in.
       C     On the first Win key-down: inject vkE8 down/up. Pass every Win
             event natively.
+      D     Double tap: a clean tap is handled like A, unless it starts
+            within 500 ms (KBDLLHOOKSTRUCT.time) of the previous masked tap's
+            key-up with no other key between them; that second tap passes
+            natively.
+
+    -Round2 runs only the second-round trials (A x10, A on a 2 s hold,
+    double tap, A/D with an elevated foreground) and refuses to run elevated.
 
     Also records the raw hook event sequence around Win+L lock/unlock and an
     optional UAC prompt, and compares the hook's idea of which keys are down
@@ -33,7 +40,10 @@
     Windows still reports down.
 #>
 param(
-    [switch] $SkipUac
+    [switch] $SkipUac,
+    # Second round only: repeated A taps, A on a long hold, double tap, and A
+    # with an elevated foreground window. Refuses to run elevated.
+    [switch] $Round2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,8 +106,13 @@ public static class Probe {
     static readonly Stopwatch Clock = Stopwatch.StartNew();
 
     public static readonly ConcurrentQueue<string> Events = new ConcurrentQueue<string>();
-    // 0 Pass, 1 A, 2 B, 3 C
+    // 0 Pass, 1 A, 2 B, 3 C, 4 D (double tap)
     public static volatile int Mode;
+    const uint DoubleTapMs = 500;
+    // D: time of the last masked tap's key-up, valid while pairOpen.
+    static bool pairOpen;
+    static uint pairUpTime;
+    static bool pairSecond;
 
     // Tap tracking (physical events only).
     static bool lwin, rwin;
@@ -167,6 +182,7 @@ public static class Probe {
         if (!isWin) {
             down[k.vkCode & 0xFF] = !up;
             if (lwin || rwin) chorded = true;
+            pairOpen = false;
             return CallNextHookEx(hook, code, wParam, lParam);
         }
 
@@ -176,6 +192,8 @@ public static class Probe {
                 // New hold: clean unless another key is already down.
                 chorded = false;
                 for (int i = 0; i < 256; i++) if (down[i]) { chorded = true; break; }
+                pairSecond = pairOpen && unchecked(k.time - pairUpTime) <= DoubleTapMs;
+                pairOpen = false;
                 if (Mode == 3) { Note("  C: mask on first Win down"); SendMask(); }
             } else if ((k.vkCode == VK_LWIN && !lwin) || (k.vkCode == VK_RWIN && !rwin)) {
                 chorded = true; // the other Win side joined
@@ -204,6 +222,14 @@ public static class Probe {
                 action = "B: sent " + sent + "/3, " + (consume ? "consumed physical up" : "passed physical up");
             } else if (Mode == 3) {
                 action = "C: passed up (mask went in at down)";
+            } else if (Mode == 4 && pairSecond) {
+                action = "D: second tap, passed natively";
+            } else if (Mode == 4) {
+                Note("  D: first tap, mask then pass the physical up");
+                uint sent = SendMask();
+                action = "D: first tap, mask " + sent + "/2, passed up";
+                pairOpen = sent == 2;
+                pairUpTime = k.time;
             }
         }
         LastClean = !chorded;
@@ -240,7 +266,7 @@ public static class Probe {
     }
 
     public static void ResetTracking() {
-        lwin = false; rwin = false; chorded = false;
+        lwin = false; rwin = false; chorded = false; pairOpen = false; pairSecond = false;
         for (int i = 0; i < 256; i++) down[i] = false;
     }
 
@@ -305,6 +331,42 @@ function Invoke-Trial([string] $name, [int] $mode, [string] $instruction, [int] 
     $results.Add([pscustomobject]@{ Trial = $name; Clean = $clean; Action = $action; Detected = [bool]$detected; Seen = $seen })
 }
 
+# Waits for $count completed Win holds while watching the foreground the whole
+# time, then asks once whether Start opened during any of them.
+function Invoke-Burst([string] $name, [int] $mode, [int] $count, [string] $instruction, [int] $seconds = 90) {
+    [Probe]::Mode = $mode
+    [Probe]::ResetTracking()
+    $before = [Probe]::Releases
+    Write-Host ""
+    Write-Host "  [$name]" -ForegroundColor Cyan
+    Write-Host "  >>> NOW: $instruction" -ForegroundColor Yellow
+    $deadline = (Get-Date).AddSeconds($seconds)
+    $detected = @()
+    $actions = @()
+    $seenReleases = $before
+    $quietUntil = $null
+    while ((Get-Date) -lt $deadline) {
+        $fg = [Probe]::Foreground()
+        if ($fg -match '^(StartMenuExperienceHost|SearchHost|ShellExperienceHost) ') {
+            $detected += ("after release {0}: {1}" -f ([Probe]::Releases - $before), $fg)
+            Close-Start
+        }
+        if ([Probe]::Releases -ne $seenReleases) {
+            $seenReleases = [Probe]::Releases
+            $actions += [Probe]::LastAction
+            if ($seenReleases - $before -ge $count) { $quietUntil = (Get-Date).AddMilliseconds(1500) }
+        }
+        if ($quietUntil -and (Get-Date) -gt $quietUntil) { break }
+        Start-Sleep -Milliseconds 20
+    }
+    $done = [Probe]::Releases - $before
+    $seen = Read-YesNo "Did the Start menu open or flash, even briefly, at any point?"
+    Write-Host ("  releases={0}/{1} start-detected={2} you-saw-start={3}" -f $done, $count, $detected.Count, $seen)
+    foreach ($d in $detected) { Write-Host "    detected $d" }
+    foreach ($a in $actions) { Write-Host "    action: $a" }
+    $results.Add([pscustomobject]@{ Trial = $name; Clean = "$done/$count"; Action = ($actions -join '; '); Detected = $detected.Count; Seen = $seen })
+}
+
 function Show-StaleKeys([string] $label) {
     $believed = @()
     $down = [Probe]::Down
@@ -338,6 +400,9 @@ try {
     $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Write-Host "Probe elevated: $elevated"
     if (Get-Process -Name winorbit -ErrorAction SilentlyContinue) { throw "WinOrbit is running; exit it first (tray > Exit)." }
+    if ($Round2 -and $elevated) {
+        throw "-Round2 needs a NON-elevated terminal. Open one with Win+R, type powershell, press Enter (not Ctrl+Shift+Enter)."
+    }
     if ($elevated) {
         Write-Host "WARNING: this terminal is elevated, so the elevated-window trial is skipped. Run from a normal terminal for full results." -ForegroundColor Red
     }
@@ -346,6 +411,28 @@ try {
     $hookStarted = $true
     Write-Host "`nProbe hook installed. Keep this window focused unless a step says otherwise."
     Write-Host "When Start opens, the script closes it with Esc. Answer y/n by typing here."
+
+    if ($Round2) {
+        Write-Host "`n[R2-1] Strategy A, repeated"
+        Invoke-Burst "A x10 taps" 1 10 "tap the LEFT Windows key 10 times, about one per second, a few of them very quick"
+        Invoke-Trial "A: Win held 2 s" 1 "hold the LEFT Windows key about 2 seconds, then release"
+
+        Write-Host "`n[R2-2] Double tap (first tap masked, second passes natively)"
+        Invoke-Trial "D: single tap" 4 "tap the LEFT Windows key ONCE (Start should NOT open)"
+        Start-Sleep -Milliseconds 800
+        Invoke-Burst "D: double tap" 4 2 "double-tap the LEFT Windows key quickly (Start SHOULD open on the second tap)" 30
+        Start-Sleep -Milliseconds 800
+        Invoke-Burst "D: two slow taps" 4 2 "tap the LEFT Windows key, wait about 2 seconds, tap it again (Start should NOT open)" 30
+
+        Write-Host "`n[R2-3] Elevated foreground window (UIPI)"
+        Write-Host "  Open Task Manager (Ctrl+Shift+Esc), which runs elevated for admin users. Click into it so it is focused."
+        Write-Host "  The Start check reads the foreground, so answer the y/n question after switching back here."
+        Invoke-Trial "A with elevated foreground" 1 "with Task Manager focused, tap the LEFT Windows key once" 60
+        Invoke-Trial "A with elevated foreground, again" 1 "click Task Manager again, then tap the LEFT Windows key once" 60
+        Invoke-Burst "D double tap with elevated foreground" 4 2 "click Task Manager again, then double-tap the LEFT Windows key quickly" 60
+        Show-StaleKeys "after elevated trials"
+        return
+    }
 
     Write-Host "`n[1] Native behaviour (hook passes everything)"
     Invoke-Trial "native: LWin tap" 0 "tap the LEFT Windows key once"
