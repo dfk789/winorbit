@@ -80,7 +80,7 @@ $exitCode = 1
 $helperLoaded = $false
 
 $SC_ALT = 0x38; $SC_TAB = 0x0F; $SC_BACKTICK = 0x29; $SC_ESC = 0x01; $SC_SHIFT = 0x2A
-$VK_ALT = 0x12; $VK_TAB = 0x09; $VK_SHIFT = 0x10; $VK_ESC = 0x1B; $VK_BACKTICK = 0xC0; $VK_MASK = 0xE8
+$VK_ALT = 0x12; $VK_TAB = 0x09; $VK_SHIFT = 0x10; $VK_ESC = 0x1B; $VK_MASK = 0xE8
 # Unassigned virtual keys: no app reacts to them and WinOrbit ignores them.
 $VK_SENTINEL = 0x97; $VK_DETECTOR = 0x98; $VK_TRAFFIC = 0x99
 $WM_COMMAND = 0x0111; $IDM_EXIT = 1
@@ -133,8 +133,11 @@ function Wait-OverlayHidden($app, [int] $seconds = 5) {
 
 # Injects the held keys, then $key, and reports whether $key passed through
 # WinOrbit and whether the overlay ever became visible. Cancels a native
-# switcher with Esc before releasing the held keys.
-function Test-InjectedChord($app, [string] $label, [uint32[]] $holdScans, [uint32] $keyScan, [int] $keyVk) {
+# switcher with Esc before releasing the held keys. The key is checked under
+# the virtual key it was injected as, which depends on the keyboard layout
+# (scan 0x29 is VK_OEM_3 on US layouts but VK_OEM_8 on UK ones).
+function Test-InjectedChord($app, [string] $label, [uint32[]] $holdScans, [uint32] $keyScan) {
+    $keyVk = [W]::VkOf($keyScan)
     $passed = $false
     $overlay = $false
     try {
@@ -156,7 +159,7 @@ function Test-InjectedChord($app, [string] $label, [uint32[]] $holdScans, [uint3
     }
     [void](Wait-InputDrained)
     if ([W]::IsWindowVisible($app.Hwnd)) { $overlay = $true }
-    Write-Host ("  injected {0,-22} passed through: {1,-5} WinOrbit overlay shown: {2}" -f $label, $passed, $overlay)
+    Write-Host ("  injected {0,-22} (vk 0x{3:X2}) passed through: {1,-5} WinOrbit overlay shown: {2}" -f $label, $passed, $overlay, $keyVk)
     if (-not $passed) { $failures.Add("injected: $label was consumed") }
     if ($overlay) { $failures.Add("injected: $label showed the WinOrbit overlay") }
 }
@@ -293,12 +296,12 @@ function Invoke-InjectedCheck {
         [void](Wait-PhysicalAltTab $app "before the injected keys")
         Write-Host "`n  Injecting keys now. The native Windows switcher may flash; that is expected."
         $injectedFrom = $app.Clock.Elapsed.TotalSeconds
-        Test-InjectedChord $app "Alt+Tab" @($SC_ALT) $SC_TAB $VK_TAB
-        Test-InjectedChord $app "Shift+Alt+Tab" @($SC_ALT, $SC_SHIFT) $SC_TAB $VK_TAB
-        Test-InjectedChord $app "Alt+`` (backtick)" @($SC_ALT) $SC_BACKTICK $VK_BACKTICK
-        Test-InjectedChord $app "Alt (down/up)" @() $SC_ALT $VK_ALT
-        Test-InjectedChord $app "Shift (down/up)" @() $SC_SHIFT $VK_SHIFT
-        Test-InjectedChord $app "Esc" @() $SC_ESC $VK_ESC
+        Test-InjectedChord $app "Alt+Tab" @($SC_ALT) $SC_TAB
+        Test-InjectedChord $app "Shift+Alt+Tab" @($SC_ALT, $SC_SHIFT) $SC_TAB
+        Test-InjectedChord $app "Alt+`` (backtick)" @($SC_ALT) $SC_BACKTICK
+        Test-InjectedChord $app "Alt (down/up)" @() $SC_ALT
+        Test-InjectedChord $app "Shift (down/up)" @() $SC_SHIFT
+        Test-InjectedChord $app "Esc" @() $SC_ESC
         # Let any (wrongly) posted message reach the log before the window ends.
         Start-Sleep -Milliseconds 1000
         $injectedTo = $app.Clock.Elapsed.TotalSeconds
@@ -432,8 +435,12 @@ public static class W {
     // Scan code plus its virtual key, like a real key. Windows still flags it
     // as injected (LLKHF_INJECTED).
     public static void Key(uint scan, bool up) {
-        uint vk = MapVirtualKey(scan, 1);
-        keybd_event((byte)vk, (byte)scan, up ? 2u : 0u, UIntPtr.Zero);
+        keybd_event(VkOf(scan), (byte)scan, up ? 2u : 0u, UIntPtr.Zero);
+    }
+
+    // The virtual key Key() sends for a scan code, in the active layout.
+    public static byte VkOf(uint scan) {
+        return (byte)MapVirtualKey(scan, 1);
     }
 
     // Virtual-key only (scan code 0), for keys WinOrbit never matches.
@@ -470,7 +477,7 @@ public static class W {
             # Nothing may be left logically down.
             Start-Sleep -Milliseconds 200
             $stuck = @()
-            foreach ($key in @(@('Alt', $VK_ALT), @('Tab', $VK_TAB), @('Shift', $VK_SHIFT), @('Esc', $VK_ESC), @('mask vkE8', $VK_MASK), @('sentinel', $VK_SENTINEL), @('detector', $VK_DETECTOR), @('traffic', $VK_TRAFFIC))) {
+            foreach ($key in @(@('Alt', $VK_ALT), @('Tab', $VK_TAB), @('Shift', $VK_SHIFT), @('Esc', $VK_ESC), @('backtick', [W]::VkOf($SC_BACKTICK)), @('mask vkE8', $VK_MASK), @('sentinel', $VK_SENTINEL), @('detector', $VK_DETECTOR), @('traffic', $VK_TRAFFIC))) {
                 if ([W]::IsDown($key[1])) { $stuck += $key[0] }
             }
             Write-Host ("`n[4] keys left down: {0}" -f $(if ($stuck.Count) { $stuck -join ', ' } else { 'none' }))
