@@ -1008,7 +1008,8 @@ mod tests {
             )
         }
 
-        /// A physical key event.
+        /// A key event without injected flags, as a physical key produces.
+        /// "Physical" in these tests means exactly that.
         fn event(&mut self, scan_code: u32, is_extended: bool, is_pressed: bool) -> bool {
             self.raw(hook_data(scan_code, is_extended, is_pressed, 0))
         }
@@ -1837,8 +1838,9 @@ mod tests {
     #[test]
     fn injected_events_change_nothing_and_are_never_consumed() {
         // Every key WinOrbit cares about, both sides, down and up, with each
-        // injected flag combination: from idle, from a physical hold, and
-        // from a live switch session.
+        // injected flag combination: from idle, from a physical hold of the
+        // configured modifier, and from a live switch session started with
+        // it. Each modifier side is used for the hold.
         let keys = [
             (ALT, false),
             (ALT, true),
@@ -1851,34 +1853,66 @@ mod tests {
             (ESC, false),
             (A, false),
         ];
-        let setups: [fn(&mut Harness); 3] = [
-            |_| {},
-            |h| {
-                h.down(ALT);
-            },
-            |h| {
-                h.down(ALT);
-                h.tap(TAB);
-            },
+        let modifiers = [
+            (["alt+`", "alt+tab"], ALT, false),
+            (["alt+`", "alt+tab"], ALT, true),
+            (["win+`", "win+tab"], LWIN, true),
+            (["win+`", "win+tab"], RWIN, true),
         ];
-        for setup in setups {
-            for hotkeys in [["alt+`", "alt+tab"], ["win+`", "win+tab"]] {
+        #[derive(Clone, Copy, Debug)]
+        enum Setup {
+            Idle,
+            Hold,
+            Session,
+        }
+        for (hotkeys, modifier, is_extended) in modifiers {
+            for setup in [Setup::Idle, Setup::Hold, Setup::Session] {
                 let mut h = Harness::with_hotkeys(hotkeys);
-                setup(&mut h);
-                let before = h.snapshot();
-                let posted = h.sink.posted.len();
-                let requests = h.injector.requests.len();
+                let idle = h.snapshot();
+                match setup {
+                    Setup::Idle => {}
+                    Setup::Hold => {
+                        assert!(!h.event(modifier, is_extended, true));
+                        assert_ne!(h.snapshot(), idle, "{hotkeys:?}: no hold");
+                    }
+                    Setup::Session => {
+                        assert!(!h.event(modifier, is_extended, true));
+                        assert!(h.tap(TAB), "{hotkeys:?}: Tab not consumed");
+                        assert_eq!(h.sink.posted, vec![SwitchApps { reverse: false }]);
+                    }
+                }
+                let posted = h.sink.posted.clone();
+                let requests = h.injector.requests.clone();
                 for flags in INJECTED_VARIANTS {
-                    for (scan_code, is_extended) in keys {
+                    for (scan_code, key_extended) in keys {
                         for is_pressed in [true, false] {
-                            let data = hook_data(scan_code, is_extended, is_pressed, flags);
-                            assert!(!h.raw(data), "consumed {data:?}");
+                            let data = hook_data(scan_code, key_extended, is_pressed, flags);
+                            let before = h.snapshot();
+                            assert!(!h.raw(data), "{hotkeys:?} {setup:?}: consumed {data:?}");
+                            assert_eq!(h.snapshot(), before, "{hotkeys:?} {setup:?}: {data:?}");
+                            assert_eq!(h.sink.posted, posted, "{hotkeys:?} {setup:?}: {data:?}");
+                            assert_eq!(
+                                h.injector.requests, requests,
+                                "{hotkeys:?} {setup:?}: {data:?}"
+                            );
                         }
                     }
                 }
-                assert_eq!(h.snapshot(), before);
-                assert_eq!(h.sink.posted.len(), posted);
-                assert_eq!(h.injector.requests.len(), requests);
+                // The physical state survived intact: releasing the physical
+                // modifier ends the hold, committing a live session.
+                assert!(!h.event(modifier, is_extended, false));
+                match setup {
+                    Setup::Idle | Setup::Hold => assert_eq!(h.sink.posted, posted),
+                    Setup::Session => assert_eq!(
+                        h.sink.posted,
+                        vec![SwitchApps { reverse: false }, SwitchAppsDone]
+                    ),
+                }
+                assert_eq!(
+                    h.snapshot(),
+                    idle,
+                    "{hotkeys:?} {setup:?}: not back to idle"
+                );
             }
         }
     }
