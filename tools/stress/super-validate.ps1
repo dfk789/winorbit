@@ -155,6 +155,8 @@ public static class V {
 
     public static void ResetWin() { lwin = false; rwin = false; }
 
+    public static bool IsVisible(IntPtr hwnd) { return IsWindowVisible(hwnd); }
+
     public static bool IsDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
     public static void Vk(byte vk, byte scan, bool up, bool extended) {
@@ -292,7 +294,7 @@ function Invoke-Trial {
         [string] $name, [string] $instruction, [int] $releases,
         [bool] $expectStart, [int] $expectToggle, [int] $expectSecond,
         [string] $nativeQuestion = '', [int] $seconds = 60, [switch] $Optional, [switch] $NoMeasure, [switch] $ExpectReset,
-        [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd,
+        [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd, [switch] $ExpectOverlayHidden,
         [string] $logPath = $script:logPath
     )
     Close-StartIfOpen
@@ -353,6 +355,9 @@ function Invoke-Trial {
         # One commit per Alt hold, however many Tab presses it had.
         $commits = ([regex]::Matches($text, 'message WM_USER_SWITCH_APPS_DONE')).Count
         Check $name 'WinOrbit switch commits logged' $expectCommits $commits
+    }
+    if ($ExpectOverlayHidden) {
+        Check $name 'WinOrbit overlay hidden (measured)' $true (-not [V]::IsVisible($script:app.Hwnd))
     }
     if ($ExpectStartClosedAtEnd) {
         Check $name 'Start closed at the end (measured)' $true (-not $startAtEnd)
@@ -434,6 +439,8 @@ try {
         Invoke-Trial 'tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 1 0
         Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectCommits 1
         Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectCommits 0
+        Invoke-Trial 'Ctrl+Alt+Del during Alt+Tab' 'hold Alt, tap Tab (switcher shows), KEEP Alt held and press Ctrl+Del, click Cancel, release all keys, CLICK this window' 0 $false 0 0 'Was the WinOrbit switcher gone when you came back?' -ExpectReset -expectCommits 0 -ExpectOverlayHidden
+        Invoke-Trial 'Alt+Tab after the interrupted switch' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch normally?' -expectCommits 1
     }
 
     Write-Host "`n[4] Elevated foreground"
