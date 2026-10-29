@@ -6,7 +6,7 @@ use crate::{
     },
     config::{Hotkey, SuperTapConfig, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
     foreground::{IS_FOREGROUND_IN_BLACKLIST, IS_FOREGROUND_START},
-    super_key::{KeyStateProbe, SuperTap, TapOutcome, VK_LWIN, VK_RWIN},
+    super_key::{KeyStateProbe, KeysDown, SuperTap, TapOutcome, VK_LWIN, VK_RWIN},
 };
 
 use anyhow::{anyhow, bail, Result};
@@ -79,6 +79,10 @@ struct HookShared {
     /// `KeyboardState::epoch`.
     epoch: AtomicU32,
     state: Mutex<KeyboardState>,
+    /// Virtual-key codes of injected events not yet handed to `SuperTap`
+    /// (one bit each). Lock-free, so a contended state lock can never lose
+    /// one: they are handed over on the next physical event that gets it.
+    injected: [AtomicU64; 4],
     /// Longest hook callback so far, in microseconds; logged at shutdown.
     max_callback_us: AtomicU64,
 }
@@ -89,6 +93,7 @@ impl HookShared {
             target: AtomicIsize::new(0),
             epoch: AtomicU32::new(0),
             state: Mutex::new(KeyboardState::new(&[], None)),
+            injected: Default::default(),
             max_callback_us: AtomicU64::new(0),
         }
     }
@@ -98,6 +103,12 @@ impl HookShared {
     /// ownership invariant on `HookShared` for why that is safe.
     fn quiesce(&self) {
         self.target.store(0, Ordering::Release);
+    }
+
+    /// Notes the key of an injected event, which is otherwise ignored. Only
+    /// ever makes `SuperTap` more cautious (see `super_key`).
+    fn note_injected(&self, vk: u8) {
+        self.injected[(vk >> 6) as usize].fetch_or(1 << (vk & 63), Ordering::AcqRel);
     }
 
     /// Hook-thread side of one key event. Never blocks: a contended state lock
@@ -119,6 +130,15 @@ impl HookShared {
             state.reset_physical_state();
             state.epoch = epoch;
         }
+        // After any pending reset, so injected events seen since then count
+        // as seen in probation.
+        let injected = self
+            .injected
+            .each_ref()
+            .map(|word| word.swap(0, Ordering::AcqRel));
+        if let Some(super_tap) = state.super_tap.as_mut() {
+            super_tap.on_injected(&KeysDown::from_words(injected));
+        }
         let target = self.target.load(Ordering::Acquire);
         if target == 0 {
             return false;
@@ -136,9 +156,8 @@ static LISTENER_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// switch to the secure desktop). Never blocks: the hook drops its physical
 /// key state on its next event. Safe to call at any time, from any thread.
 ///
-/// This is the hook's only recovery from lost key-ups. It never consults
-/// `GetAsyncKeyState`, which reports an injected key-up exactly like a
-/// physical one and so would let injected input change hook decisions.
+/// This is the hook's only recovery from lost key-ups. Bare Win taps then stay
+/// native until `SuperTap` regains trust; hotkey holds simply restart.
 pub fn reset_input_state(reason: &str) {
     HOOK.epoch.fetch_add(1, Ordering::AcqRel);
     info!("input reset: {reason}");
@@ -1024,7 +1043,8 @@ enum HotKeyAction {
 /// Hook-thread handling of one raw event. Injected input is rejected here,
 /// before the state is even locked, so it can never change modifier, Shift or
 /// hotkey state, start/advance/cancel/commit a switch, inject a mask, post a
-/// UI action, or be consumed: it always passes on to the next hook.
+/// UI action, or be consumed: it always passes on to the next hook. Its key
+/// is only noted, for `SuperTap` to distrust Windows' state of that key.
 fn handle_hook_data<S: ActionSink>(
     shared: &HookShared,
     data: &KBDLLHOOKSTRUCT,
@@ -1034,7 +1054,10 @@ fn handle_hook_data<S: ActionSink>(
 ) -> bool {
     match KeyEvent::from_hook_data(data) {
         Some(event) => shared.on_key(event, foreground, sink_for, io),
-        None => false,
+        None => {
+            shared.note_injected(data.vkCode as u8);
+            false
+        }
     }
 }
 
@@ -3002,23 +3025,93 @@ mod tests {
             );
             assert!(!h.raw(hook_data(A, false, false, flags)));
             h.up(A);
-            // The physical key-up is the boundary, not the injected one.
+            // Every other key the injected events touched is still suspect.
+            assert!(!h.is_trusted(), "{flags:#x}: suspect keys ignored");
+            // Physical events of those keys are the boundary, never injected ones.
+            h.sync_tap();
+            h.tap(SHIFT);
+            h.win_tap(LWIN);
+            assert!(!h.is_trusted(), "{flags:#x}: right Win still suspect");
+            h.win_tap(RWIN);
             assert!(h.is_trusted(), "{flags:#x}: physical boundary ignored");
             assert!(h.sink.posted.is_empty() && h.injector.requests.is_empty());
+            assert_eq!(h.injector.replays, 0);
         }
     }
 
+    /// A key physically held across a reset, then an injected key-up of it:
+    /// Windows now reports it up, but it is still held, so no candidate sync
+    /// point restores trust and no tap is owned until it is physically
+    /// released.
     #[test]
-    fn residual_an_injected_up_of_the_held_key_hides_it_from_the_veto() {
-        // Documented limitation: Windows' own key state is the veto, and an
-        // injected key-up of exactly the key held across the reset clears it
-        // there too (Windows then also treats that key as up).
-        let mut h = Harness::with_overview(400);
-        h.hold(SHIFT, false);
-        h.bump_epoch();
-        assert!(!h.raw(hook_data(SHIFT, false, false, LLKHF_INJECTED.0)));
-        h.sync_tap();
-        assert!(h.is_trusted());
+    fn an_injected_key_up_never_hides_a_key_held_across_a_reset() {
+        #[derive(Clone, Copy, Debug)]
+        enum How {
+            /// Pressed while the hook could not see it (after the reset).
+            Unseen,
+            /// Seen going down; the injected key-up arrives before the reset.
+            SeenThenReset,
+            /// As above, with a physical event between the injected key-up and
+            /// the reset, so the hook hears of it while still trusted.
+            SeenEventThenReset,
+        }
+        for (key, ext) in [(SHIFT, false), (CTRL, false), (ALT, false), (RWIN, true)] {
+            for how in [How::Unseen, How::SeenThenReset, How::SeenEventThenReset] {
+                for flags in INJECTED_VARIANTS {
+                    let what = format!("{key:#x} {how:?} {flags:#x}");
+                    let mut h = Harness::with_overview(400);
+                    let inject_up = |h: &mut Harness| {
+                        assert!(!h.raw(hook_data(key, ext, false, flags)));
+                    };
+                    match how {
+                        How::Unseen => {
+                            h.bump_epoch();
+                            h.hold(key, ext);
+                            inject_up(&mut h);
+                        }
+                        How::SeenThenReset => {
+                            assert!(!h.event(key, ext, true));
+                            inject_up(&mut h);
+                            h.bump_epoch();
+                        }
+                        How::SeenEventThenReset => {
+                            assert!(!h.event(key, ext, true));
+                            inject_up(&mut h);
+                            h.tap(SYNC);
+                            h.bump_epoch();
+                        }
+                    }
+                    assert!(
+                        !h.injector.is_down(vk_of(key, ext)),
+                        "{what}: still reads down"
+                    );
+
+                    // Every candidate sync point, then taps of both sides.
+                    h.sync_tap();
+                    h.tap(A);
+                    for _ in 0..2 {
+                        h.wait(1_000);
+                        assert_eq!(h.win_tap(LWIN), [false, false], "{what}");
+                    }
+                    if key != RWIN {
+                        h.wait(1_000);
+                        assert_eq!(h.win_tap(RWIN), [false, false], "{what}");
+                    }
+                    assert!(!h.is_trusted(), "{what}: trusted while still held");
+                    assert!(h.sink.posted.is_empty(), "{what}: posted");
+                    assert!(h.injector.requests.is_empty(), "{what}: masked");
+                    assert_eq!(h.injector.replays, 0, "{what}: replayed Start");
+
+                    // The physical release (unpaired, so one more native
+                    // gesture) is what restores trust.
+                    assert!(!h.event(key, ext, false));
+                    h.sync_tap();
+                    h.wait(1_000);
+                    h.win_tap(LWIN);
+                    assert_eq!(h.taps(), vec!["toggle"], "{what}: never recovers");
+                }
+            }
+        }
     }
 
     #[test]
@@ -3124,11 +3217,20 @@ mod tests {
         Wait(u32),
         /// An input reset signal (epoch bump).
         Reset,
+        /// Physically pressed while the hook could not see it.
+        Hold(u32, bool),
     }
 
     /// What the hook decided for a run: whether each physical event was
-    /// consumed, the actions posted, the injection requests, Start replays.
-    type Decisions = (Vec<bool>, Vec<HotKeyAction>, Vec<Vec<MaskKey>>, usize);
+    /// consumed, the actions posted, the injection requests, Start replays,
+    /// and whether bare Win taps were trusted after each step.
+    type Decisions = (
+        Vec<bool>,
+        Vec<HotKeyAction>,
+        Vec<Vec<MaskKey>>,
+        usize,
+        Vec<bool>,
+    );
 
     fn run_physical(
         build: Build,
@@ -3137,6 +3239,7 @@ mod tests {
     ) -> Decisions {
         let mut h = build();
         let mut consumed = vec![];
+        let mut trusted = vec![];
         for index in 0..=steps.len() {
             if let Some((at, key, ext, is_pressed, flags)) = injected {
                 if at == index {
@@ -3152,14 +3255,22 @@ mod tests {
                 }
                 Some(Phys::Wait(ms)) => h.wait(*ms),
                 Some(Phys::Reset) => h.bump_epoch(),
+                Some(Phys::Hold(key, ext)) => h.hold(*key, *ext),
                 None => {}
             }
+            trusted.push(
+                h.state()
+                    .super_tap
+                    .as_ref()
+                    .is_some_and(|tap| tap.sync() == crate::super_key::PhysicalSync::Trusted),
+            );
         }
         (
             consumed,
             h.sink.posted,
             h.injector.requests,
             h.injector.replays,
+            trusted,
         )
     }
 
@@ -3264,12 +3375,47 @@ mod tests {
         }
     }
 
+    /// Physical histories around resets, including keys held across them, with
+    /// an injected event of any key at any position: injected input never
+    /// makes a later physical decision more owned, nor trust come sooner.
     #[test]
     fn injected_events_after_a_reset_can_only_make_gestures_more_native() {
-        use Phys::{Key, Reset, Wait};
+        use Phys::{Hold, Key, Reset, Wait};
         let tap = [Key(LWIN, true, true), Key(LWIN, true, false)];
         let type_e = [Key(E, false, true), Key(E, false, false)];
+        let sync = [Key(SYNC, false, true), Key(SYNC, false, false)];
+        let held_across_reset = |key: u32, ext: bool| {
+            [
+                &[Reset, Hold(key, ext)][..],
+                &tap,
+                &sync,
+                &tap,
+                &[Key(key, ext, false)],
+                &sync,
+                &tap,
+                &[Wait(1_000)],
+                &tap,
+            ]
+            .concat()
+        };
+        let seen_then_reset = |key: u32, ext: bool| {
+            [
+                &[Key(key, ext, true), Reset][..],
+                &sync,
+                &tap,
+                &[Key(key, ext, false)],
+                &sync,
+                &tap,
+            ]
+            .concat()
+        };
         let sequences: Vec<(&str, Vec<Phys>)> = vec![
+            ("Shift held across reset", held_across_reset(SHIFT, false)),
+            ("Ctrl held across reset", held_across_reset(CTRL, false)),
+            ("Alt held across reset", held_across_reset(ALT, false)),
+            ("right Win held across reset", held_across_reset(RWIN, true)),
+            ("Shift seen, then reset", seen_then_reset(SHIFT, false)),
+            ("right Alt seen, then reset", seen_then_reset(ALT, true)),
             (
                 "reset, tap, tap",
                 [&[Reset][..], &tap, &[Wait(1_000)], &tap].concat(),
@@ -3281,6 +3427,8 @@ mod tests {
             ),
         ];
         let owned = |d: &Decisions| d.1.len() + d.2.len();
+        let posts = |d: &Decisions| d.1.len();
+        let masks = |d: &Decisions| d.2.len();
         let build: Build = || Harness::with_overview(400);
         for (name, steps) in &sequences {
             let baseline = run_physical(build, steps, None);
@@ -3291,6 +3439,10 @@ mod tests {
                         (LWIN, true),
                         (RWIN, true),
                         (SHIFT, false),
+                        (RSHIFT, false),
+                        (CTRL, false),
+                        (ALT, false),
+                        (ALT, true),
                         (E, false),
                         (SYNC, false),
                     ] {
@@ -3302,7 +3454,12 @@ mod tests {
                             );
                             assert_eq!(with.0, baseline.0, "{what}: consume changed");
                             assert!(owned(&with) <= owned(&baseline), "{what}: more owned");
+                            assert!(posts(&with) <= posts(&baseline), "{what}: more posts");
+                            assert!(masks(&with) <= masks(&baseline), "{what}: more masks");
                             assert_eq!(with.3, baseline.3, "{what}: replay changed");
+                            for (step, (with, base)) in with.4.iter().zip(&baseline.4).enumerate() {
+                                assert!(!with || *base, "{what}: trusted sooner, at step {step}");
+                            }
                         }
                     }
                 }

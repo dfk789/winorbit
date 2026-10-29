@@ -42,17 +42,39 @@
 //!   missed. During `SuperPending` it also makes the hold a chord.
 //!
 //! Probation ends only at a physical key-up (an event, so injected input,
-//! which never reaches this machine, cannot end it) that leaves no key or
-//! Win side believed down, and only if `KeyStateProbe` reports no other key
-//! down. The probe can only extend probation: it never ends it on its own,
-//! never starts or ends a tap and never grants ownership. A gesture that
-//! might contain a key held across a reset is therefore never owned.
+//! which never reaches this machine as a key event, cannot end it) that
+//! leaves no key or Win side believed down, no key suspect (below), and only
+//! if `KeyStateProbe` reports no other key down. The probe can only extend
+//! probation: it never ends it on its own, never starts or ends a tap and
+//! never grants ownership. A gesture that might contain a key held across a
+//! reset is therefore never owned.
 //!
-//! The probe is consulted only at that boundary, never while trusted. It is
-//! `GetAsyncKeyState`, which also reflects injected input; the consequences
-//! are bounded: an injected key-down only extends probation (fail-open), and
-//! an injected key-up of exactly the key held across a reset hides it from
-//! the veto, in which case Windows itself also treats that key as up.
+//! ## Injected input can only make probation longer
+//!
+//! The probe is `GetAsyncKeyState`, which injected input also changes: an
+//! injected key-up of a key physically held across a reset would make it
+//! read up. So the probe's answer is never taken for a *suspect* key, one
+//! whose Windows state injected input may have changed since it was last
+//! physically known:
+//!
+//! - during probation, every key of an injected event (`on_injected`; a
+//!   generic Shift/Ctrl/Alt code marks both sides);
+//! - while trusted, every key of an injected event that is believed
+//!   physically down. A trusted key believed up is physically up, so
+//!   Windows' state for it is right whatever was injected; one believed down
+//!   may be held across a later reset, which forgets that it was down.
+//!
+//! A suspect key counts as held whatever the probe says. Only a physical
+//! event of that same key clears it, so the veto is effectively
+//! `probe down || suspect`. An injected event can change the probe only for
+//! the keys it names, and it makes exactly those keys suspect: injected input
+//! can extend probation, never shorten it. Trusted decisions never consult
+//! the probe or the suspect set, so injected input cannot change them either.
+//!
+//! The one case outside this: input injected while the hook sees nothing at
+//! all (secure desktop, or an elevated window focused while WinOrbit is not
+//! elevated). It cannot be observed, and only elevated or system software
+//! can inject there.
 
 /// Left Windows key.
 pub const VK_LWIN: u8 = 0x5B;
@@ -69,9 +91,15 @@ pub trait KeyStateProbe {
     fn is_down(&self, vk: u8) -> bool;
 }
 
+/// Codes that are never a held keyboard key: mouse buttons, `VK_PACKET`
+/// (Unicode text sent by software), the Start mask, and invalid codes.
+fn is_never_held_key(vk: u8) -> bool {
+    matches!(vk, 0x00 | 0x01 | 0x02 | 0x04..=0x06 | 0xE7 | 0xFF) || vk == VK_MASK
+}
+
 /// Keys the end-of-probation veto ignores for an event of key `vk`: the key in
 /// flight and its generic Shift/Ctrl/Alt alias (both still read down at its
-/// own key-up), mouse buttons, the Start mask, and invalid codes.
+/// own key-up), and codes that are never a held key.
 fn veto_ignores(vk: u8, candidate: u8) -> bool {
     let alias = match vk {
         0xA0 | 0xA1 => 0x10,
@@ -79,10 +107,18 @@ fn veto_ignores(vk: u8, candidate: u8) -> bool {
         0xA4 | 0xA5 => 0x12,
         _ => vk,
     };
-    candidate == vk
-        || candidate == alias
-        || matches!(candidate, 0x00 | 0x01 | 0x02 | 0x04..=0x06 | 0xFF)
-        || candidate == VK_MASK
+    candidate == vk || candidate == alias || is_never_held_key(candidate)
+}
+
+/// The physical keys a virtual-key code may stand for: a generic
+/// Shift/Ctrl/Alt code may mean either side.
+fn physical_keys(vk: u8) -> [u8; 2] {
+    match vk {
+        0x10 => [0xA0, 0xA1],
+        0x11 => [0xA2, 0xA3],
+        0x12 => [0xA4, 0xA5],
+        _ => [vk, vk],
+    }
 }
 
 /// Whether the machine's belief about physical key state may be trusted.
@@ -123,7 +159,8 @@ impl WinSides {
     }
 }
 
-/// Non-Win keys believed physically down, one bit per virtual-key code.
+/// A set of virtual-key codes, one bit each: the non-Win keys believed
+/// physically down, or the suspect keys.
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct KeysDown([u64; 4]);
 
@@ -147,16 +184,27 @@ impl KeysDown {
     fn is_empty(&self) -> bool {
         self.0.iter().all(|word| *word == 0)
     }
+
+    fn contains(&self, vk: u8) -> bool {
+        let (word, bit) = Self::slot(vk);
+        self.0[word] & bit != 0
+    }
+
+    /// Builds a set from raw words (as collected by the hook).
+    pub fn from_words(words: [u64; 4]) -> Self {
+        Self(words)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..=255u8).filter(|vk| self.contains(*vk))
+    }
 }
 
 impl std::fmt::Debug for KeysDown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut list = f.debug_list();
-        for vk in 0..=255u8 {
-            let (word, bit) = Self::slot(vk);
-            if self.0[word] & bit != 0 {
-                list.entry(&format_args!("{vk:#04x}"));
-            }
+        for vk in self.iter() {
+            list.entry(&format_args!("{vk:#04x}"));
         }
         list.finish()
     }
@@ -197,6 +245,9 @@ pub struct SuperTap {
     phase: SuperPhase,
     sync: PhysicalSync,
     keys: KeysDown,
+    /// Keys whose Windows state injected input may have changed since they
+    /// were last physically known; the probe is not believed for them.
+    suspect: KeysDown,
     /// `KBDLLHOOKSTRUCT.time` of the release of the last delivered first tap,
     /// while the next tap may still be its second tap.
     pair_anchor: Option<u32>,
@@ -211,6 +262,7 @@ impl SuperTap {
             // Nothing is known about keys held when the hook starts.
             sync: PhysicalSync::Probation,
             keys: KeysDown::default(),
+            suspect: KeysDown::default(),
             pair_anchor: None,
             double_tap_ms,
         }
@@ -218,9 +270,35 @@ impl SuperTap {
 
     /// Forgets all physical state and enters probation. Called when key-ups
     /// may have been lost (session lock/unlock, input desktop switch, focus
-    /// moving to an elevated window).
+    /// moving to an elevated window). Suspect keys stay suspect.
     pub fn reset(&mut self) {
+        let suspect = std::mem::take(&mut self.suspect);
         *self = Self::new(self.double_tap_ms);
+        self.suspect = suspect;
+    }
+
+    /// Records the keys of injected events as suspect (see the module docs).
+    /// Never changes anything else.
+    pub fn on_injected(&mut self, injected: &KeysDown) {
+        for vk in injected.iter() {
+            for key in physical_keys(vk) {
+                if !is_never_held_key(key)
+                    && (self.sync == PhysicalSync::Probation || self.is_believed_down(key))
+                {
+                    self.suspect.set(key, true);
+                }
+            }
+        }
+    }
+
+    fn is_believed_down(&self, vk: u8) -> bool {
+        match self.phase {
+            _ if vk != VK_LWIN && vk != VK_RWIN => self.keys.contains(vk),
+            SuperPhase::Idle => false,
+            SuperPhase::SuperPending { sides, .. } | SuperPhase::ChordPassthrough { sides } => {
+                sides.contains(vk)
+            }
+        }
     }
 
     /// Opens the double-tap window after a first tap's overview input was
@@ -240,6 +318,8 @@ impl SuperTap {
         time: u32,
         probe: &impl KeyStateProbe,
     ) -> Option<TapOutcome> {
+        // Its physical state is known again from this event.
+        self.suspect.set(vk, false);
         let outcome = if vk == VK_LWIN || vk == VK_RWIN {
             if is_pressed {
                 self.on_win_down(vk, time);
@@ -285,11 +365,12 @@ impl SuperTap {
     }
 
     /// At the physical key-up of `vk`: ends probation if nothing is believed
-    /// down any more and Windows reports no other key down either.
+    /// down or suspect any more and Windows reports no other key down either.
     fn try_end_probation(&mut self, vk: u8, probe: &impl KeyStateProbe) {
         if self.sync == PhysicalSync::Trusted
             || self.phase != SuperPhase::Idle
             || !self.keys.is_empty()
+            || !self.suspect.is_empty()
         {
             return;
         }
@@ -380,6 +461,7 @@ mod tests {
 
     const SHIFT: u8 = 0xA0;
     const CTRL: u8 = 0xA2;
+    const ALT: u8 = 0xA4;
     const L: u8 = 0x4C;
     const E: u8 = 0x45;
     /// An unassigned key used to end probation in tests.
@@ -419,6 +501,10 @@ mod tests {
         Hold(u8),
         /// Physically released while the hook could not see it.
         LoseUp(u8),
+        /// Software injected this key event: Windows' key state changes (a
+        /// generic code changes both sides), the machine only hears of it
+        /// through `on_injected`, as the hook reports it.
+        Inject(u8, bool),
         /// The caller delivered the last first tap.
         Delivered,
         Reset,
@@ -476,6 +562,15 @@ mod tests {
                 }
                 LoseUp(vk) => {
                     self.probe.0.borrow_mut()[vk as usize] = false;
+                    None
+                }
+                Inject(vk, is_pressed) => {
+                    for key in physical_keys(vk) {
+                        self.probe.0.borrow_mut()[key as usize] = is_pressed;
+                    }
+                    let mut injected = KeysDown::default();
+                    injected.set(vk, true);
+                    self.tap.on_injected(&injected);
                     None
                 }
                 Delivered => {
@@ -730,6 +825,247 @@ mod tests {
             (
                 "a key-up while another key is still down does not end probation",
                 cat(&[&[Sync, Reset, Down(SHIFT), Down(E), Up(E)], &TAP]),
+                vec![],
+            ),
+        ];
+        for (name, steps, expected) in cases {
+            let mut run = Run::starting(400);
+            assert_eq!(run.outcomes(&steps), expected, "{name}");
+        }
+    }
+
+    /// A key physically held across a reset, then an injected key-up of it:
+    /// Windows now reads it up, but it is still held, so nothing may be owned
+    /// until it is physically released.
+    #[test]
+    fn an_injected_key_up_never_hides_a_held_key() {
+        // (held key, codes the injected key-up may use for it)
+        let keys = [
+            (SHIFT, vec![SHIFT, 0x10]),
+            (CTRL, vec![CTRL, 0x11]),
+            (ALT, vec![ALT, 0x12]),
+            (VK_RWIN, vec![VK_RWIN]),
+        ];
+        for (held, codes) in keys {
+            for code in codes {
+                // How the key came to be held: unseen during a blind period,
+                // or seen going down while trusted.
+                // A key is only ever held unseen while the hook is blind,
+                // which starts with a reset, so an injected event the hook
+                // sees comes after that reset (the hook applies a pending
+                // reset before anything it heard of since).
+                let befores: [(&str, Vec<Step>, &[bool]); 2] = [
+                    ("held unseen", vec![Sync, Reset, Hold(held)], &[false]),
+                    (
+                        "held while trusted",
+                        vec![Sync, Down(held), Reset],
+                        &[false, true],
+                    ),
+                ];
+                for (how, before, positions) in befores {
+                    // Injected before or after the reset; then every candidate
+                    // physical sync point, then taps.
+                    for &inject_first in positions {
+                        let mut steps = before.clone();
+                        let at = if inject_first {
+                            steps.len() - 1
+                        } else {
+                            steps.len()
+                        };
+                        steps.insert(at, Inject(code, false));
+                        let steps =
+                            cat(&[&steps, &[Sync, Down(E), Up(E)], &TAP, &[Sync], &TAP, &TAP]);
+                        let what =
+                            format!("{held:#x} {how}, injected {code:#x}-up, first={inject_first}");
+                        let mut run = Run::starting(400);
+                        assert_eq!(run.outcomes(&steps), Vec::<&str>::new(), "{what}");
+                        assert_eq!(run.tap.sync(), PhysicalSync::Probation, "{what}");
+
+                        // The physical release is what restores trust (being
+                        // unpaired, it spends one more tap first).
+                        // A generic code made the other side suspect too.
+                        let other = held ^ 1;
+                        let other_side: &[Step] = match code {
+                            0x10..=0x12 => &[Down(other), Up(other)],
+                            _ => &[],
+                        };
+                        let after_release = cat(&[&[Up(held)], other_side, &TAP, &TAP]);
+                        // The other side's tap is itself a clean sync point.
+                        let owned = if other_side.is_empty() { 1 } else { 2 };
+                        assert_eq!(run.outcomes(&after_release), vec!["first"; owned], "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// For physical histories with keys held across resets, an injected event
+    /// of any key at any position never produces a tap, or trust, at a step
+    /// where the same physical history alone has none.
+    #[test]
+    fn injected_events_never_make_any_step_more_owned_or_trusted() {
+        let histories: Vec<(&str, Vec<Step>)> = vec![
+            (
+                "Shift held across reset, released later",
+                cat(&[
+                    &[Sync, Reset, Hold(SHIFT)],
+                    &TAP,
+                    &[Sync],
+                    &TAP,
+                    &[Up(SHIFT)],
+                    &TAP,
+                    &TAP,
+                ]),
+            ),
+            (
+                "Ctrl seen down, reset, released later",
+                cat(&[
+                    &[Sync, Down(CTRL), Reset],
+                    &TAP,
+                    &[Sync],
+                    &TAP,
+                    &[Up(CTRL)],
+                    &TAP,
+                    &TAP,
+                ]),
+            ),
+            (
+                "other Win side held across reset",
+                cat(&[
+                    &[Sync, Reset, Hold(VK_RWIN)],
+                    &TAP,
+                    &[Sync],
+                    &TAP,
+                    &[Up(VK_RWIN)],
+                    &TAP,
+                    &TAP,
+                ]),
+            ),
+            (
+                "Alt held across reset, lost key-up",
+                cat(&[
+                    &[Sync, Reset, Hold(ALT)],
+                    &TAP,
+                    &[LoseUp(ALT), Sync],
+                    &TAP,
+                    &TAP,
+                ]),
+            ),
+            (
+                "nothing held: typing then taps and a double tap",
+                cat(&[
+                    &[Sync, Reset, Down(E), Up(E)],
+                    &TAP,
+                    &[Delivered, Wait(50)],
+                    &TAP,
+                    &TAP,
+                ]),
+            ),
+            (
+                "startup, chord, taps",
+                cat(&[
+                    &TAP,
+                    &[Down(VK_LWIN), Down(E), Up(E), Up(VK_LWIN)],
+                    &TAP,
+                    &TAP,
+                ]),
+            ),
+        ];
+        let run = |steps: &[Step]| {
+            let mut run = Run::starting(400);
+            steps
+                .iter()
+                .map(|step| {
+                    let outcome = run.step(*step);
+                    (outcome.is_some(), run.tap.sync() == PhysicalSync::Trusted)
+                })
+                .collect::<Vec<_>>()
+        };
+        let keys = [
+            SHIFT, 0xA1, CTRL, ALT, 0x10, 0x11, 0x12, VK_LWIN, VK_RWIN, E, SYNC,
+        ];
+        for (name, history) in &histories {
+            let baseline = run(history);
+            assert!(baseline.iter().any(|(tap, _)| *tap), "{name}: never owns");
+            for at in 0..=history.len() {
+                for vk in keys {
+                    for is_pressed in [true, false] {
+                        let mut steps = history.clone();
+                        steps.insert(at, Inject(vk, is_pressed));
+                        let mut with = run(&steps);
+                        with.remove(at);
+                        for (index, (with, base)) in with.iter().zip(&baseline).enumerate() {
+                            let what = format!(
+                                "{name}: injected {vk:#x} pressed={is_pressed} at {at}, step {index}"
+                            );
+                            assert!(
+                                !with.0 || base.0,
+                                "{what}: a tap the baseline does not have"
+                            );
+                            assert!(
+                                !with.1 || base.1,
+                                "{what}: trusted where the baseline is not"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn injected_events_only_make_keys_suspect_during_probation() {
+        let cases: Vec<(&str, Vec<Step>, Vec<&str>)> = vec![
+            (
+                "an injected key-up of an unheld key: native until it is pressed",
+                cat(&[
+                    &[Sync, Reset, Inject(E, false), Sync],
+                    &TAP,
+                    &[Down(E), Up(E)],
+                    &TAP,
+                ]),
+                vec!["first"],
+            ),
+            (
+                "an injected key-down: native until it is physically known up",
+                cat(&[
+                    &[Sync, Reset, Inject(E, true), Sync],
+                    &TAP,
+                    &[Down(E), Up(E)],
+                    &TAP,
+                ]),
+                vec!["first"],
+            ),
+            (
+                "injected while trusted and not held: nothing to suspect",
+                cat(&[&[Sync, Inject(E, false), Reset, Sync], &TAP]),
+                vec!["first"],
+            ),
+            (
+                "generic Shift suspects both sides",
+                cat(&[
+                    &[Sync, Reset, Inject(0x10, false), Down(SHIFT), Up(SHIFT)],
+                    &TAP,
+                    &[Down(0xA1), Up(0xA1)],
+                    &TAP,
+                ]),
+                vec!["first"],
+            ),
+            (
+                "the mask, VK_PACKET and mouse codes are never suspect",
+                cat(&[
+                    &[Sync, Reset, Inject(VK_MASK, true), Inject(VK_MASK, false)],
+                    &[Inject(0xE7, false), Inject(0x01, false), Sync],
+                    &TAP,
+                ]),
+                vec!["first"],
+            ),
+            (
+                "suspect keys survive further resets",
+                cat(&[
+                    &[Sync, Reset, Inject(E, false), Reset, Sync, Reset, Sync],
+                    &TAP,
+                ]),
                 vec![],
             ),
         ];
