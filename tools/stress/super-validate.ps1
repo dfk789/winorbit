@@ -62,6 +62,7 @@ $helperLoaded = $false
 $observerStarted = $false
 $app = $null
 $exitCode = 1
+$hiddenStartSeen = New-Object System.Collections.Generic.HashSet[string]
 $WM_COMMAND = 0x0111; $IDM_EXIT = 1
 
 Add-Type -TypeDefinition @"
@@ -92,6 +93,8 @@ public static class V {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string name);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
 
     const uint LLKHF_INJECTED = 0x10, LLKHF_LOWER_IL_INJECTED = 0x02, LLKHF_UP = 0x80;
     static readonly HookProc Proc = Callback;
@@ -166,7 +169,9 @@ public static class V {
         GetClassName(hwnd, cls, 256);
         string name = "?";
         try { name = Process.GetProcessById((int)pid).ProcessName; } catch (Exception) { }
-        return name + " [" + cls + "]";
+        int cloaked = 0;
+        DwmGetWindowAttribute(hwnd, 14, out cloaked, 4); // DWMWA_CLOAKED
+        return name + " [" + cls + "]" + (IsWindowVisible(hwnd) ? "" : " invisible") + (cloaked != 0 ? " cloaked" : "");
     }
 }
 "@
@@ -245,7 +250,13 @@ function Stop-App($a, [int] $timeoutMs = 5000) {
 # also hosts Quick Settings (Win+A).
 function Get-StartForeground {
     $fg = [V]::Foreground()
-    if ($fg -match '^(StartMenuExperienceHost|SearchHost) ') { return $fg }
+    # A cloaked or invisible Start host is not a visible Start menu: Windows
+    # activates SearchHost briefly during Win+Left without showing anything.
+    if ($fg -match '^(StartMenuExperienceHost|SearchHost) ' -and $fg -notmatch ' (cloaked|invisible)$') { return $fg }
+    if ($fg -match '^(StartMenuExperienceHost|SearchHost) ' -and -not $script:hiddenStartSeen.Contains($fg)) {
+        [void]$script:hiddenStartSeen.Add($fg)
+        Write-Host "    (hidden Start host in foreground, not counted: $fg)"
+    }
     return $null
 }
 
@@ -281,7 +292,7 @@ function Invoke-Trial {
         [string] $name, [string] $instruction, [int] $releases,
         [bool] $expectStart, [int] $expectToggle, [int] $expectSecond,
         [string] $nativeQuestion = '', [int] $seconds = 60, [switch] $Optional, [switch] $NoMeasure, [switch] $ExpectReset,
-        [int] $expectSwitches = -1, [switch] $ExpectStartClosedAtEnd,
+        [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd,
         [string] $logPath = $script:logPath
     )
     Close-StartIfOpen
@@ -338,9 +349,10 @@ function Invoke-Trial {
     Check $name 'Start open or flash (you)' $expectStart $userStart
     Check $name 'overview actions logged' $expectToggle $taps.Toggle
     Check $name 'double-tap actions logged' $expectSecond $taps.Second
-    if ($expectSwitches -ge 0) {
-        $switches = ([regex]::Matches($text, '(?m)message WM_USER_SWITCH_APPS\s*$')).Count
-        Check $name 'WinOrbit switches logged' $expectSwitches $switches
+    if ($expectCommits -ge 0) {
+        # One commit per Alt hold, however many Tab presses it had.
+        $commits = ([regex]::Matches($text, 'message WM_USER_SWITCH_APPS_DONE')).Count
+        Check $name 'WinOrbit switch commits logged' $expectCommits $commits
     }
     if ($ExpectStartClosedAtEnd) {
         Check $name 'Start closed at the end (measured)' $true (-not $startAtEnd)
@@ -420,8 +432,8 @@ try {
         }
         Invoke-Trial 'Ctrl+Alt+Del' 'press Ctrl+Alt+Del, click Cancel, come back here' 0 $false 0 0 -ExpectReset
         Invoke-Trial 'tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 1 0
-        Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectSwitches 1
-        Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectSwitches 0
+        Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectCommits 1
+        Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectCommits 0
     }
 
     Write-Host "`n[4] Elevated foreground"
