@@ -313,6 +313,9 @@ function Invoke-Trial {
         [bool] $expectStart, [int] $expectToggle, [int] $expectSecond,
         [string] $nativeQuestion = '', [int] $seconds = 60, [switch] $Optional, [switch] $NoMeasure, [switch] $ExpectReset,
         [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd, [switch] $ExpectOverlayHidden, [switch] $ExpectNoReset,
+        # Counts are minimums: an owned tap shows nothing yet, so people tap
+        # again, and they may come back with a second Alt+Tab.
+        [switch] $AtLeast,
         [string] $logPath = $script:logPath
     )
     $script:trialCount++
@@ -368,12 +371,20 @@ function Invoke-Trial {
         Check $name 'Start in foreground (measured)' $expectStart $startSeen
     }
     Check $name 'Start open or flash (you)' $expectStart $userStart
-    Check $name 'overview actions logged' $expectToggle $taps.Toggle
+    if ($AtLeast) {
+        Check $name "overview actions logged (at least $expectToggle)" $true ($taps.Toggle -ge $expectToggle)
+    } else {
+        Check $name 'overview actions logged' $expectToggle $taps.Toggle
+    }
     Check $name 'double-tap actions logged' $expectSecond $taps.Second
     if ($expectCommits -ge 0) {
         # One commit per Alt hold, however many Tab presses it had.
         $commits = ([regex]::Matches($text, 'message WM_USER_SWITCH_APPS_DONE')).Count
-        Check $name 'WinOrbit switch commits logged' $expectCommits $commits
+        if ($AtLeast) {
+            Check $name "WinOrbit switch commits logged (at least $expectCommits)" $true ($commits -ge $expectCommits)
+        } else {
+            Check $name 'WinOrbit switch commits logged' $expectCommits $commits
+        }
     }
     if ($ExpectNoReset) {
         Check $name 'no input reset logged' $true ($text -notmatch 'input reset:')
@@ -418,6 +429,9 @@ try {
     [V]::Start()
     $observerStarted = $true
     Write-Host "`nWinOrbit started. Keep this window focused unless a step says otherwise."
+    # WinOrbit owns no tap until it has seen a key released with nothing else
+    # held (startup probation); this Enter is that key.
+    [void](Read-Host "  Press Enter to begin")
     Write-Host "When Start opens, the script closes it with Esc."
 
     if ($OnlySections.Count) { Write-Host ("Sections: {0}" -f ($OnlySections -join ', ')) }
@@ -458,14 +472,14 @@ try {
     if ((Want 3) -and -not $SkipLock) {
         Write-Host "`n[3] Win+L lock/unlock"
         Invoke-Trial 'Win+L, then the first tap' 'press Win+L, sign back in, FIRST THING tap the LEFT Windows key once (Start opens), then click here and press Enter' 0 $true 0 0 -ExpectReset -NoMeasure
-        Invoke-Trial 'second tap after unlock' 'tap the LEFT Windows key once' 1 $false 1 0
+        Invoke-Trial 'second tap after unlock' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
         Invoke-Trial 'chord after unlock' 'press Win+E (Explorer opens; close it)' 1 $false 0 0 'Did Explorer open?'
         if (-not $SkipUac) {
             Invoke-Trial 'UAC, then the first tap' 'press Win+R, type cmd, press Ctrl+Shift+Enter, click No on the UAC prompt, click this window, then tap the LEFT Windows key once' 2 $true 0 0 -ExpectReset -seconds 120
-            Invoke-Trial 'second tap after UAC' 'tap the LEFT Windows key once' 1 $false 1 0
+            Invoke-Trial 'second tap after UAC' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
         }
         Invoke-Trial 'Ctrl+Alt+Del, then the first tap' 'press Ctrl+Alt+Del, click Cancel, then FIRST THING tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 120
-        Invoke-Trial 'second tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 1 0
+        Invoke-Trial 'second tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
         Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectCommits 1
         Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectCommits 0
         Invoke-Trial 'Ctrl+Alt+Del during Alt+Tab' 'hold Alt, tap Tab (switcher shows), KEEP Alt held and press Ctrl+Del, click Cancel, release all keys, CLICK this window' 0 $false 0 0 'Was the WinOrbit switcher gone when you came back?' -ExpectReset -expectCommits 0 -ExpectOverlayHidden
@@ -477,7 +491,7 @@ try {
     Write-Host "  Windows sends a non-elevated WinOrbit no keys while an elevated window (Task Manager) is focused;"
     Write-Host "  WinOrbit resets its key state when focus moves there."
     Invoke-Trial 'Ctrl+Shift+Esc, then the first tap' 'open Task Manager with Ctrl+Shift+Esc, CLICK back into this window, then tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 90
-    Invoke-Trial 'second tap after Task Manager' 'tap the LEFT Windows key once' 1 $false 1 0
+    Invoke-Trial 'second tap after Task Manager' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
     Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key ONCE (Start opens natively), then CLICK this window (Start closes)' 0 $true 0 0 -NoMeasure -ExpectReset
     Invoke-Trial 'tap back here' 'tap the LEFT Windows key once' 1 $false 1 0
     }
@@ -503,9 +517,14 @@ try {
     $offset = Get-LogLength $script:logPath
     $app = Start-App $Exe
     $startedWith = Read-LogSince $script:logPath $offset
-    Check 'launch with Start open' 'Start visible at launch (measured)' $true (Test-StartForeground)
     Check 'launch with Start open' 'WinOrbit saw Start open at startup' $true ($startedWith -match 'start open=true')
-    Invoke-Trial 'tap closes Start open since launch' 'type the letter a (it goes into Start search), then tap the LEFT Windows key once (Start must close)' 1 $true 0 0 'Did your tap close Start?' -ExpectStartClosedAtEnd
+    Start-Sleep -Milliseconds 300
+    if (Test-StartForeground) {
+        Invoke-Trial 'tap closes Start open since launch' 'type the letter a (it goes into Start search), then tap the LEFT Windows key once (Start must close)' 1 $true 0 0 'Did your tap close Start?' -ExpectStartClosedAtEnd
+    } else {
+        # Observed on 22631: Windows closes Start right after the launch.
+        Write-Host "    (Start closed during the launch; the startup classification is checked from the log only)"
+    }
     Invoke-Trial 'after relaunch' 'tap the LEFT Windows key once' 1 $false 1 0
     $stop = Stop-App $app; $app = $null
     Check 'second exit' 'exit code' 0 $stop.Code
@@ -514,7 +533,7 @@ try {
     if (Want 7) {
     if (-not $app) { $app = Start-App $Exe }
     Write-Host "`n[7] Regression on this build"
-    Invoke-Trial 'Alt+Tab' 'press Alt+Tab, release (the app list shows, the next app activates), then CLICK this window' 0 $false 0 0 'Did the app list look normal and the right app activate?' -expectCommits 1 -ExpectNoReset
+    Invoke-Trial 'Alt+Tab' 'press Alt+Tab, release (the app list shows, the next app activates), then CLICK this window' 0 $false 0 0 'Did the app list look normal and the right app activate?' -expectCommits 1 -ExpectNoReset -AtLeast
     Invoke-Trial 'Alt+`' 'press Alt+` (cycles windows of the current app), then CLICK this window' 0 $false 0 0 'Did Alt+` cycle the app''s windows?'
     Invoke-Trial 'Win+Left, then a tap' 'click another window, press Win+Left, then IMMEDIATELY tap the LEFT Windows key once (Start must NOT open)' 2 $false 1 0 -seconds 90
     }
