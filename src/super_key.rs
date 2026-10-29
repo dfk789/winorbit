@@ -71,10 +71,17 @@
 //! can extend probation, never shorten it. Trusted decisions never consult
 //! the probe or the suspect set, so injected input cannot change them either.
 //!
-//! The one case outside this: input injected while the hook sees nothing at
-//! all (secure desktop, or an elevated window focused while WinOrbit is not
-//! elevated). It cannot be observed, and only elevated or system software
-//! can inject there.
+//! "Trusted" assumes the hook saw every physical event since trust began.
+//! Two cases are outside this guarantee:
+//!
+//! - input injected while the hook sees nothing at all (secure desktop, or
+//!   an elevated window focused while WinOrbit is not elevated). It cannot
+//!   be observed, and only elevated or system software can inject there;
+//! - a reset signal that arrives late: the signals are WinEvents and window
+//!   messages handled on the UI thread. If that thread is held up for the
+//!   whole of a blind period, an injected key-up the hook sees after it,
+//!   before the reset, is taken as seen while trusted, so a key pressed
+//!   unseen during it is not made suspect.
 
 /// Left Windows key.
 pub const VK_LWIN: u8 = 0x5B;

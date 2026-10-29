@@ -29,13 +29,13 @@
 //! ## Which signal covers which transition
 //!
 //! Bare Win taps are owned only while every transition that can hide key-ups
-//! produces a reset. Seen in validation logs (TASK-S06D) unless noted:
+//! produces a reset. Lock/unlock as seen in validation logs (TASK-S06D):
 //!
 //! | Transition                  | Reset signal                              |
 //! |-----------------------------|-------------------------------------------|
 //! | Win+L lock, unlock          | WTS lock/unlock *and* desktop switch      |
-//! | UAC prompt                  | desktop switch only                       |
-//! | Ctrl+Alt+Del                | desktop switch only                       |
+//! | UAC prompt                  | desktop switch (WTS has no event for it)  |
+//! | Ctrl+Alt+Del                | desktop switch (WTS has no event for it)  |
 //! | RDP / user switch           | WTS connect/disconnect (not validated)    |
 //! | elevated window focused     | foreground watcher, when not elevated     |
 //!
