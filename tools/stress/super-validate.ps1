@@ -59,11 +59,16 @@ param(
     [Parameter(Mandatory = $true)] [string] $Exe,
     [switch] $SkipUac,
     [switch] $SkipLock,
-    # Run only these sections (1-7), e.g. -Only 4. Default: all.
-    [int[]] $Only
+    # Run only these sections (1-7), e.g. -Only 4 or -Only 1,3,4. Default: all.
+    # A string, because powershell -File passes "1,3,4" as one argument.
+    [string] $Only = ''
 )
 
-function Want([int] $section) { return (-not $Only) -or ($Only -contains $section) }
+$OnlySections = @($Only -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { [int]$_ })
+if ($Only -and ($OnlySections.Count -eq 0 -or @($OnlySections | Where-Object { $_ -lt 1 -or $_ -gt 7 }).Count)) {
+    throw "-Only must list sections 1-7, e.g. -Only 1,3,4"
+}
+function Want([int] $section) { return ($OnlySections.Count -eq 0) -or ($OnlySections -contains $section) }
 
 $ErrorActionPreference = 'Stop'
 $failures = New-Object System.Collections.Generic.List[string]
@@ -301,6 +306,7 @@ function Check([string] $trial, [string] $what, $expected, $actual) {
 
 # Waits for $releases Win releases (or Enter when $releases is 0), watching the
 # foreground for Start the whole time, then checks the log and asks.
+$trialCount = 0
 function Invoke-Trial {
     param(
         [string] $name, [string] $instruction, [int] $releases,
@@ -309,6 +315,7 @@ function Invoke-Trial {
         [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd, [switch] $ExpectOverlayHidden, [switch] $ExpectNoReset,
         [string] $logPath = $script:logPath
     )
+    $script:trialCount++
     Close-StartIfOpen
     [V]::ResetWin()
     $before = [V]::WinReleases
@@ -413,7 +420,8 @@ try {
     Write-Host "`nWinOrbit started. Keep this window focused unless a step says otherwise."
     Write-Host "When Start opens, the script closes it with Esc."
 
-    if ($Only) { Write-Host ("Sections: {0}" -f ($Only -join ', ')) }
+    if ($OnlySections.Count) { Write-Host ("Sections: {0}" -f ($OnlySections -join ', ')) }
+    $trialsBefore = $script:trialCount
     if (Want 1) {
     Write-Host "`n[1] Clean taps"
     Invoke-Trial 'LWin tap' 'tap the LEFT Windows key once' 1 $false 1 0
@@ -533,6 +541,8 @@ try {
     $stop = Stop-App $app; $app = $null
     Check 'disabled exit' 'exit code' 0 $stop.Code
     }
+    # A run that checked nothing must never report PASS.
+    if ($script:trialCount -eq $trialsBefore) { $failures.Add("no trial ran (sections: $Only)") }
 } catch {
     $failures.Add("aborted: $_")
 } finally {
