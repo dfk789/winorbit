@@ -239,11 +239,18 @@ function Stop-App($a, [int] $timeoutMs = 5000) {
     return @{ Exited = $true; Code = $a.Process.ExitCode }
 }
 
+# Returns the foreground "process [class]" if it is Start, else $null. Start
+# runs in SearchHost on Windows 11 23H2 (round-2 probe) and in
+# StartMenuExperienceHost elsewhere. ShellExperienceHost is not counted: it
+# also hosts Quick Settings (Win+A).
+function Get-StartForeground {
+    $fg = [V]::Foreground()
+    if ($fg -match '^(StartMenuExperienceHost|SearchHost) ') { return $fg }
+    return $null
+}
+
 function Test-StartForeground {
-    # Start runs in SearchHost on Windows 11 23H2 (round-2 probe) and in
-    # StartMenuExperienceHost elsewhere. ShellExperienceHost is not counted:
-    # it also hosts Quick Settings (Win+A).
-    return [V]::Foreground() -match '^(StartMenuExperienceHost|SearchHost) '
+    return [bool](Get-StartForeground)
 }
 
 function Close-StartIfOpen {
@@ -274,6 +281,7 @@ function Invoke-Trial {
         [string] $name, [string] $instruction, [int] $releases,
         [bool] $expectStart, [int] $expectToggle, [int] $expectSecond,
         [string] $nativeQuestion = '', [int] $seconds = 60, [switch] $Optional, [switch] $NoMeasure, [switch] $ExpectReset,
+        [int] $expectSwitches = -1, [switch] $ExpectStartClosedAtEnd,
         [string] $logPath = $script:logPath
     )
     Close-StartIfOpen
@@ -284,15 +292,18 @@ function Invoke-Trial {
     Write-Host "  [$name]" -ForegroundColor Cyan
     Write-Host "  >>> NOW: $instruction" -ForegroundColor Yellow
     $startSeen = $false
+    $startWhat = $null
     if ($releases -eq 0) {
         [void](Read-Host "  Press Enter here when done")
         Start-Sleep -Milliseconds 300
-        $startSeen = Test-StartForeground
+        $startWhat = Get-StartForeground
+        $startSeen = [bool]$startWhat
     } else {
         $deadline = (Get-Date).AddSeconds($seconds)
         $quietUntil = $null
         while ((Get-Date) -lt $deadline) {
-            if (Test-StartForeground) { $startSeen = $true }
+            $fg = Get-StartForeground
+            if ($fg) { $startSeen = $true; if (-not $startWhat) { $startWhat = $fg } }
             if (-not $quietUntil -and ([V]::WinReleases - $before) -ge $releases) {
                 $quietUntil = (Get-Date).AddMilliseconds(1500)
             }
@@ -308,7 +319,9 @@ function Invoke-Trial {
             $failures.Add("${name}: saw only $done of $releases Win releases")
         }
     }
+    $startAtEnd = Get-StartForeground
     Close-StartIfOpen
+    if ($startWhat) { Write-Host "    Start detected as: $startWhat" }
     $text = Read-LogSince $logPath $offset
     $taps = Count-Taps $text
     if ($ExpectReset) {
@@ -325,6 +338,13 @@ function Invoke-Trial {
     Check $name 'Start open or flash (you)' $expectStart $userStart
     Check $name 'overview actions logged' $expectToggle $taps.Toggle
     Check $name 'double-tap actions logged' $expectSecond $taps.Second
+    if ($expectSwitches -ge 0) {
+        $switches = ([regex]::Matches($text, '(?m)message WM_USER_SWITCH_APPS\s*$')).Count
+        Check $name 'WinOrbit switches logged' $expectSwitches $switches
+    }
+    if ($ExpectStartClosedAtEnd) {
+        Check $name 'Start closed at the end (measured)' $true (-not $startAtEnd)
+    }
     if ($nativeQuestion) {
         Check $name $nativeQuestion $true (Read-YesNo $nativeQuestion)
     }
@@ -344,16 +364,18 @@ try {
     $ini = Join-Path (Split-Path $Exe) 'winorbit.ini'
     Write-Host "winorbit.ini:"
     Get-Content $ini | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { Write-Host "  $_" }
-    if ((Get-IniValue $ini 'overview' 'enable') -ne 'yes' -or (Get-IniValue $ini 'overview' 'double_tap_ms') -ne '400') {
-        throw "$ini must set [overview] enable = yes and double_tap_ms = 400"
+    $doubleTapMs = Get-IniValue $ini 'overview' 'double_tap_ms'
+    if ((Get-IniValue $ini 'overview' 'enable') -ne 'yes' -or $doubleTapMs -notmatch '^\d+$' -or [int]$doubleTapMs -eq 0) {
+        throw "$ini must set [overview] enable = yes and a non-zero double_tap_ms"
     }
+    Write-Host "double tap window: $doubleTapMs ms"
     $script:logPath = Get-LogPath $Exe
     Write-Host "WinOrbit log: $script:logPath"
 
     $offset = Get-LogLength $script:logPath
     $app = Start-App $Exe
     $startup = Read-LogSince $script:logPath $offset
-    Check 'startup' 'listener owns bare Win tap' $true ($startup -match 'bare Win tap owned \(double tap 400 ms\)')
+    Check 'startup' 'listener owns bare Win tap' $true ($startup -match "bare Win tap owned \(double tap $doubleTapMs ms\)")
     [V]::Start()
     $observerStarted = $true
     Write-Host "`nWinOrbit started. Keep this window focused unless a step says otherwise."
@@ -363,8 +385,9 @@ try {
     Invoke-Trial 'LWin tap' 'tap the LEFT Windows key once' 1 $false 1 0
     Invoke-Trial 'RWin tap' 'tap the RIGHT Windows key once (no right Win key? wait 15 s to skip)' 1 $false 1 0 -seconds 15 -Optional
     Invoke-Trial 'LWin held 2 s' 'hold the LEFT Windows key about 2 seconds, then release' 1 $false 1 0
-    Invoke-Trial '10 taps' 'tap the LEFT Windows key 10 times, about one per second' 10 $false 10 0 -seconds 90
+    Invoke-Trial '10 taps' 'tap the LEFT Windows key 10 times SLOWLY: count one-and-two between taps' 10 $false 10 0 -seconds 90
     Invoke-Trial 'double tap' 'double-tap the LEFT Windows key quickly (Start SHOULD open; the script then closes it)' 2 $true 1 1
+    Invoke-Trial 'tap closes open Start' 'double-tap the LEFT Windows key (Start opens), wait a second, tap it once more (Start must close)' 3 $true 1 1 'Did your last tap close Start?' -ExpectStartClosedAtEnd
     Invoke-Trial 'two slow taps' 'tap the LEFT Windows key, wait about 2 seconds, tap it again' 2 $false 2 0
     Invoke-Trial 'Shift held, Win tap' 'hold Shift, tap the LEFT Windows key, release Shift' 1 $false 0 0
 
@@ -397,13 +420,14 @@ try {
         }
         Invoke-Trial 'Ctrl+Alt+Del' 'press Ctrl+Alt+Del, click Cancel, come back here' 0 $false 0 0 -ExpectReset
         Invoke-Trial 'tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 1 0
-        Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), come back here' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?'
-        Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'click this window, press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no switcher)?'
+        Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectSwitches 1
+        Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectSwitches 0
     }
 
     Write-Host "`n[4] Elevated foreground"
-    Write-Host "  Open Task Manager (Ctrl+Shift+Esc). Windows sends a non-elevated WinOrbit no keys while it is focused."
-    Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key once (Start opens natively), then come back here' 0 $true 0 0 -NoMeasure
+    Write-Host "  Windows sends a non-elevated WinOrbit no keys while an elevated window (Task Manager) is focused."
+    [void](Read-Host "  >>> First open Task Manager (Ctrl+Shift+Esc), click back into this window, then press Enter")
+    Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key ONCE (Start opens natively), then CLICK this window (Start closes)' 0 $true 0 0 -NoMeasure
     Invoke-Trial 'tap back here' 'tap the LEFT Windows key once' 1 $false 1 0
 
     Write-Host "`n[5] Exit and relaunch"
