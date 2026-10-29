@@ -20,8 +20,9 @@
     consumes or injects into the key stream it watches, and is used only to
     notice when you have released the Windows key. It is installed after
     WinOrbit's hook, so Windows calls it first; it passes every event on.
-    The only keys it injects are Esc (to close Start or a menu it opened for
-    a trial) and key-ups for anything still down at the end.
+    It asks you to press Esc when Start is open, and injects only key-ups
+    for anything still down at the end (and Esc if you do not close Start
+    within 30 s).
 
     Trials:
       [1] Clean taps: LWin, RWin (skippable), 2 s hold, 10 taps, double and
@@ -343,11 +344,20 @@ function Test-StartForeground {
     return [bool](Get-StartForeground)
 }
 
+# Asks for a PHYSICAL Esc: an injected key while WinOrbit is in probation
+# (just started, or after a reset) would keep taps native until that key is
+# pressed by hand, which would break the next owned-tap trial. Injects Esc
+# only as a last resort.
 function Close-StartIfOpen {
+    if (-not (Test-StartForeground)) { return }
+    Write-Host "  >>> Start is open: press Esc to close it" -ForegroundColor Yellow
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Test-StartForeground) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
     if (Test-StartForeground) {
+        Write-Host "    (no Esc: closing Start by injecting Esc; WinOrbit may then leave taps native until you press Esc)"
         [V]::Vk(0x1B, 0x01, $false, $false); [V]::Vk(0x1B, 0x01, $true, $false)
-        Start-Sleep -Milliseconds 400
     }
+    Start-Sleep -Milliseconds 400
 }
 
 function Read-YesNo([string] $question) {
@@ -383,6 +393,8 @@ function Invoke-Trial {
         # The Alt+Tab presses (Alt holds with Tab) the trial needs; any other
         # number makes it invalid: it is run again. -1: not checked.
         [int] $altTabHolds = -1,
+        # Start is open on purpose when the trial begins.
+        [switch] $KeepStart,
         [int] $attempt = 1,
         [string] $logPath = $script:logPath
     )
@@ -393,9 +405,9 @@ function Invoke-Trial {
         nativeQuestion = $nativeQuestion; seconds = $seconds; Optional = $Optional; NoMeasure = $NoMeasure
         ExpectReset = $ExpectReset; expectCommits = $expectCommits; ExpectStartClosedAtEnd = $ExpectStartClosedAtEnd
         ExpectOverlayHidden = $ExpectOverlayHidden; ExpectNoReset = $ExpectNoReset; Owned = $Owned
-        RequireSecond = $RequireSecond; altTabHolds = $altTabHolds; attempt = $attempt + 1; logPath = $logPath
+        RequireSecond = $RequireSecond; altTabHolds = $altTabHolds; KeepStart = $KeepStart; attempt = $attempt + 1; logPath = $logPath
     }
-    Close-StartIfOpen
+    if (-not $KeepStart) { Close-StartIfOpen }
     [V]::ResetWin()
     $before = [V]::WinReleases
     $altTabBefore = [V]::AltTabHolds
@@ -619,7 +631,7 @@ try {
     Check 'launch with Start open' 'WinOrbit saw Start open at startup' $true ($startedWith -match 'start open=true')
     Start-Sleep -Milliseconds 300
     if (Test-StartForeground) {
-        Invoke-Trial 'tap closes Start open since launch' 'type the letter a (it goes into Start search), then tap the LEFT Windows key once (Start must close)' 1 $true 0 0 'Did your tap close Start?' -ExpectStartClosedAtEnd
+        Invoke-Trial 'tap closes Start open since launch' 'type the letter a (it goes into Start search), then tap the LEFT Windows key once (Start must close)' 1 $true 0 0 'Did your tap close Start?' -ExpectStartClosedAtEnd -KeepStart
     } else {
         # Observed on 22631: Windows closes Start right after the launch.
         Write-Host "    (Start closed during the launch; the startup classification is checked from the log only)"
