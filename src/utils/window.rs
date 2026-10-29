@@ -1,4 +1,4 @@
-use crate::utils::is_process_elevated;
+use crate::utils::{is_process_elevated, HandleWrapper};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
@@ -178,11 +178,13 @@ pub fn get_window_pid(hwnd: HWND) -> u32 {
 
 pub fn get_module_path(pid: u32) -> Option<String> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    // Closed on drop; this runs for every listed window and foreground change.
+    let handle = HandleWrapper::new(handle);
     let mut len: u32 = MAX_PATH;
     let mut name = vec![0u16; len as usize];
     let ret = unsafe {
         QueryFullProcessImageNameW(
-            handle,
+            handle.get_handle(),
             PROCESS_NAME_WIN32,
             PWSTR(name.as_mut_ptr()),
             &mut len,

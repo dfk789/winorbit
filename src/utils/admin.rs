@@ -17,7 +17,9 @@ pub fn is_running_as_admin() -> Result<bool> {
 
 pub fn is_process_elevated(pid: u32) -> Option<bool> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    is_elevated(handle).ok()
+    // Closed on drop; this runs for every listed window and foreground change.
+    let handle = HandleWrapper::new(handle);
+    is_elevated(handle.get_handle()).ok()
 }
 
 pub fn is_elevated(handle: HANDLE) -> Result<bool> {
