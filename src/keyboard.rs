@@ -2908,37 +2908,53 @@ mod tests {
 
     #[test]
     fn keys_held_across_a_reset_never_make_a_tap() {
-        // (held key, released during the Win hold?)
         for (held, ext) in [(SHIFT, false), (CTRL, false), (ALT, false), (RWIN, true)] {
-            for release_during_hold in [false, true] {
-                let name = format!("{held:#x} released during hold: {release_during_hold}");
-                let mut h = Harness::with_overview(400);
-                h.hold(held, ext);
-                h.bump_epoch();
-                for _ in 0..3 {
-                    h.down_ext(LWIN);
-                    if release_during_hold {
-                        // Its physical key-up was never paired with a down.
-                        h.event(held, ext, false);
-                    }
-                    h.up_ext(LWIN);
-                    h.wait(1_000);
-                    if release_during_hold {
-                        h.hold(held, ext);
-                    }
-                }
-                assert!(h.sink.posted.is_empty(), "{name}: owned");
-                assert!(h.injector.requests.is_empty(), "{name}: masked");
-                assert_eq!(h.injector.replays, 0, "{name}: replayed");
-                assert!(!h.is_trusted(), "{name}: trusted while a key is held");
-
-                // Released for real: one more native gesture, then owned.
-                h.event(held, ext, false);
-                h.win_tap(LWIN);
+            // Still held through several Win taps: none is owned.
+            let mut h = Harness::with_overview(400);
+            h.hold(held, ext);
+            h.bump_epoch();
+            for _ in 0..3 {
+                assert_eq!(h.win_tap(LWIN), [false, false]);
                 h.wait(1_000);
-                h.win_tap(LWIN);
-                assert_eq!(h.taps(), vec!["toggle"], "{name}: never recovered");
             }
+            assert!(h.sink.posted.is_empty(), "{held:#x}: owned");
+            assert!(h.injector.requests.is_empty(), "{held:#x}: masked");
+            assert_eq!(h.injector.replays, 0, "{held:#x}: replayed");
+            assert!(!h.is_trusted(), "{held:#x}: trusted while a key is held");
+            // Released for real (an unpaired key-up): one more native
+            // gesture, then owned.
+            h.event(held, ext, false);
+            h.win_tap(LWIN);
+            assert!(
+                h.sink.posted.is_empty(),
+                "{held:#x}: owned right after release"
+            );
+            h.wait(1_000);
+            h.win_tap(LWIN);
+            assert_eq!(h.taps(), vec!["toggle"], "{held:#x}: never recovered");
+
+            // Released during the Win hold: that gesture is a chord.
+            let mut h = Harness::with_overview(400);
+            h.hold(held, ext);
+            h.bump_epoch();
+            h.down_ext(LWIN);
+            h.event(held, ext, false);
+            h.up_ext(LWIN);
+            assert!(
+                h.sink.posted.is_empty(),
+                "{held:#x} released in hold: owned"
+            );
+            assert!(
+                h.injector.requests.is_empty(),
+                "{held:#x} released in hold: masked"
+            );
+            // Nothing is held any more, so the next tap is owned.
+            h.win_tap(LWIN);
+            assert_eq!(
+                h.taps(),
+                vec!["toggle"],
+                "{held:#x} released in hold: no recovery"
+            );
         }
     }
 
@@ -2950,10 +2966,16 @@ mod tests {
         assert!(!h.up(SHIFT));
         assert!(!h.up_ext(LWIN));
         assert!(h.sink.posted.is_empty() && h.injector.requests.is_empty());
-        assert!(!h.is_trusted(), "an unpaired key-up is evidence of desync");
-        h.sync_tap();
         h.win_tap(LWIN);
         assert_eq!(h.taps(), vec!["toggle"]);
+
+        // Outside a hold it is still evidence of desync: probation until a
+        // clean key-up, so a held key could not slip through.
+        let mut h = Harness::with_overview(400);
+        assert!(!h.up(SHIFT));
+        assert!(!h.is_trusted());
+        h.sync_tap();
+        assert!(h.is_trusted());
     }
 
     #[test]
