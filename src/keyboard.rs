@@ -5,7 +5,7 @@ use crate::{
         WM_USER_SWITCH_WINDOWS_DONE,
     },
     config::{Hotkey, SuperTapConfig, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
-    foreground::IS_FOREGROUND_IN_BLACKLIST,
+    foreground::{IS_FOREGROUND_IN_BLACKLIST, IS_FOREGROUND_START},
     super_key::{SuperTap, TapOutcome, VK_LWIN, VK_RWIN},
 };
 
@@ -104,7 +104,7 @@ impl HookShared {
     fn on_key<S: ActionSink>(
         &self,
         event: KeyEvent,
-        is_foreground_in_blacklist: bool,
+        foreground: Foreground,
         sink_for: impl FnOnce(isize) -> S,
         io: &mut impl HookIo,
     ) -> bool {
@@ -122,7 +122,7 @@ impl HookShared {
         if target == 0 {
             return false;
         }
-        state.handle_key(event, is_foreground_in_blacklist, &mut sink_for(target), io)
+        state.handle_key(event, foreground, &mut sink_for(target), io)
     }
 }
 
@@ -434,6 +434,15 @@ fn send_keys(keys: &[(u16, u16, bool)]) -> usize {
         };
     }
     unsafe { SendInput(&inputs[..count], std::mem::size_of::<INPUT>() as i32) as usize }
+}
+
+/// What the foreground watcher last reported, read by the hook as plain flags.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Foreground {
+    /// The foreground app is in `[switch-windows] blacklist`.
+    is_in_blacklist: bool,
+    /// Start or Search is the foreground window.
+    is_start: bool,
 }
 
 /// One physical key event, as seen by the hook.
@@ -813,7 +822,7 @@ impl KeyboardState {
     fn handle_key(
         &mut self,
         event: KeyEvent,
-        is_foreground_in_blacklist: bool,
+        foreground: Foreground,
         sink: &mut impl ActionSink,
         io: &mut impl HookIo,
     ) -> bool {
@@ -828,7 +837,13 @@ impl KeyboardState {
         };
         let is_modifier = self.handle_modifier_key(event, sink);
         if let Some(tap) = tap {
-            self.handle_super_tap(tap, sink, io);
+            if foreground.is_start {
+                // Start (or Search) is open: a tap is how Windows closes it,
+                // so leave this one to Windows.
+                debug!("bare Win tap with Start open: left to Windows");
+            } else {
+                self.handle_super_tap(tap, sink, io);
+            }
         }
         if is_modifier || event.vk == VK_LWIN || event.vk == VK_RWIN {
             return false;
@@ -836,7 +851,7 @@ impl KeyboardState {
 
         for index in 0..self.hotkeys.len() {
             let allow_switch = self.hotkeys[index].hotkey.id != SWITCH_WINDOWS_HOTKEY_ID
-                || !is_foreground_in_blacklist;
+                || !foreground.is_in_blacklist;
             let hold = self.hotkeys[index].hold;
             let is_held = self.holds[hold].sides.is_down();
             let state = &mut self.hotkeys[index];
@@ -1012,12 +1027,12 @@ enum HotKeyAction {
 fn handle_hook_data<S: ActionSink>(
     shared: &HookShared,
     data: &KBDLLHOOKSTRUCT,
-    is_foreground_in_blacklist: bool,
+    foreground: Foreground,
     sink_for: impl FnOnce(isize) -> S,
     io: &mut impl HookIo,
 ) -> bool {
     match KeyEvent::from_hook_data(data) {
-        Some(event) => shared.on_key(event, is_foreground_in_blacklist, sink_for, io),
+        Some(event) => shared.on_key(event, foreground, sink_for, io),
         None => false,
     }
 }
@@ -1029,11 +1044,14 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     // No routine logging here: this runs for every key in the system.
     let started = Instant::now();
     let kbd_data: &KBDLLHOOKSTRUCT = &*(l_param.0 as *const _);
-    let is_foreground_in_blacklist = IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed);
+    let foreground = Foreground {
+        is_in_blacklist: IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed),
+        is_start: IS_FOREGROUND_START.load(Ordering::Relaxed),
+    };
     let consume = handle_hook_data(
         &HOOK,
         kbd_data,
-        is_foreground_in_blacklist,
+        foreground,
         |target| WindowSink(HWND(target as _)),
         &mut SystemIo,
     );
@@ -1071,8 +1089,9 @@ fn action_message(action: HotKeyAction) -> Option<(u32, LPARAM)> {
 mod tests {
     use super::{
         action_message, finish_shutdown, handle_hook_data, wait_for_thread_exit, ActionSink,
-        HookShared, HotKeyAction, KeyEvent, KeyInjector, KeyboardListener, KeyboardState,
-        MaskCleanup, MaskKey, StartReplay, LISTENER_ACTIVE, OWN_INJECTION_MARKER, VK_MASK,
+        Foreground, HookShared, HotKeyAction, KeyEvent, KeyInjector, KeyboardListener,
+        KeyboardState, MaskCleanup, MaskKey, StartReplay, LISTENER_ACTIVE, OWN_INJECTION_MARKER,
+        VK_MASK,
     };
     use crate::app::{
         WM_USER_OVERVIEW_SECOND_TAP, WM_USER_OVERVIEW_TOGGLE, WM_USER_SWITCH_APPS,
@@ -1275,6 +1294,8 @@ mod tests {
         sink: FakeSink,
         injector: FakeInjector,
         blacklisted: bool,
+        /// Start is the foreground window.
+        start_open: bool,
         /// `KBDLLHOOKSTRUCT.time` of the next event; starts near wrap-around.
         now: u32,
     }
@@ -1299,6 +1320,7 @@ mod tests {
                 sink: FakeSink::default(),
                 injector: FakeInjector::default(),
                 blacklisted: false,
+                start_open: false,
                 now: u32::MAX - 5_000,
             }
         }
@@ -1325,7 +1347,10 @@ mod tests {
             handle_hook_data(
                 &self.shared,
                 &data,
-                self.blacklisted,
+                Foreground {
+                    is_in_blacklist: self.blacklisted,
+                    is_start: self.start_open,
+                },
                 move |_| sink,
                 &mut self.injector,
             )
@@ -1926,7 +1951,7 @@ mod tests {
         let mut injector = FakeInjector::default();
         for (scan_code, is_pressed) in [(ALT, true), (TAB, true), (TAB, false), (ALT, false)] {
             let event = key_event(scan_code, false, is_pressed);
-            assert!(!shared.on_key(event, false, |_| &mut sink, &mut injector));
+            assert!(!shared.on_key(event, Foreground::default(), |_| &mut sink, &mut injector));
         }
         assert!(sink.posted.is_empty());
         assert!(injector.requests.is_empty());
@@ -1939,9 +1964,12 @@ mod tests {
         let held = h.shared.state.lock();
         let mut sink = FakeSink::default();
         let event = key_event(TAB, false, true);
-        assert!(!h
-            .shared
-            .on_key(event, false, |_| &mut sink, &mut FakeInjector::default()));
+        assert!(!h.shared.on_key(
+            event,
+            Foreground::default(),
+            |_| &mut sink,
+            &mut FakeInjector::default()
+        ));
         drop(held);
         assert!(sink.posted.is_empty());
     }
@@ -2992,6 +3020,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tap_with_start_open_is_left_to_windows_to_close_it() {
+        let mut h = Harness::with_overview(250);
+        h.win_tap(LWIN);
+        h.wait(50);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle", "second"], "double tap opens Start");
+
+        // Start is now the foreground window: the next taps close/reopen it
+        // natively, unmasked and unposted, however fast they come.
+        h.start_open = true;
+        for wait in [50, 1_000] {
+            h.wait(wait);
+            assert_eq!(h.win_tap(LWIN), [false, false]);
+        }
+        assert_eq!(h.taps(), vec!["toggle", "second"]);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+
+        // Once Start has closed, taps are owned again; the native taps above
+        // never opened a double-tap window.
+        h.start_open = false;
+        h.wait(50);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle", "second", "toggle"]);
     }
 
     #[test]

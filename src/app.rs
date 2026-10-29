@@ -79,7 +79,10 @@ impl App {
         let hwnd = Self::create_window()?;
         let painter = GdiAAPainter::new(hwnd)?;
 
-        let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
+        let _foreground_watcher = ForegroundWatcher::init(
+            &config.switch_windows_blacklist,
+            config.overview.super_tap().is_some(),
+        )?;
         if let Some(error) = &config.overview.error {
             warn!("{error}");
         }

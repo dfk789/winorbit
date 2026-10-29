@@ -17,7 +17,17 @@ use windows::Win32::{
 /// keyboard hook thread.
 pub static IS_FOREGROUND_IN_BLACKLIST: AtomicBool = AtomicBool::new(false);
 
+/// Start (or Search) is the foreground window. Written like
+/// `IS_FOREGROUND_IN_BLACKLIST`, only while bare Win taps are owned
+/// (`[overview] enable`): a tap then closes Start natively.
+pub static IS_FOREGROUND_START: AtomicBool = AtomicBool::new(false);
+
+/// Processes hosting the Start menu: `SearchHost.exe` on Windows 11 23H2
+/// (seen by the S06D probe), `StartMenuExperienceHost.exe` on other builds.
+const START_EXES: [&str; 2] = ["searchhost.exe", "startmenuexperiencehost.exe"];
+
 static BLACKLIST: OnceCell<HashSet<String>> = OnceCell::new();
+static TRACK_START: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub struct ForegroundWatcher {
@@ -25,14 +35,16 @@ pub struct ForegroundWatcher {
 }
 
 impl ForegroundWatcher {
-    pub fn init(blacklist: &HashSet<String>) -> Result<Self> {
-        if blacklist.is_empty() {
+    pub fn init(blacklist: &HashSet<String>, track_start: bool) -> Result<Self> {
+        IS_FOREGROUND_START.store(false, Ordering::Relaxed);
+        if blacklist.is_empty() && !track_start {
             return Ok(Self {
                 hook: HWINEVENTHOOK::default(),
             });
         }
 
         let _ = BLACKLIST.set(blacklist.iter().map(|v| v.to_lowercase()).collect());
+        TRACK_START.store(track_start, Ordering::Relaxed);
 
         let hook = unsafe {
             SetWinEventHook(
@@ -75,9 +87,14 @@ unsafe extern "system" fn win_event_proc(
     _dw_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    let exe = match get_window_exe(hwnd) {
-        Some(v) => v.to_lowercase(),
-        None => return,
+    let exe = get_window_exe(hwnd).map(|v| v.to_lowercase());
+    if TRACK_START.load(Ordering::Relaxed) {
+        // Unknown owner: not Start, so taps stay owned.
+        let is_start = exe.as_deref().is_some_and(|exe| START_EXES.contains(&exe));
+        IS_FOREGROUND_START.store(is_start, Ordering::Relaxed);
+    }
+    let Some(exe) = exe else {
+        return;
     };
     let is_in_blacklist = BLACKLIST.get().unwrap().contains(&exe);
     IS_FOREGROUND_IN_BLACKLIST.store(is_in_blacklist, Ordering::Relaxed);

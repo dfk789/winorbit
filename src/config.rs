@@ -38,7 +38,7 @@ pub struct Config {
 }
 
 /// Default `[overview] double_tap_ms`.
-pub const DEFAULT_DOUBLE_TAP_MS: u32 = 400;
+pub const DEFAULT_DOUBLE_TAP_MS: u32 = 250;
 /// Accepted non-zero `[overview] double_tap_ms` range.
 pub const DOUBLE_TAP_MS_RANGE: std::ops::RangeInclusive<u32> = 100..=1000;
 
