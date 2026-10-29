@@ -8,8 +8,12 @@
 //! - `WM_WTSSESSION_CHANGE` lock/unlock/connect, registered here.
 //! - `EVENT_SYSTEM_DESKTOPSWITCH`, raised whenever the input desktop changes,
 //!   forwarded to the app window as `WM_USER_INPUT_RESET`.
+//! - Focus moving to an elevated window while WinOrbit is not elevated
+//!   (reported by `foreground::ForegroundWatcher`): Windows then sends the
+//!   hook nothing, so keys held at that moment (Ctrl+Shift+Esc opening Task
+//!   Manager, Win+1 activating an elevated app) lose their key-ups.
 //!
-//! Both are handled by the app window (`App::handle_message`), which resets
+//! All are handled by the app window (`App::handle_message`), which resets
 //! the hook and cancels any open switcher, since the release that would have
 //! committed it can no longer arrive. Neither runs inside the hook callback.
 
@@ -26,9 +30,55 @@ use windows::Win32::{
     },
 };
 
-/// App window that desktop-switch events are forwarded to (as an integer
-/// because `HWND` is not `Send`); 0 when no watcher is installed.
+/// App window that reset requests are forwarded to (as an integer because
+/// `HWND` is not `Send`); 0 when no watcher is installed.
 static RESET_TARGET: AtomicIsize = AtomicIsize::new(0);
+
+/// Why key-ups may have been lost; sent as the `WPARAM` of
+/// `WM_USER_INPUT_RESET`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetReason {
+    DesktopSwitch,
+    ElevatedForeground,
+}
+
+impl ResetReason {
+    const ALL: [Self; 2] = [Self::DesktopSwitch, Self::ElevatedForeground];
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::DesktopSwitch => "input desktop switch",
+            Self::ElevatedForeground => "elevated window focused",
+        }
+    }
+
+    pub fn from_wparam(wparam: usize) -> Option<Self> {
+        Self::ALL.get(wparam).copied()
+    }
+
+    fn to_wparam(self) -> usize {
+        self as usize
+    }
+}
+
+/// Asks the app window (UI thread) to reset input. Without a window the hook
+/// is still reset directly; only the switcher cancel is skipped.
+pub fn request_reset(reason: ResetReason) {
+    let target = RESET_TARGET.load(Ordering::Acquire);
+    let posted = target != 0
+        && unsafe {
+            PostMessageW(
+                Some(HWND(target as _)),
+                WM_USER_INPUT_RESET,
+                WPARAM(reason.to_wparam()),
+                LPARAM(0),
+            )
+        }
+        .is_ok();
+    if !posted {
+        crate::keyboard::reset_input_state(reason.describe());
+    }
+}
 
 /// Owns both registrations and undoes them on drop. Must be dropped on the
 /// thread that created it (the UI thread), before its window is destroyed.
@@ -95,20 +145,18 @@ unsafe extern "system" fn desktop_switch_proc(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    let target = RESET_TARGET.load(Ordering::Acquire);
-    if target == 0 {
-        return;
-    }
-    if let Err(err) = unsafe {
-        PostMessageW(
-            Some(HWND(target as _)),
-            WM_USER_INPUT_RESET,
-            WPARAM(0),
-            LPARAM(0),
-        )
-    } {
-        // Still reset the hook; only the switcher cancel is lost.
-        crate::keyboard::reset_input_state("input desktop switch (post failed)");
-        error!("failed to forward desktop switch, {err}");
+    request_reset(ResetReason::DesktopSwitch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResetReason;
+
+    #[test]
+    fn reset_reasons_round_trip_through_wparam() {
+        for reason in ResetReason::ALL {
+            assert_eq!(ResetReason::from_wparam(reason.to_wparam()), Some(reason));
+        }
+        assert_eq!(ResetReason::from_wparam(ResetReason::ALL.len()), None);
     }
 }

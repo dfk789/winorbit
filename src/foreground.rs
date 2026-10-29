@@ -1,4 +1,5 @@
-use crate::utils::get_window_exe;
+use crate::input_reset::{request_reset, ResetReason};
+use crate::utils::{get_window_exe, get_window_pid, is_process_elevated};
 use anyhow::{bail, Result};
 use once_cell::sync::OnceCell;
 use std::collections::HashSet;
@@ -28,6 +29,9 @@ const START_EXES: [&str; 2] = ["searchhost.exe", "startmenuexperiencehost.exe"];
 
 static BLACKLIST: OnceCell<HashSet<String>> = OnceCell::new();
 static TRACK_START: AtomicBool = AtomicBool::new(false);
+/// WinOrbit is not elevated, so focus moving to an elevated window hides
+/// the following key-ups from the keyboard hook.
+static TRACK_ELEVATED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub struct ForegroundWatcher {
@@ -35,9 +39,13 @@ pub struct ForegroundWatcher {
 }
 
 impl ForegroundWatcher {
-    pub fn init(blacklist: &HashSet<String>, track_start: bool) -> Result<Self> {
+    pub fn init(
+        blacklist: &HashSet<String>,
+        track_start: bool,
+        track_elevated: bool,
+    ) -> Result<Self> {
         IS_FOREGROUND_START.store(false, Ordering::Relaxed);
-        if blacklist.is_empty() && !track_start {
+        if blacklist.is_empty() && !track_start && !track_elevated {
             return Ok(Self {
                 hook: HWINEVENTHOOK::default(),
             });
@@ -45,6 +53,7 @@ impl ForegroundWatcher {
 
         let _ = BLACKLIST.set(blacklist.iter().map(|v| v.to_lowercase()).collect());
         TRACK_START.store(track_start, Ordering::Relaxed);
+        TRACK_ELEVATED.store(track_elevated, Ordering::Relaxed);
 
         let hook = unsafe {
             SetWinEventHook(
@@ -87,6 +96,14 @@ unsafe extern "system" fn win_event_proc(
     _dw_event_thread: u32,
     _dwms_event_time: u32,
 ) {
+    if TRACK_ELEVATED.load(Ordering::Relaxed) {
+        let pid = get_window_pid(hwnd);
+        // An unreadable token is treated as elevated: a needless reset only
+        // drops key state, a missed one leaves keys stuck down for the hook.
+        if pid != 0 && is_process_elevated(pid) != Some(false) {
+            request_reset(ResetReason::ElevatedForeground);
+        }
+    }
     let exe = get_window_exe(hwnd).map(|v| v.to_lowercase());
     if TRACK_START.load(Ordering::Relaxed) {
         // Unknown owner: not Start, so taps stay owned.

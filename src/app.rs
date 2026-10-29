@@ -1,6 +1,6 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
-use crate::input_reset::InputResetWatcher;
+use crate::input_reset::{InputResetWatcher, ResetReason};
 use crate::keyboard::{reset_input_state, KeyboardListener};
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::preview::{PreviewSource, WindowPreviewSource};
@@ -81,9 +81,15 @@ impl App {
         let hwnd = Self::create_window()?;
         let painter = GdiAAPainter::new(hwnd)?;
 
+        let is_admin = is_running_as_admin()?;
+        debug!("is_admin {is_admin}");
+
+        // Not elevated: Windows hides input from the hook while an elevated
+        // window is focused, so focus moving there must reset key state.
         let _foreground_watcher = ForegroundWatcher::init(
             &config.switch_windows_blacklist,
             config.overview.super_tap().is_some(),
+            !is_admin,
         )?;
         if let Some(error) = &config.overview.error {
             warn!("{error}");
@@ -96,9 +102,6 @@ impl App {
             true => Some(TrayIcon::create()),
             false => None,
         };
-
-        let is_admin = is_running_as_admin()?;
-        debug!("is_admin {is_admin}");
 
         let startup = Startup::init(is_admin)?;
 
@@ -313,7 +316,9 @@ impl App {
                 }
             }
             WM_USER_INPUT_RESET => {
-                get_app(hwnd)?.reset_input("input desktop switch");
+                if let Some(reason) = ResetReason::from_wparam(wparam.0) {
+                    get_app(hwnd)?.reset_input(reason.describe());
+                }
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
