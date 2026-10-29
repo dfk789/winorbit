@@ -43,9 +43,11 @@ pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
 /// Clean bare Win tap (Start suppressed); `lparam` is the key-up's
 /// `KBDLLHOOKSTRUCT.time`. Only logged until the overview exists.
 pub const WM_USER_OVERVIEW_TOGGLE: u32 = 6030;
-/// Second tap of a double tap (Windows opens Start natively); `lparam` as above.
+/// Clean bare Win tap within `double_tap_ms` of a delivered toggle; Start was
+/// suppressed too. `lparam` as above. Only logged until the overview exists.
 pub const WM_USER_OVERVIEW_SECOND_TAP: u32 = 6031;
-/// The input desktop changed (secure desktop: UAC, Ctrl+Alt+Del, lock).
+/// Input was reset (desktop switch, elevated focus; `wparam` is a
+/// `ResetReason`): cancel any open switcher. The hook is already reset.
 pub const WM_USER_INPUT_RESET: u32 = 6040;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
@@ -298,7 +300,7 @@ impl App {
             }
             WM_USER_OVERVIEW_SECOND_TAP => {
                 info!(
-                    "bare Win double tap (time {}): Start left to Windows",
+                    "bare Win second tap (time {}): overview second tap",
                     lparam.0 as u32
                 );
             }
@@ -312,12 +314,17 @@ impl App {
                     _ => None,
                 };
                 if let Some(reason) = reason {
-                    get_app(hwnd)?.reset_input(reason);
+                    // Already a window message: reset the hook first thing.
+                    reset_input_state(reason);
+                    get_app(hwnd)?.cancel_after_input_reset();
                 }
             }
             WM_USER_INPUT_RESET => {
+                // The signal already reset the hook (`input_reset`); only the
+                // UI side is left, so no second epoch bump here.
                 if let Some(reason) = ResetReason::from_wparam(wparam.0) {
-                    get_app(hwnd)?.reset_input(reason.describe());
+                    debug!("cancelling switcher after: {}", reason.describe());
+                    get_app(hwnd)?.cancel_after_input_reset();
                 }
             }
             WM_NCHITTEST => {
@@ -557,11 +564,10 @@ impl App {
         }
     }
 
-    /// Key-ups may have been lost: the hook drops its key state, and any open
-    /// switcher is cancelled because the release that would commit it can no
-    /// longer arrive.
-    fn reset_input(&mut self, reason: &str) {
-        reset_input_state(reason);
+    /// After an input reset (already applied to the hook): any open switcher
+    /// is cancelled because the release that would commit it can no longer
+    /// arrive.
+    fn cancel_after_input_reset(&mut self) {
         self.cancel_switch_app();
         self.switch_windows_state.modifier_released = true;
     }
