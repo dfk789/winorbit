@@ -3467,6 +3467,95 @@ mod tests {
         }
     }
 
+    /// A missing reset observer leaves no tap state at all: Win is native,
+    /// switching keeps working.
+    #[test]
+    fn missing_reset_observers_leave_win_native_and_switching_working() {
+        use crate::input_reset::{decide_super_tap, SafetyObservers};
+        let all = SafetyObservers {
+            session: true,
+            desktop_switch: true,
+            foreground: true,
+        };
+        let requested = Some(SuperTapConfig { double_tap_ms: 400 });
+        for observers in [
+            SafetyObservers {
+                desktop_switch: false,
+                ..all
+            },
+            SafetyObservers {
+                session: false,
+                ..all
+            },
+            SafetyObservers {
+                foreground: false,
+                ..all
+            },
+        ] {
+            let decision = decide_super_tap(requested, observers);
+            let mut h = Harness::build(["alt+`", "alt+tab"], decision.config());
+            assert!(
+                h.state().super_tap.is_none(),
+                "{observers:?}: tap state built"
+            );
+            for wait in [1_000, 50] {
+                h.wait(wait);
+                assert_eq!(h.win_tap(LWIN), [false, false], "{observers:?}");
+            }
+            h.sync_tap();
+            h.win_tap(RWIN);
+            assert!(h.sink.posted.is_empty(), "{observers:?}: Win tap posted");
+            assert!(h.injector.requests.is_empty(), "{observers:?}: masked");
+
+            assert!(!h.down(ALT));
+            assert!(h.tap(TAB));
+            assert!(!h.up(ALT));
+            assert_eq!(
+                h.sink.posted,
+                vec![SwitchApps { reverse: false }, SwitchAppsDone],
+                "{observers:?}: Alt+Tab broke"
+            );
+        }
+        // With every observer the same configuration owns taps.
+        let mut h = Harness::build(
+            ["alt+`", "alt+tab"],
+            decide_super_tap(requested, all).config(),
+        );
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+    }
+
+    /// The Start flag as each tracking mode computes it for the foreground.
+    #[test]
+    fn start_tracking_modes_decide_which_taps_are_left_to_windows() {
+        use crate::foreground::{is_start, StartTracking::*};
+        // (foreground exe, visible, cloak, tracking, tap owned)
+        let cases = [
+            ("searchhost.exe", true, 0x2, CloakEvents, true),
+            ("searchhost.exe", true, 0, CloakEvents, false),
+            ("searchhost.exe", true, 0x2, HostOnly, false),
+            ("searchhost.exe", false, 0, HostOnly, false),
+            ("startmenuexperiencehost.exe", true, 0, HostOnly, false),
+            ("notepad.exe", true, 0, HostOnly, true),
+            ("notepad.exe", true, 0, CloakEvents, true),
+        ];
+        for (exe, visible, cloak, tracking, owned) in cases {
+            let mut h = Harness::with_overview(250);
+            h.start_open = is_start(tracking, Some(exe), visible, cloak);
+            h.win_tap(LWIN);
+            let what = format!("{exe} visible={visible} cloak={cloak:#x} {tracking:?}");
+            assert_eq!(!h.taps().is_empty(), owned, "{what}");
+            assert_eq!(!h.injector.requests.is_empty(), owned, "{what}: mask");
+        }
+        // Cloak events: a hidden Start host that uncloaks becomes Start without
+        // a new foreground event (the watcher re-classifies on the uncloak).
+        let mut h = Harness::with_overview(250);
+        h.start_open = is_start(CloakEvents, Some("searchhost.exe"), true, 0x2);
+        h.start_open = is_start(CloakEvents, Some("searchhost.exe"), true, 0);
+        assert_eq!(h.win_tap(LWIN), [false, false]);
+        assert!(h.sink.posted.is_empty() && h.injector.requests.is_empty());
+    }
+
     #[test]
     fn tap_with_start_open_is_left_to_windows_to_close_it() {
         let mut h = Harness::with_overview(250);

@@ -1,6 +1,6 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
-use crate::input_reset::{InputResetWatcher, ResetReason};
+use crate::input_reset::{decide_super_tap, InputResetWatcher, ResetReason, SuperTapDecision};
 use crate::keyboard::{reset_input_state, KeyboardListener};
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::preview::{PreviewSource, WindowPreviewSource};
@@ -86,9 +86,12 @@ impl App {
         let is_admin = is_running_as_admin()?;
         debug!("is_admin {is_admin}");
 
+        // Every reset signal is installed before the keyboard hook starts, so
+        // whether bare Win taps may be owned is known up front.
+        let input_reset = InputResetWatcher::init(hwnd);
         // Not elevated: Windows hides input from the hook while an elevated
         // window is focused, so focus moving there must reset key state.
-        let _foreground_watcher = ForegroundWatcher::init(
+        let foreground_watcher = ForegroundWatcher::init(
             &config.switch_windows_blacklist,
             config.overview.super_tap().is_some(),
             !is_admin,
@@ -96,9 +99,23 @@ impl App {
         if let Some(error) = &config.overview.error {
             warn!("{error}");
         }
+        let super_tap = decide_super_tap(
+            config.overview.super_tap(),
+            input_reset.observers(foreground_watcher.is_watching()),
+        );
+        match &super_tap {
+            SuperTapDecision::NotRequested => {}
+            SuperTapDecision::Enabled(_) => info!(
+                "bare Win taps owned; Start detection: {}",
+                foreground_watcher.start_tracking().describe()
+            ),
+            SuperTapDecision::Unsafe(missing) => warn!(
+                "bare Win taps left to Windows: cannot watch {}",
+                missing.join(", ")
+            ),
+        }
         let keyboard_listener =
-            KeyboardListener::init(hwnd, &config.to_hotkeys(), config.overview.super_tap())?;
-        let input_reset = InputResetWatcher::init(hwnd);
+            KeyboardListener::init(hwnd, &config.to_hotkeys(), super_tap.config())?;
 
         let trayicon = match config.trayicon {
             true => Some(TrayIcon::create()),
