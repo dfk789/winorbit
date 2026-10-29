@@ -134,7 +134,7 @@ path =
 - Bare Windows key (`[overview] enable = yes`, experimental, off by default):
   - A clean tap of either Windows key (pressed and released with no other key involved) no longer opens Start. It is reserved for the upcoming overview; this build only logs it.
   - A quick second tap (within `double_tap_ms`) is owned too and reported to the overview as a second tap; Start stays closed. `Ctrl+Esc` always opens Start.
-  - While Start (or Search) is visibly open, a tap is left to Windows, so it closes Start as usual. A hidden or cloaked Start host in the foreground (Windows does this briefly during `Win+Left`) does not count.
+  - While Start (or Search) is visibly open, a tap is left to Windows, so it closes Start as usual. A hidden or DWM-cloaked Start host in the foreground does not count. Windows briefly brings Start's host to the foreground during some shortcuts (seen with `Win+Left`); if it shows that window as visible, a tap in that moment is left to Windows and may open Start.
   - Anything else involving the Windows key is left to Windows unchanged: `Win+E`, `Win+L`, `Win+Shift+S`, `Win+number`, `Win+arrows`, holding `Shift` and then tapping Win, pressing both Windows keys together, and so on. WinOrbit never swallows a Windows-key event; on a clean tap it only injects the unassigned key `vkE8` just before the release, which is what stops Start from opening.
   - If that injection fails, Start opens as usual. If the overview action cannot be delivered, WinOrbit reopens Start itself.
   - While an elevated window is focused and WinOrbit is not elevated, Windows does not send WinOrbit's hook any keys, so the Windows key keeps its native behavior there.
