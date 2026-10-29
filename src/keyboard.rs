@@ -661,7 +661,7 @@ impl KeyboardState {
 
     /// Forgets which keys are down and any hold in progress, without posting
     /// anything. Used after a session lock/unlock, where key-ups go to the
-    /// secure desktop. The UI cancels its own switcher on lock. A pending mask
+    /// secure desktop. The UI cancels its own switcher on every reset. A pending mask
     /// key-up is kept: it is still owed.
     fn reset_physical_state(&mut self) {
         self.shift = SidesDown::default();
@@ -836,14 +836,10 @@ impl KeyboardState {
             None => None,
         };
         let is_modifier = self.handle_modifier_key(event, sink);
-        if let Some(tap) = tap {
-            if foreground.is_start {
-                // Start (or Search) is open: a tap is how Windows closes it,
-                // so leave this one to Windows.
-                debug!("bare Win tap with Start open: left to Windows");
-            } else {
-                self.handle_super_tap(tap, sink, io);
-            }
+        // With Start (or Search) open, a tap is how Windows closes it, so it
+        // is left to Windows. Not logged: this runs inside the hook callback.
+        if let Some(tap) = tap.filter(|_| !foreground.is_start) {
+            self.handle_super_tap(tap, sink, io);
         }
         if is_modifier || event.vk == VK_LWIN || event.vk == VK_RWIN {
             return false;

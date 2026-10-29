@@ -45,6 +45,8 @@ pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
 pub const WM_USER_OVERVIEW_TOGGLE: u32 = 6030;
 /// Second tap of a double tap (Windows opens Start natively); `lparam` as above.
 pub const WM_USER_OVERVIEW_SECOND_TAP: u32 = 6031;
+/// The input desktop changed (secure desktop: UAC, Ctrl+Alt+Del, lock).
+pub const WM_USER_INPUT_RESET: u32 = 6040;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -307,14 +309,11 @@ impl App {
                     _ => None,
                 };
                 if let Some(reason) = reason {
-                    reset_input_state(reason);
-                    if event == WTS_SESSION_LOCK {
-                        // The hook dropped the hold, so no release will commit.
-                        let app = get_app(hwnd)?;
-                        app.cancel_switch_app();
-                        app.switch_windows_state.modifier_released = true;
-                    }
+                    get_app(hwnd)?.reset_input(reason);
                 }
+            }
+            WM_USER_INPUT_RESET => {
+                get_app(hwnd)?.reset_input("input desktop switch");
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
@@ -551,6 +550,15 @@ impl App {
             }
             self.painter.unpaint(state);
         }
+    }
+
+    /// Key-ups may have been lost: the hook drops its key state, and any open
+    /// switcher is cancelled because the release that would commit it can no
+    /// longer arrive.
+    fn reset_input(&mut self, reason: &str) {
+        reset_input_state(reason);
+        self.cancel_switch_app();
+        self.switch_windows_state.modifier_released = true;
     }
 
     fn cancel_switch_app(&mut self) {
