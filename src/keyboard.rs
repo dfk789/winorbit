@@ -1,34 +1,37 @@
 use crate::{
     app::{
-        WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
-        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
+        WM_USER_OVERVIEW_SECOND_TAP, WM_USER_OVERVIEW_TOGGLE, WM_USER_SWITCH_APPS,
+        WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE, WM_USER_SWITCH_WINDOWS,
+        WM_USER_SWITCH_WINDOWS_DONE,
     },
-    config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
+    config::{Hotkey, SuperTapConfig, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
     foreground::IS_FOREGROUND_IN_BLACKLIST,
+    super_key::{KeyStateProbe, SuperTap, TapOutcome, VK_LWIN, VK_RWIN},
 };
 
 use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 use std::sync::{
-    atomic::{AtomicBool, AtomicIsize, Ordering},
+    atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError},
     LazyLock,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-            KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY,
+            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+            KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY,
+            VK_CONTROL, VK_ESCAPE,
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW,
             PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
             HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
-            LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_QUIT,
+            LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP, WM_QUIT,
         },
     },
 };
@@ -49,6 +52,9 @@ const OWN_INJECTION_MARKER: usize = 0x574F_524B;
 /// neither alone can get through.
 const INJECTED_FLAGS: u32 = LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0;
 
+/// Thread message asking the hook thread to reopen Start (see `StartReplay`).
+const WM_HOOK_REPLAY_START: u32 = WM_APP + 0x30;
+
 /// How long `KeyboardListener::drop` waits for the hook thread to exit.
 const HOOK_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -68,14 +74,22 @@ struct HookShared {
     /// App window the hook posts to, as an integer because `HWND` is not
     /// `Send`. 0 once quiesced.
     target: AtomicIsize,
+    /// Bumped by `reset_input_state` (session lock/unlock). The hook drops
+    /// all physical key state on its next event once this differs from
+    /// `KeyboardState::epoch`.
+    epoch: AtomicU32,
     state: Mutex<KeyboardState>,
+    /// Longest hook callback so far, in microseconds; logged at shutdown.
+    max_callback_us: AtomicU64,
 }
 
 impl HookShared {
     fn new() -> Self {
         Self {
             target: AtomicIsize::new(0),
-            state: Mutex::new(KeyboardState::new(&[])),
+            epoch: AtomicU32::new(0),
+            state: Mutex::new(KeyboardState::new(&[], None)),
+            max_callback_us: AtomicU64::new(0),
         }
     }
 
@@ -93,23 +107,23 @@ impl HookShared {
         event: KeyEvent,
         is_foreground_in_blacklist: bool,
         sink_for: impl FnOnce(isize) -> S,
-        injector: &mut impl KeyInjector,
+        io: &mut impl HookIo,
     ) -> bool {
         let Some(mut state) = self.state.try_lock() else {
             return false;
         };
         // Retried even after quiesce, so the mask key gets every chance to go up.
-        state.flush_pending_mask_up(injector);
+        state.flush_pending_mask_up(io);
+        let epoch = self.epoch.load(Ordering::Acquire);
+        if state.epoch != epoch {
+            state.reset_physical_state();
+            state.epoch = epoch;
+        }
         let target = self.target.load(Ordering::Acquire);
         if target == 0 {
             return false;
         }
-        state.handle_key(
-            event,
-            is_foreground_in_blacklist,
-            &mut sink_for(target),
-            injector,
-        )
+        state.handle_key(event, is_foreground_in_blacklist, &mut sink_for(target), io)
     }
 }
 
@@ -117,6 +131,13 @@ static HOOK: LazyLock<HookShared> = LazyLock::new(HookShared::new);
 
 /// At most one listener (or detached hook thread) may own `HOOK` at a time.
 static LISTENER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Tells the hook that key-ups may have been lost (the session was locked or
+/// unlocked, so input went to the secure desktop). Never blocks: the hook
+/// drops its physical key state on its next event. Safe to call at any time.
+pub fn reset_input_state() {
+    HOOK.epoch.fetch_add(1, Ordering::AcqRel);
+}
 
 /// Owns the dedicated thread that installs `WH_KEYBOARD_LL` and pumps its
 /// messages. Low-level hook callbacks run on the installing thread, so keeping
@@ -134,14 +155,18 @@ pub struct KeyboardListener {
 }
 
 impl KeyboardListener {
-    pub fn init(hwnd: HWND, hotkeys: &[&Hotkey]) -> Result<Self> {
+    pub fn init(
+        hwnd: HWND,
+        hotkeys: &[&Hotkey],
+        super_tap: Option<SuperTapConfig>,
+    ) -> Result<Self> {
         if LISTENER_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             bail!("Keyboard listener is already running");
         }
-        match Self::start(hwnd, hotkeys) {
+        match Self::start(hwnd, hotkeys, super_tap) {
             Ok(listener) => Ok(listener),
             Err(err) => {
                 HOOK.quiesce();
@@ -151,11 +176,14 @@ impl KeyboardListener {
         }
     }
 
-    fn start(hwnd: HWND, hotkeys: &[&Hotkey]) -> Result<Self> {
+    fn start(hwnd: HWND, hotkeys: &[&Hotkey], super_tap: Option<SuperTapConfig>) -> Result<Self> {
         // Fresh state on every start, so nothing leaks across restarts. This
         // lock is uncontended: holding `LISTENER_ACTIVE` means no hook thread
         // exists, because a detached one keeps the slot taken forever.
-        *HOOK.state.lock() = KeyboardState::new(hotkeys);
+        let mut state = KeyboardState::new(hotkeys, super_tap);
+        state.epoch = HOOK.epoch.load(Ordering::Acquire);
+        *HOOK.state.lock() = state;
+        HOOK.max_callback_us.store(0, Ordering::Relaxed);
         HOOK.target.store(hwnd.0 as isize, Ordering::Release);
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32>>();
@@ -179,7 +207,13 @@ impl KeyboardListener {
                 return Err(anyhow!("Keyboard hook thread exited during startup"));
             }
         };
-        info!("keyboard listener start");
+        info!(
+            "keyboard listener start, bare Win tap {}",
+            match super_tap {
+                Some(tap) => format!("owned (double tap {} ms)", tap.double_tap_ms),
+                None => "native".into(),
+            }
+        );
 
         Ok(Self {
             thread_id,
@@ -211,11 +245,11 @@ impl Drop for KeyboardListener {
                 let _ = thread.join();
             }
         }
-        report_mask_cleanup(finish_shutdown(
-            &HOOK,
-            thread_exited,
-            &mut SendInputInjector,
-        ));
+        report_mask_cleanup(finish_shutdown(&HOOK, thread_exited, &mut SystemIo));
+        info!(
+            "keyboard hook longest callback {} us",
+            HOOK.max_callback_us.load(Ordering::Relaxed)
+        );
         if thread_exited {
             LISTENER_ACTIVE.store(false, Ordering::Release);
         } else {
@@ -250,6 +284,8 @@ fn finish_shutdown(
     thread_exited: bool,
     injector: &mut impl KeyInjector,
 ) -> MaskCleanup {
+    // Nothing else to undo: S06D never consumes a Win event and never holds a
+    // synthetic key down, so only a pending mask key-up can be outstanding.
     let state = if thread_exited {
         Some(shared.state.lock())
     } else {
@@ -320,6 +356,11 @@ fn run_hook_thread(ready: mpsc::Sender<Result<u32>>) {
                 });
                 break;
             }
+            _ if message.hwnd.is_invalid() && message.message == WM_HOOK_REPLAY_START => {
+                // Outside the hook callback, so the injected keys land after
+                // the Win key-up that triggered the replay.
+                replay_start_menu();
+            }
             _ => unsafe {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -334,6 +375,63 @@ fn run_hook_thread(ready: mpsc::Sender<Result<u32>>) {
     debug!("keyboard hook thread exited");
 }
 
+/// Injects Ctrl+Esc so Windows opens Start, releasing whatever went down if
+/// only part of it could be inserted.
+fn replay_start_menu() {
+    let keys = [
+        (VK_CONTROL.0, 0x1d, false),
+        (VK_ESCAPE.0, 0x01, false),
+        (VK_ESCAPE.0, 0x01, true),
+        (VK_CONTROL.0, 0x1d, true),
+    ];
+    let sent = send_keys(&keys);
+    if sent == keys.len() {
+        info!("reopened Start after the overview action could not be delivered");
+        return;
+    }
+    error!(
+        "could not reopen Start: injected {sent} of {} keys",
+        keys.len()
+    );
+    // Release keys whose key-down went in: Esc (if down but not up), then Ctrl.
+    let mut release = vec![];
+    if sent == 2 {
+        release.push(keys[2]);
+    }
+    if (1..4).contains(&sent) {
+        release.push(keys[3]);
+    }
+    if !release.is_empty() && send_keys(&release) != release.len() {
+        error!("could not release keys after a failed Start replay");
+    }
+}
+
+/// `SendInput` of (vk, scan code, is key-up) keyboard events tagged with
+/// `OWN_INJECTION_MARKER`. At most 4 events, without allocating, because it
+/// also runs inside the hook callback.
+fn send_keys(keys: &[(u16, u16, bool)]) -> usize {
+    let mut inputs = [INPUT::default(); 4];
+    let count = keys.len().min(inputs.len());
+    for (input, &(vk, scan, is_up)) in inputs.iter_mut().zip(&keys[..count]) {
+        *input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    wScan: scan,
+                    dwFlags: match is_up {
+                        false => KEYBD_EVENT_FLAGS(0),
+                        true => KEYEVENTF_KEYUP,
+                    },
+                    dwExtraInfo: OWN_INJECTION_MARKER,
+                    ..Default::default()
+                },
+            },
+        };
+    }
+    unsafe { SendInput(&inputs[..count], std::mem::size_of::<INPUT>() as i32) as usize }
+}
+
 /// One physical key event, as seen by the hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyEvent {
@@ -341,6 +439,10 @@ struct KeyEvent {
     /// Only used to tell apart modifier sides that share a scan code.
     is_extended: bool,
     is_pressed: bool,
+    /// Virtual-key code, used by bare Win tap recognition.
+    vk: u8,
+    /// `KBDLLHOOKSTRUCT.time` (ms, wraps).
+    time: u32,
 }
 
 impl KeyEvent {
@@ -355,6 +457,8 @@ impl KeyEvent {
             scan_code: data.scanCode,
             is_extended: data.flags.0 & LLKHF_EXTENDED.0 != 0,
             is_pressed: data.flags.0 & LLKHF_UP.0 == 0,
+            vk: data.vkCode as u8,
+            time: data.time,
         })
     }
 }
@@ -431,32 +535,50 @@ trait KeyInjector {
     fn send(&mut self, keys: &[MaskKey]) -> usize;
 }
 
-struct SendInputInjector;
+/// Asks the hook thread to reopen Start once the current callback has
+/// returned. Used when Start was suppressed but the overview action could not
+/// be delivered. Never injects from inside the callback: input injected there
+/// lands *before* the event in flight, so Windows would see Win+Ctrl+Esc.
+trait StartReplay {
+    /// Returns false if the request could not be queued.
+    fn request_start(&mut self) -> bool;
+}
 
-impl KeyInjector for SendInputInjector {
+/// Everything the hook needs from the system besides the action sink.
+trait HookIo: KeyInjector + KeyStateProbe + StartReplay {}
+
+impl<T: KeyInjector + KeyStateProbe + StartReplay> HookIo for T {}
+
+/// Production `HookIo`: `SendInput`, `GetAsyncKeyState`, and a thread message
+/// to the current (hook) thread.
+struct SystemIo;
+
+impl KeyInjector for SystemIo {
     fn send(&mut self, keys: &[MaskKey]) -> usize {
-        let inputs: Vec<INPUT> = keys
-            .iter()
-            .map(|key| INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(VK_MASK),
-                        dwFlags: match key {
-                            MaskKey::Down => KEYBD_EVENT_FLAGS(0),
-                            MaskKey::Up => KEYEVENTF_KEYUP,
-                        },
-                        dwExtraInfo: OWN_INJECTION_MARKER,
-                        ..Default::default()
-                    },
-                },
-            })
-            .collect();
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
-        if sent != inputs.len() {
-            warn!("injected {sent} of {} modifier mask events", inputs.len());
+        let mut events = [(0, 0, false); 2];
+        let count = keys.len().min(events.len());
+        for (event, key) in events.iter_mut().zip(&keys[..count]) {
+            *event = (VK_MASK, 0, *key == MaskKey::Up);
+        }
+        let sent = send_keys(&events[..count]);
+        if sent != count {
+            warn!("injected {sent} of {count} modifier mask events");
         }
         sent
+    }
+}
+
+impl KeyStateProbe for SystemIo {
+    fn is_down(&self, vk: u8) -> bool {
+        (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
+    }
+}
+
+impl StartReplay for SystemIo {
+    fn request_start(&mut self) -> bool {
+        // Only called on the hook thread, whose loop handles the message.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        unsafe { PostThreadMessageW(thread_id, WM_HOOK_REPLAY_START, WPARAM(0), LPARAM(0)) }.is_ok()
     }
 }
 
@@ -493,10 +615,14 @@ struct KeyboardState {
     is_mask_up_pending: bool,
     holds: Vec<ModifierHold>,
     hotkeys: Vec<HotKeyState>,
+    /// Bare Win tap recognition; `None` (not even constructed) when disabled.
+    super_tap: Option<SuperTap>,
+    /// `HookShared::epoch` this state was last reset for.
+    epoch: u32,
 }
 
 impl KeyboardState {
-    fn new(hotkeys: &[&Hotkey]) -> Self {
+    fn new(hotkeys: &[&Hotkey], super_tap: Option<SuperTapConfig>) -> Self {
         let mut holds: Vec<ModifierHold> = vec![];
         let hotkeys = hotkeys
             .iter()
@@ -521,6 +647,28 @@ impl KeyboardState {
             is_mask_up_pending: false,
             holds,
             hotkeys,
+            super_tap: super_tap.map(|config| SuperTap::new(config.double_tap_ms)),
+            epoch: 0,
+        }
+    }
+
+    /// Forgets which keys are down and any hold in progress, without posting
+    /// anything. Used after a session lock/unlock, where key-ups go to the
+    /// secure desktop. The UI cancels its own switcher on lock. A pending mask
+    /// key-up is kept: it is still owed.
+    fn reset_physical_state(&mut self) {
+        self.shift = SidesDown::default();
+        for hold in self.holds.iter_mut() {
+            hold.sides = SidesDown::default();
+            hold.is_masked = false;
+            hold.is_owned = false;
+        }
+        for state in self.hotkeys.iter_mut() {
+            state.is_hotkey_pressed = false;
+            state.release_intent = ReleaseIntent::None;
+        }
+        if let Some(super_tap) = self.super_tap.as_mut() {
+            super_tap.reset();
         }
     }
 
@@ -549,18 +697,101 @@ impl KeyboardState {
         if self.holds[hold].is_masked {
             return true;
         }
+        if !self.inject_mask(injector) {
+            return false;
+        }
+        self.holds[hold].is_masked = true;
+        true
+    }
+
+    /// Injects a mask key-down/up. Returns false if nothing was inserted.
+    fn inject_mask(&mut self, injector: &mut impl KeyInjector) -> bool {
         let inserted = injector.send(&[MaskKey::Down, MaskKey::Up]);
         if inserted == 0 {
             return false;
         }
         // With only the key-down inserted the app already saw modifier+mask, so
-        // the hold is masked. The key-up is retried (best effort) until it goes
-        // in; see `MaskCleanup::StillDown`.
+        // the modifier is masked. The key-up is retried (best effort) until it
+        // goes in; see `MaskCleanup::StillDown`.
         if inserted == 1 && injector.send(&[MaskKey::Up]) != 1 {
             self.is_mask_up_pending = true;
         }
-        self.holds[hold].is_masked = true;
         true
+    }
+
+    /// Acts on a clean bare Win tap, on its key-up. The key-up itself always
+    /// passes to Windows; only the mask decides whether Start opens.
+    ///
+    /// Transaction, so Start and the overview never both happen or are both
+    /// lost:
+    /// 1. First tap: inject the mask. Input injected inside the callback lands
+    ///    before the key-up in flight, so Windows sees Win+vkE8 and does not
+    ///    open Start. Nothing inserted: post nothing; Start opens natively.
+    /// 2. Post the overview action (never waits for the UI).
+    /// 3. Post failed after the mask went in: ask the hook thread to reopen
+    ///    Start once this callback has returned.
+    ///
+    /// A second tap is not masked, so Windows opens Start natively; its
+    /// message is informational and may be lost.
+    fn handle_super_tap(
+        &mut self,
+        tap: TapOutcome,
+        sink: &mut impl ActionSink,
+        io: &mut impl HookIo,
+    ) {
+        match tap {
+            TapOutcome::SecondTap { time } => {
+                sink.post(HotKeyAction::OverviewSecondTap { time });
+            }
+            TapOutcome::FirstTap { time } => {
+                if !self.inject_mask(io) {
+                    return;
+                }
+                if sink.post(HotKeyAction::OverviewToggle { time }) {
+                    if let Some(super_tap) = self.super_tap.as_mut() {
+                        super_tap.tap_delivered(time);
+                    }
+                } else if !io.request_start() {
+                    error!("bare Win tap: overview not delivered and Start could not be reopened");
+                }
+            }
+        }
+    }
+
+    /// Ends a modifier hold whose key-ups were lost: Windows reports none of
+    /// its sides down although the hook still believes it is held. Posts the
+    /// hold's release actions as a real release would.
+    fn heal_hold(&mut self, hold: usize, probe: &impl KeyStateProbe, sink: &mut impl ActionSink) {
+        if !self.holds[hold].sides.is_down() {
+            return;
+        }
+        let vks: &[u8] = match self.holds[hold].modifier {
+            [0x5b, 0x5c] => &[VK_LWIN, VK_RWIN],
+            [0x38, 0x38] => &[0x12], // VK_MENU, either Alt
+            [0x1d, 0x1d] => &[0x11], // VK_CONTROL, either Ctrl
+            _ => return,
+        };
+        if vks.iter().any(|vk| probe.is_down(*vk)) {
+            return;
+        }
+        let state = &mut self.holds[hold];
+        state.sides = SidesDown::default();
+        state.is_masked = false;
+        state.is_owned = false;
+        self.end_holds(1 << hold, sink);
+    }
+
+    fn end_holds(&mut self, ended_holds: u32, sink: &mut impl ActionSink) {
+        for state in self.hotkeys.iter_mut() {
+            if ended_holds & (1 << state.hold) == 0 {
+                continue;
+            }
+            if let Some(action) = state.end_hold() {
+                // Release state is already cleared; a failed post has nothing
+                // to roll back (the UI is unreachable) and is logged by the sink.
+                sink.post(action);
+            }
+        }
     }
 
     /// Updates modifier holds for a modifier event and posts the release
@@ -587,16 +818,7 @@ impl KeyboardState {
                 ended_holds |= 1 << index;
             }
         }
-        for state in self.hotkeys.iter_mut() {
-            if ended_holds & (1 << state.hold) == 0 {
-                continue;
-            }
-            if let Some(action) = state.end_hold() {
-                // Release state is already cleared; a failed post has nothing
-                // to roll back (the UI is unreachable) and is logged by the sink.
-                sink.post(action);
-            }
-        }
+        self.end_holds(ended_holds, sink);
         is_modifier
     }
 
@@ -610,20 +832,43 @@ impl KeyboardState {
     ///   key through, so Windows handles the shortcut natively.
     /// - Once a hold is owned, failed deliveries still consume the key so
     ///   native and WinOrbit switching never mix within one hold.
+    /// - Win key events are never consumed. Bare tap recognition only
+    ///   observes; a Win hold that used a hotkey is a chord, so it can never
+    ///   also be a tap.
     fn handle_key(
         &mut self,
         event: KeyEvent,
         is_foreground_in_blacklist: bool,
         sink: &mut impl ActionSink,
-        injector: &mut impl KeyInjector,
+        io: &mut impl HookIo,
     ) -> bool {
         if let Some(bit) = side_bit([SCANCODE_LSHIFT, SCANCODE_RSHIFT], event) {
             self.shift.apply(bit, event.is_pressed);
         }
         let reverse = self.shift.is_down();
 
-        if self.handle_modifier_key(event, sink) {
+        let tap = match self.super_tap.as_mut() {
+            Some(super_tap) => super_tap.on_key(event.vk, event.is_pressed, event.time, io),
+            None => None,
+        };
+        let is_modifier = self.handle_modifier_key(event, sink);
+        if let Some(tap) = tap {
+            self.handle_super_tap(tap, sink, io);
+        }
+        if is_modifier || event.vk == VK_LWIN || event.vk == VK_RWIN {
             return false;
+        }
+
+        if event.is_pressed {
+            // A hotkey press with its modifier believed held: make sure the
+            // modifier really is held, so a lost key-up can never turn a plain
+            // key into a switch.
+            for index in 0..self.hotkeys.len() {
+                if self.hotkeys[index].hotkey.code == event.scan_code {
+                    let hold = self.hotkeys[index].hold;
+                    self.heal_hold(hold, io, sink);
+                }
+            }
         }
 
         for index in 0..self.hotkeys.len() {
@@ -640,7 +885,7 @@ impl KeyboardState {
                 continue;
             };
 
-            if !self.ensure_masked(hold, injector) {
+            if !self.ensure_masked(hold, io) {
                 // Not masked, so not consuming: Windows gets the key natively.
                 self.hotkeys[index].is_hotkey_pressed = was_hotkey_pressed;
                 return false;
@@ -777,11 +1022,24 @@ impl HotKeyState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HotKeyAction {
     Consume,
-    SwitchApps { reverse: bool },
+    SwitchApps {
+        reverse: bool,
+    },
     SwitchAppsDone,
     SwitchAppsCancel,
-    SwitchWindows { reverse: bool },
+    SwitchWindows {
+        reverse: bool,
+    },
     SwitchWindowsDone,
+    /// Clean bare Win tap; Start was suppressed. `time` is the key-up's
+    /// `KBDLLHOOKSTRUCT.time`.
+    OverviewToggle {
+        time: u32,
+    },
+    /// Second tap of a double tap; Windows opens Start natively.
+    OverviewSecondTap {
+        time: u32,
+    },
 }
 
 /// Hook-thread handling of one raw event. Injected input is rejected here,
@@ -793,10 +1051,10 @@ fn handle_hook_data<S: ActionSink>(
     data: &KBDLLHOOKSTRUCT,
     is_foreground_in_blacklist: bool,
     sink_for: impl FnOnce(isize) -> S,
-    injector: &mut impl KeyInjector,
+    io: &mut impl HookIo,
 ) -> bool {
     match KeyEvent::from_hook_data(data) {
-        Some(event) => shared.on_key(event, is_foreground_in_blacklist, sink_for, injector),
+        Some(event) => shared.on_key(event, is_foreground_in_blacklist, sink_for, io),
         None => false,
     }
 }
@@ -806,6 +1064,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
         return CallNextHookEx(None, code, w_param, l_param);
     }
     // No routine logging here: this runs for every key in the system.
+    let started = Instant::now();
     let kbd_data: &KBDLLHOOKSTRUCT = &*(l_param.0 as *const _);
     let is_foreground_in_blacklist = IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed);
     let consume = handle_hook_data(
@@ -813,8 +1072,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
         kbd_data,
         is_foreground_in_blacklist,
         |target| WindowSink(HWND(target as _)),
-        &mut SendInputInjector,
+        &mut SystemIo,
     );
+    HOOK.max_callback_us
+        .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     if consume {
         return LRESULT(1);
     }
@@ -834,6 +1095,12 @@ fn action_message(action: HotKeyAction) -> Option<(u32, LPARAM)> {
             Some((WM_USER_SWITCH_WINDOWS, LPARAM(reverse as isize)))
         }
         HotKeyAction::SwitchWindowsDone => Some((WM_USER_SWITCH_WINDOWS_DONE, LPARAM(0))),
+        HotKeyAction::OverviewToggle { time } => {
+            Some((WM_USER_OVERVIEW_TOGGLE, LPARAM(time as isize)))
+        }
+        HotKeyAction::OverviewSecondTap { time } => {
+            Some((WM_USER_OVERVIEW_SECOND_TAP, LPARAM(time as isize)))
+        }
     }
 }
 
@@ -842,13 +1109,16 @@ mod tests {
     use super::{
         action_message, finish_shutdown, handle_hook_data, wait_for_thread_exit, ActionSink,
         HookShared, HotKeyAction, KeyEvent, KeyInjector, KeyboardListener, KeyboardState,
-        MaskCleanup, MaskKey, LISTENER_ACTIVE, OWN_INJECTION_MARKER, VK_MASK,
+        MaskCleanup, MaskKey, StartReplay, LISTENER_ACTIVE, OWN_INJECTION_MARKER, VK_MASK,
     };
     use crate::app::{
-        WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
-        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
+        WM_USER_OVERVIEW_SECOND_TAP, WM_USER_OVERVIEW_TOGGLE, WM_USER_SWITCH_APPS,
+        WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE, WM_USER_SWITCH_WINDOWS,
+        WM_USER_SWITCH_WINDOWS_DONE,
     };
+    use crate::config::SuperTapConfig;
     use crate::config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID};
+    use crate::super_key::KeyStateProbe;
     use parking_lot::MutexGuard;
     use std::collections::VecDeque;
     use std::sync::{atomic::Ordering, mpsc};
@@ -870,6 +1140,17 @@ mod tests {
     const BACKTICK: u32 = 0x29;
     const ESC: u32 = 0x01;
     const A: u32 = 0x1e;
+    const CTRL: u32 = 0x1d;
+    const KEY_1: u32 = 0x02;
+    const D: u32 = 0x20;
+    const E: u32 = 0x12;
+    const L: u32 = 0x26;
+    const O: u32 = 0x18;
+    const R: u32 = 0x13;
+    const S: u32 = 0x1f;
+    const X: u32 = 0x2d;
+    const ENTER: u32 = 0x1c;
+    const LEFT: u32 = 0x4b;
 
     use HotKeyAction::{
         SwitchApps, SwitchAppsCancel, SwitchAppsDone, SwitchWindows, SwitchWindowsDone,
@@ -893,15 +1174,60 @@ mod tests {
         }
     }
 
-    /// Records every injection request and the keys actually inserted. Each
+    /// Fake system side of the hook (`HookIo`).
+    ///
+    /// Injection: records every request and the keys actually inserted. Each
     /// call inserts the next scripted count, or everything once the script is
     /// exhausted. With `fail_up`, every mask key-up fails forever.
-    #[derive(Default)]
+    ///
+    /// Key state: `async_down` is what `GetAsyncKeyState` would report. The
+    /// harness updates it after the hook has seen each event, as Windows does.
+    ///
+    /// Start replay: counts requests; `fail_replay` makes them fail.
     struct FakeInjector {
         script: VecDeque<usize>,
         fail_up: bool,
         requests: Vec<Vec<MaskKey>>,
         inserted: Vec<MaskKey>,
+        async_down: [bool; 256],
+        replays: usize,
+        fail_replay: bool,
+    }
+
+    impl Default for FakeInjector {
+        fn default() -> Self {
+            Self {
+                script: VecDeque::new(),
+                fail_up: false,
+                requests: vec![],
+                inserted: vec![],
+                async_down: [false; 256],
+                replays: 0,
+                fail_replay: false,
+            }
+        }
+    }
+
+    impl KeyStateProbe for FakeInjector {
+        fn is_down(&self, vk: u8) -> bool {
+            let any = |sides: [u8; 2]| sides.iter().any(|vk| self.async_down[*vk as usize]);
+            match vk {
+                0x10 => any([0xA0, 0xA1]),
+                0x11 => any([0xA2, 0xA3]),
+                0x12 => any([0xA4, 0xA5]),
+                _ => self.async_down[vk as usize],
+            }
+        }
+    }
+
+    impl StartReplay for FakeInjector {
+        fn request_start(&mut self) -> bool {
+            if self.fail_replay {
+                return false;
+            }
+            self.replays += 1;
+            true
+        }
     }
 
     impl FakeInjector {
@@ -937,6 +1263,46 @@ mod tests {
         LLKHF_LOWER_IL_INJECTED.0,
     ];
 
+    /// US-layout virtual-key code for the scan codes these tests use, as
+    /// Windows reports it in `KBDLLHOOKSTRUCT.vkCode`.
+    fn vk_of(scan_code: u32, is_extended: bool) -> u8 {
+        match (scan_code, is_extended) {
+            (ALT, false) => 0xA4,
+            (ALT, true) => 0xA5,
+            (CTRL, false) => 0xA2,
+            (CTRL, true) => 0xA3,
+            (SHIFT, _) => 0xA0,
+            (RSHIFT, _) => 0xA1,
+            (LWIN, _) => 0x5B,
+            (RWIN, _) => 0x5C,
+            (TAB, _) => 0x09,
+            (BACKTICK, _) => 0xC0,
+            (ESC, _) => 0x1B,
+            (A, _) => 0x41,
+            (KEY_1, _) => 0x31,
+            (D, _) => 0x44,
+            (E, _) => 0x45,
+            (L, _) => 0x4C,
+            (O, _) => 0x4F,
+            (R, _) => 0x52,
+            (S, _) => 0x53,
+            (X, _) => 0x58,
+            (ENTER, _) => 0x0D,
+            (LEFT, true) => 0x25,
+            _ => 0xFF,
+        }
+    }
+
+    fn key_event(scan_code: u32, is_extended: bool, is_pressed: bool) -> KeyEvent {
+        KeyEvent {
+            scan_code,
+            is_extended,
+            is_pressed,
+            vk: vk_of(scan_code, is_extended),
+            time: 0,
+        }
+    }
+
     fn hook_data(
         scan_code: u32,
         is_extended: bool,
@@ -951,6 +1317,7 @@ mod tests {
             flags |= LLKHF_UP.0;
         }
         KBDLLHOOKSTRUCT {
+            vkCode: vk_of(scan_code, is_extended) as u32,
             scanCode: scan_code,
             flags: KBDLLHOOKSTRUCT_FLAGS(flags),
             ..Default::default()
@@ -959,13 +1326,13 @@ mod tests {
 
     /// Shared hook state for one listener, driven through the same
     /// `HookShared::on_key` entry point the real hook uses.
-    fn shared_with(hotkeys: [&str; 2]) -> HookShared {
+    fn shared_with(hotkeys: [&str; 2], super_tap: Option<SuperTapConfig>) -> HookShared {
         let windows = Hotkey::create(SWITCH_WINDOWS_HOTKEY_ID, "switch windows", hotkeys[0])
             .expect("switch-windows hotkey should parse");
         let apps = Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", hotkeys[1])
             .expect("switch-apps hotkey should parse");
         let shared = HookShared::new();
-        *shared.state.lock() = KeyboardState::new(&[&windows, &apps]);
+        *shared.state.lock() = KeyboardState::new(&[&windows, &apps], super_tap);
         shared.target.store(1, Ordering::Release);
         shared
     }
@@ -975,6 +1342,8 @@ mod tests {
         sink: FakeSink,
         injector: FakeInjector,
         blacklisted: bool,
+        /// `KBDLLHOOKSTRUCT.time` of the next event; starts near wrap-around.
+        now: u32,
     }
 
     impl Harness {
@@ -983,12 +1352,32 @@ mod tests {
         }
 
         fn with_hotkeys(hotkeys: [&str; 2]) -> Self {
+            Self::build(hotkeys, None)
+        }
+
+        /// Bare Win tap ownership enabled, with default hotkeys.
+        fn with_overview(double_tap_ms: u32) -> Self {
+            Self::build(["alt+`", "alt+tab"], Some(SuperTapConfig { double_tap_ms }))
+        }
+
+        fn build(hotkeys: [&str; 2], super_tap: Option<SuperTapConfig>) -> Self {
             Self {
-                shared: shared_with(hotkeys),
+                shared: shared_with(hotkeys, super_tap),
                 sink: FakeSink::default(),
                 injector: FakeInjector::default(),
                 blacklisted: false,
+                now: u32::MAX - 5_000,
             }
+        }
+
+        /// Time passes without input.
+        fn wait(&mut self, ms: u32) {
+            self.now = self.now.wrapping_add(ms);
+        }
+
+        /// The key goes up while the hook cannot see it (secure desktop).
+        fn lose_up(&mut self, scan_code: u32, is_extended: bool) {
+            self.injector.async_down[vk_of(scan_code, is_extended) as usize] = false;
         }
 
         fn state(&self) -> MutexGuard<'_, KeyboardState> {
@@ -997,15 +1386,21 @@ mod tests {
 
         /// Feeds one raw hook event through the same entry point as the real
         /// hook, including the injected-input filter.
-        fn raw(&mut self, data: KBDLLHOOKSTRUCT) -> bool {
+        fn raw(&mut self, mut data: KBDLLHOOKSTRUCT) -> bool {
+            self.now = self.now.wrapping_add(10);
+            data.time = self.now;
             let sink = &mut self.sink;
-            handle_hook_data(
+            let consumed = handle_hook_data(
                 &self.shared,
                 &data,
                 self.blacklisted,
                 move |_| sink,
                 &mut self.injector,
-            )
+            );
+            // Windows' key state changes only after the hooks have seen the
+            // event, injected or not.
+            self.injector.async_down[data.vkCode as usize & 0xFF] = data.flags.0 & LLKHF_UP.0 == 0;
+            consumed
         }
 
         /// A key event without injected flags, as a physical key produces.
@@ -1577,7 +1972,8 @@ mod tests {
     fn quiesce_and_shutdown_never_wait_for_a_hook_stuck_holding_its_state() {
         // Leaked so the "hook" (this thread) and the shutdown thread share it
         // the way the real hook thread shares the never-freed `HOOK`.
-        let shared: &'static HookShared = Box::leak(Box::new(shared_with(["alt+`", "alt+tab"])));
+        let shared: &'static HookShared =
+            Box::leak(Box::new(shared_with(["alt+`", "alt+tab"], None)));
         let stuck_hook = shared.state.lock();
 
         let (done_tx, done_rx) = mpsc::channel();
@@ -1601,11 +1997,7 @@ mod tests {
         let mut sink = FakeSink::default();
         let mut injector = FakeInjector::default();
         for (scan_code, is_pressed) in [(ALT, true), (TAB, true), (TAB, false), (ALT, false)] {
-            let event = KeyEvent {
-                scan_code,
-                is_extended: false,
-                is_pressed,
-            };
+            let event = key_event(scan_code, false, is_pressed);
             assert!(!shared.on_key(event, false, |_| &mut sink, &mut injector));
         }
         assert!(sink.posted.is_empty());
@@ -1618,11 +2010,7 @@ mod tests {
         h.down(ALT);
         let held = h.shared.state.lock();
         let mut sink = FakeSink::default();
-        let event = KeyEvent {
-            scan_code: TAB,
-            is_extended: false,
-            is_pressed: true,
-        };
+        let event = key_event(TAB, false, true);
         assert!(!h
             .shared
             .on_key(event, false, |_| &mut sink, &mut FakeInjector::default()));
@@ -1635,7 +2023,7 @@ mod tests {
         // A detached hook thread never releases the slot, so `start` (which
         // takes the state lock) can never run alongside it.
         LISTENER_ACTIVE.store(true, Ordering::Release);
-        let result = KeyboardListener::init(HWND::default(), &[]);
+        let result = KeyboardListener::init(HWND::default(), &[], None);
         assert!(LISTENER_ACTIVE.load(Ordering::Acquire));
         LISTENER_ACTIVE.store(false, Ordering::Release);
         assert!(result.is_err());
@@ -1773,39 +2161,11 @@ mod tests {
         let event = |scan_code, is_extended, is_pressed| {
             KeyEvent::from_hook_data(&hook_data(scan_code, is_extended, is_pressed, 0))
         };
-        assert_eq!(
-            event(TAB, false, true),
-            Some(KeyEvent {
-                scan_code: TAB,
-                is_extended: false,
-                is_pressed: true
-            })
-        );
-        assert_eq!(
-            event(TAB, false, false),
-            Some(KeyEvent {
-                scan_code: TAB,
-                is_extended: false,
-                is_pressed: false
-            })
-        );
+        assert_eq!(event(TAB, false, true), Some(key_event(TAB, false, true)));
+        assert_eq!(event(TAB, false, false), Some(key_event(TAB, false, false)));
         // Right Alt and both Win keys arrive extended.
-        assert_eq!(
-            event(ALT, true, true),
-            Some(KeyEvent {
-                scan_code: ALT,
-                is_extended: true,
-                is_pressed: true
-            })
-        );
-        assert_eq!(
-            event(RWIN, true, false),
-            Some(KeyEvent {
-                scan_code: RWIN,
-                is_extended: true,
-                is_pressed: false
-            })
-        );
+        assert_eq!(event(ALT, true, true), Some(key_event(ALT, true, true)));
+        assert_eq!(event(RWIN, true, false), Some(key_event(RWIN, true, false)));
     }
 
     #[test]
@@ -2069,6 +2429,522 @@ mod tests {
         assert_eq!(
             message(SwitchWindowsDone),
             Some((WM_USER_SWITCH_WINDOWS_DONE, 0))
+        );
+    }
+
+    // Bare Win tap (TASK-S06D)
+
+    use HotKeyAction::{OverviewSecondTap, OverviewToggle};
+
+    impl Harness {
+        /// Bare Win tap ownership enabled, with the given hotkeys.
+        fn with_hotkeys_and_overview(hotkeys: [&str; 2]) -> Self {
+            Self::build(hotkeys, Some(SuperTapConfig { double_tap_ms: 400 }))
+        }
+
+        /// Taps a Win key (both arrive extended); returns whether each event
+        /// was consumed.
+        fn win_tap(&mut self, win: u32) -> [bool; 2] {
+            [self.down_ext(win), self.up_ext(win)]
+        }
+
+        /// Overview actions posted so far, by kind.
+        fn taps(&self) -> Vec<&'static str> {
+            self.sink
+                .posted
+                .iter()
+                .filter_map(|action| match action {
+                    OverviewToggle { .. } => Some("toggle"),
+                    OverviewSecondTap { .. } => Some("second"),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn bump_epoch(&self) {
+            self.shared.epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn bare_win_tap_masks_on_release_and_posts_the_overview() {
+        for win in [LWIN, RWIN] {
+            let mut h = Harness::with_overview(400);
+            assert!(!h.down_ext(win));
+            assert!(h.injector.requests.is_empty(), "{win:#x}: masked on press");
+            assert!(h.sink.posted.is_empty());
+            assert!(!h.up_ext(win), "{win:#x}: Win key-up consumed");
+            assert_eq!(h.injector.requests, vec![vec![Down, Up]], "{win:#x}");
+            assert_eq!(
+                h.sink.posted,
+                vec![OverviewToggle { time: h.now }],
+                "{win:#x}"
+            );
+            assert_eq!(h.injector.replays, 0);
+        }
+    }
+
+    #[test]
+    fn key_repeat_and_long_holds_are_one_tap() {
+        let mut h = Harness::with_overview(400);
+        for _ in 0..30 {
+            assert!(!h.down_ext(LWIN));
+        }
+        h.wait(10_000);
+        assert!(!h.up_ext(LWIN));
+        assert_eq!(h.taps(), vec!["toggle"]);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+    }
+
+    /// One key event: (scan code, extended, pressed).
+    type KeySeq = Vec<(u32, bool, bool)>;
+    /// A step run between two taps.
+    type Between<'a> = &'a dyn Fn(&mut Harness);
+
+    /// Native Windows-key chords, as (scan code, extended, pressed) events,
+    /// with `W` standing for the Win key under test.
+    fn native_chords() -> Vec<(&'static str, KeySeq)> {
+        const W: u32 = 0;
+        let chord = |keys: &[(u32, bool)]| {
+            let mut events = vec![(W, true, true)];
+            events.extend(keys.iter().map(|&(key, ext)| (key, ext, true)));
+            events.extend(keys.iter().rev().map(|&(key, ext)| (key, ext, false)));
+            events.push((W, true, false));
+            events
+        };
+        vec![
+            ("Win+L", chord(&[(L, false)])),
+            ("Win+D", chord(&[(D, false)])),
+            ("Win+E", chord(&[(E, false)])),
+            ("Win+R", chord(&[(R, false)])),
+            ("Win+X", chord(&[(X, false)])),
+            ("Win+1", chord(&[(KEY_1, false)])),
+            ("Win+A (printable)", chord(&[(A, false)])),
+            ("Win+Left", chord(&[(LEFT, true)])),
+            ("Win+Shift+S", chord(&[(SHIFT, false), (S, false)])),
+            ("Win+Ctrl+O", chord(&[(CTRL, false), (O, false)])),
+            ("Win+Tab (not configured)", chord(&[(TAB, false)])),
+            ("Win+` (not configured)", chord(&[(BACKTICK, false)])),
+            (
+                "Win+E, E released after Win",
+                vec![
+                    (W, true, true),
+                    (E, false, true),
+                    (W, true, false),
+                    (E, false, false),
+                ],
+            ),
+            (
+                "Shift held, then a Win tap",
+                vec![
+                    (SHIFT, false, true),
+                    (W, true, true),
+                    (W, true, false),
+                    (SHIFT, false, false),
+                ],
+            ),
+            (
+                "Shift pressed and released during the hold",
+                vec![
+                    (W, true, true),
+                    (SHIFT, false, true),
+                    (SHIFT, false, false),
+                    (W, true, false),
+                ],
+            ),
+            (
+                "both Win keys overlap",
+                vec![
+                    (LWIN, true, true),
+                    (RWIN, true, true),
+                    (RWIN, true, false),
+                    (LWIN, true, false),
+                ],
+            ),
+            (
+                "one side released while the other is held",
+                vec![
+                    (LWIN, true, true),
+                    (RWIN, true, true),
+                    (LWIN, true, false),
+                    (RWIN, true, false),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn native_chords_are_never_consumed_masked_or_posted() {
+        for win in [LWIN, RWIN] {
+            for (name, events) in native_chords() {
+                let mut h = Harness::with_overview(400);
+                for (key, ext, is_pressed) in events {
+                    let key = if key == 0 { win } else { key };
+                    assert!(
+                        !h.event(key, ext, is_pressed),
+                        "{name} ({win:#x}): consumed {key:#x}"
+                    );
+                    assert!(
+                        h.injector.requests.is_empty(),
+                        "{name} ({win:#x}): masked at {key:#x}"
+                    );
+                    assert!(h.sink.posted.is_empty(), "{name} ({win:#x}): posted");
+                }
+                // The chord leaves nothing behind: the next tap is clean.
+                h.win_tap(win);
+                assert_eq!(h.taps(), vec!["toggle"], "{name} ({win:#x}): next tap");
+            }
+        }
+    }
+
+    #[test]
+    fn win_hotkeys_own_their_hold_and_release_never_taps() {
+        for (hotkeys, key, switch, done) in [
+            (
+                ["win+`", "win+tab"],
+                TAB,
+                SwitchApps { reverse: false },
+                SwitchAppsDone,
+            ),
+            (
+                ["win+`", "win+tab"],
+                BACKTICK,
+                SwitchWindows { reverse: false },
+                SwitchWindowsDone,
+            ),
+        ] {
+            for win in [LWIN, RWIN] {
+                let mut h = Harness::with_hotkeys_and_overview(hotkeys);
+                assert!(!h.down_ext(win));
+                assert!(h.tap(key), "{key:#x}: hotkey not consumed");
+                assert!(!h.up_ext(win), "Win key-up consumed");
+                assert_eq!(h.sink.posted, vec![switch, done], "{key:#x} {win:#x}");
+                // Only the hotkey's own mask, no tap mask on release.
+                assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+
+                // A bare tap in the same configuration is still a tap.
+                h.win_tap(win);
+                assert_eq!(h.taps(), vec!["toggle"]);
+            }
+        }
+    }
+
+    #[test]
+    fn injected_input_never_starts_breaks_or_ends_a_tap() {
+        for flags in INJECTED_VARIANTS {
+            let mut h = Harness::with_overview(400);
+            let injected = |h: &mut Harness, key, ext, is_pressed| {
+                assert!(!h.raw(hook_data(key, ext, is_pressed, flags)));
+            };
+
+            // Injected Win tap alone: nothing.
+            let idle = h.snapshot();
+            injected(&mut h, LWIN, true, true);
+            injected(&mut h, LWIN, true, false);
+            assert_eq!(h.snapshot(), idle, "{flags:#x}");
+            assert!(h.sink.posted.is_empty() && h.injector.requests.is_empty());
+
+            // Injected keys during a physical tap do not make it a chord.
+            h.down_ext(LWIN);
+            injected(&mut h, A, false, true);
+            injected(&mut h, A, false, false);
+            h.up_ext(LWIN);
+            assert_eq!(h.taps(), vec!["toggle"], "{flags:#x}");
+
+            // An injected Win key-up does not end a physical hold.
+            h.wait(1_000);
+            h.down_ext(RWIN);
+            injected(&mut h, RWIN, true, false);
+            assert_eq!(h.taps(), vec!["toggle"], "{flags:#x}: injected up ended it");
+            h.up_ext(RWIN);
+            assert_eq!(h.taps(), vec!["toggle", "toggle"], "{flags:#x}");
+
+            // An injected overview-style action is just another injected key.
+            assert_eq!(h.injector.requests.len(), 2);
+        }
+    }
+
+    #[test]
+    fn mask_failure_leaves_start_native_and_posts_nothing() {
+        let mut h = Harness::with_overview(400);
+        h.injector.script = [0].into();
+        assert_eq!(h.win_tap(LWIN), [false, false]);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+        assert!(h.injector.inserted.is_empty());
+        assert!(
+            h.sink.posted.is_empty(),
+            "overview posted although Start opens"
+        );
+        assert_eq!(h.injector.replays, 0);
+
+        // An undelivered tap does not pair: the next quick tap is a first tap.
+        h.wait(50);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+        assert_eq!(h.injector.requests.len(), 2);
+    }
+
+    #[test]
+    fn partial_mask_still_suppresses_start_and_releases_the_mask_key() {
+        let mut h = Harness::with_overview(400);
+        h.injector.script = [1].into();
+        h.win_tap(LWIN);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up], vec![Up]]);
+        assert_eq!(h.injector.inserted, vec![Down, Up]);
+        assert_eq!(h.taps(), vec!["toggle"]);
+
+        // The key-up keeps failing: retried on the next event and at shutdown.
+        let mut h = Harness::with_overview(400);
+        h.injector.fail_up = true;
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+        assert!(h.state().is_mask_up_pending);
+        h.down(A);
+        assert_eq!(h.injector.requests.last(), Some(&vec![Up]));
+        h.injector.fail_up = false;
+        h.up(A);
+        assert!(!h.state().is_mask_up_pending);
+        assert_eq!(h.injector.inserted, vec![Down, Up]);
+    }
+
+    #[test]
+    fn undelivered_overview_reopens_start_from_the_hook_thread() {
+        let mut h = Harness::with_overview(400);
+        h.fail_posts(|action| matches!(action, OverviewToggle { .. }));
+        assert_eq!(h.win_tap(LWIN), [false, false]);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+        assert_eq!(h.injector.replays, 1, "Start suppressed but not reopened");
+        assert!(h.sink.posted.is_empty());
+
+        // Not delivered, so no double-tap window: the next quick tap is masked.
+        h.deliver_posts();
+        h.wait(50);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+        assert_eq!(h.injector.replays, 1);
+
+        // If even the replay cannot be queued, nothing else is attempted.
+        let mut h = Harness::with_overview(400);
+        h.fail_posts(|action| matches!(action, OverviewToggle { .. }));
+        h.injector.fail_replay = true;
+        h.win_tap(LWIN);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+        assert!(h.sink.posted.is_empty());
+        h.deliver_posts();
+        h.injector.fail_replay = false;
+        h.wait(1_000);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"], "not idle after a failed replay");
+    }
+
+    #[test]
+    fn double_tap_passes_the_second_tap_to_windows() {
+        let mut h = Harness::with_overview(400);
+        h.win_tap(LWIN);
+        h.wait(100);
+        assert_eq!(h.win_tap(LWIN), [false, false]);
+        assert_eq!(h.taps(), vec!["toggle", "second"]);
+        // The second tap is not masked, so Windows opens Start.
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+
+        // A third quick tap starts a new pair.
+        h.wait(100);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle", "second", "toggle"]);
+        assert_eq!(h.injector.requests.len(), 2);
+
+        // A lost second-tap message changes nothing: Start opens natively.
+        let mut h = Harness::with_overview(400);
+        h.fail_posts(|action| matches!(action, OverviewSecondTap { .. }));
+        h.win_tap(LWIN);
+        h.wait(100);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+        assert_eq!(h.injector.requests.len(), 1);
+        assert_eq!(h.injector.replays, 0);
+    }
+
+    #[test]
+    fn slow_taps_interrupted_pairs_and_disabled_double_tap_each_toggle() {
+        let slow = |h: &mut Harness| h.wait(500);
+        let key_between = |h: &mut Harness| {
+            h.tap(A);
+        };
+        let quick = |h: &mut Harness| h.wait(50);
+        let cases: [(&str, u32, Between); 3] = [
+            ("slow", 400, &slow),
+            ("key between", 400, &key_between),
+            ("double tap disabled", 0, &quick),
+        ];
+        for (name, double_tap_ms, between) in cases {
+            let mut h = Harness::with_overview(double_tap_ms);
+            h.win_tap(LWIN);
+            between(&mut h);
+            h.win_tap(LWIN);
+            assert_eq!(h.taps(), vec!["toggle", "toggle"], "{name}");
+            assert_eq!(h.injector.requests.len(), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn quiesce_in_any_phase_stops_masking_and_posting() {
+        // Before the press, mid-hold, and between the taps of a double tap.
+        for phase in 0..3 {
+            let mut h = Harness::with_overview(400);
+            if phase == 2 {
+                h.win_tap(LWIN);
+                h.wait(50);
+            }
+            let requests = h.injector.requests.clone();
+            let posted = h.sink.posted.clone();
+            if phase == 0 {
+                h.shared.quiesce();
+            }
+            assert!(!h.down_ext(LWIN));
+            if phase != 0 {
+                h.shared.quiesce();
+            }
+            assert!(!h.up_ext(LWIN), "phase {phase}: Win key-up consumed");
+            assert_eq!(h.injector.requests, requests, "phase {phase}: masked");
+            assert_eq!(h.sink.posted, posted, "phase {phase}: posted");
+            assert_eq!(h.injector.replays, 0);
+        }
+    }
+
+    #[test]
+    fn shutdown_mid_hold_has_nothing_to_release() {
+        let mut h = Harness::with_overview(400);
+        h.down_ext(LWIN);
+        h.shared.quiesce();
+        let mut injector = FakeInjector::default();
+        assert_eq!(
+            finish_shutdown(&h.shared, true, &mut injector),
+            MaskCleanup::NotNeeded
+        );
+        assert!(injector.requests.is_empty(), "shutdown injected a key");
+        // The Win key-up after shutdown is passed and ignored.
+        assert!(!h.up_ext(LWIN));
+        assert!(h.sink.posted.is_empty() && h.injector.requests.is_empty());
+    }
+
+    #[test]
+    fn lost_key_ups_heal_so_the_next_tap_works_and_chords_stay_native() {
+        // Win+L locks the PC; the lock screen swallows both key-ups.
+        let mut h = Harness::with_overview(400);
+        h.down_ext(LWIN);
+        assert!(!h.down(L));
+        h.lose_up(L, false);
+        h.lose_up(LWIN, true);
+        h.wait(30_000);
+        assert_eq!(h.win_tap(LWIN), [false, false]);
+        assert_eq!(h.taps(), vec!["toggle"], "first tap after unlock");
+
+        // Chords after recovery stay native.
+        let requests = h.injector.requests.clone();
+        h.down_ext(LWIN);
+        assert!(!h.tap(E));
+        h.up_ext(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+        assert_eq!(h.injector.requests, requests);
+
+        // A key-up leaking from the secure desktop changes nothing.
+        let before = h.snapshot();
+        assert!(!h.up(0x0a));
+        assert_eq!(h.snapshot(), before);
+    }
+
+    #[test]
+    fn session_lock_epoch_resets_tap_and_hotkey_holds() {
+        // Mid-tap.
+        let mut h = Harness::with_overview(400);
+        h.down_ext(LWIN);
+        h.down(L);
+        h.lose_up(L, false);
+        h.lose_up(LWIN, true);
+        h.bump_epoch();
+        h.win_tap(RWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+
+        // Mid-switch: Alt's key-up is lost; after the reset Tab is plain Tab.
+        let mut h = Harness::with_overview(400);
+        h.down(ALT);
+        assert!(h.tap(TAB));
+        h.lose_up(ALT, false);
+        h.bump_epoch();
+        assert!(!h.tap(TAB), "plain Tab consumed after the reset");
+        assert_eq!(h.sink.posted, vec![SwitchApps { reverse: false }]);
+        assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
+    }
+
+    #[test]
+    fn stale_modifier_holds_heal_before_a_hotkey_fires() {
+        // Without a lock notification: the lost Alt key-up is noticed on the
+        // next Tab press, which then commits the switch it ended.
+        let mut h = Harness::new();
+        h.down(ALT);
+        assert!(h.tap(TAB));
+        h.lose_up(ALT, false);
+        assert!(!h.tap(TAB), "plain Tab consumed with a stale Alt");
+        assert_eq!(
+            h.sink.posted,
+            vec![SwitchApps { reverse: false }, SwitchAppsDone]
+        );
+
+        // A stale Win side must not turn plain Tab into win+tab.
+        for win in [LWIN, RWIN] {
+            let mut h = Harness::with_hotkeys(["win+`", "win+tab"]);
+            h.down_ext(win);
+            h.lose_up(win, true);
+            assert!(!h.tap(TAB), "{win:#x}: plain Tab consumed with a stale Win");
+            assert!(!h.tap(BACKTICK));
+            assert!(h.sink.posted.is_empty());
+            assert!(h.injector.requests.is_empty());
+        }
+    }
+
+    #[test]
+    fn restarted_state_has_no_tap_in_progress() {
+        let mut h = Harness::with_overview(400);
+        h.down_ext(LWIN);
+        h.down(SHIFT);
+        let fresh = KeyboardState::new(&[], Some(SuperTapConfig { double_tap_ms: 400 }));
+        let tap = fresh.super_tap.as_ref().expect("tap state when enabled");
+        assert_eq!(tap.phase(), crate::super_key::SuperPhase::Idle);
+        *h.state() = fresh;
+        h.up(SHIFT);
+        h.up_ext(LWIN);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+    }
+
+    #[test]
+    fn disabled_overview_builds_no_tap_state_and_leaves_win_native() {
+        let mut h = Harness::new();
+        assert!(h.state().super_tap.is_none());
+        for win in [LWIN, RWIN] {
+            for _ in 0..3 {
+                assert_eq!(h.win_tap(win), [false, false]);
+                h.wait(100);
+            }
+        }
+        h.down_ext(LWIN);
+        h.wait(5_000);
+        h.up_ext(LWIN);
+        assert!(h.sink.posted.is_empty());
+        assert!(h.injector.requests.is_empty());
+        assert_eq!(h.injector.replays, 0);
+    }
+
+    #[test]
+    fn overview_actions_map_to_their_messages() {
+        let message = |action| action_message(action).map(|(msg, lparam)| (msg, lparam.0 as u32));
+        assert_eq!(
+            message(OverviewToggle { time: 0xFFFF_FFF0 }),
+            Some((WM_USER_OVERVIEW_TOGGLE, 0xFFFF_FFF0))
+        );
+        assert_eq!(
+            message(OverviewSecondTap { time: 1234 }),
+            Some((WM_USER_OVERVIEW_SECOND_TAP, 1234))
         );
     }
 }

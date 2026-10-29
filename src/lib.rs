@@ -11,6 +11,7 @@ mod keyboard;
 mod painter;
 mod preview;
 mod startup;
+mod super_key;
 mod switch_apps;
 mod trayicon;
 

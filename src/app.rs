@@ -1,6 +1,6 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
-use crate::keyboard::KeyboardListener;
+use crate::keyboard::{reset_input_state, KeyboardListener};
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::preview::{PreviewSource, WindowPreviewSource};
 use crate::startup::Startup;
@@ -19,14 +19,21 @@ use std::collections::HashMap;
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
-    System::LibraryLoader::GetModuleHandleW,
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        RemoteDesktop::{
+            WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+            NOTIFY_FOR_THIS_SESSION,
+        },
+    },
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
         LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
         SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
         HICON, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONUP,
-        WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST,
+        WM_NCHITTEST, WM_RBUTTONUP, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_LOCK,
+        WTS_SESSION_UNLOCK,
     },
 };
 
@@ -38,6 +45,11 @@ pub const WM_USER_SWITCH_APPS_DONE: u32 = 6011;
 pub const WM_USER_SWITCH_APPS_CANCEL: u32 = 6012;
 pub const WM_USER_SWITCH_WINDOWS: u32 = 6020;
 pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
+/// Clean bare Win tap (Start suppressed); `lparam` is the key-up's
+/// `KBDLLHOOKSTRUCT.time`. Only logged until the overview exists.
+pub const WM_USER_OVERVIEW_TOGGLE: u32 = 6030;
+/// Second tap of a double tap (Windows opens Start natively); `lparam` as above.
+pub const WM_USER_OVERVIEW_SECOND_TAP: u32 = 6031;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -70,7 +82,19 @@ impl App {
         let painter = GdiAAPainter::new(hwnd)?;
 
         let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
-        let keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
+        if let Some(error) = &config.overview.error {
+            warn!("{error}");
+        }
+        let keyboard_listener =
+            KeyboardListener::init(hwnd, &config.to_hotkeys(), config.overview.super_tap())?;
+        // Lock/unlock sends key-ups to the secure desktop; the notification
+        // lets the hook drop key state it can no longer trust. Without it the
+        // hook still heals from GetAsyncKeyState on the next relevant press.
+        let session_notifications =
+            unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
+        if let Err(err) = &session_notifications {
+            warn!("session lock notifications unavailable, {err}");
+        }
 
         let trayicon = match config.trayicon {
             true => Some(TrayIcon::create()),
@@ -105,6 +129,9 @@ impl App {
             .map_err(|err| anyhow!("Failed to set window ptr, {err}"))?;
 
         let result = Self::eventloop();
+        if session_notifications.is_ok() {
+            let _ = unsafe { WTSUnRegisterSessionNotification(hwnd) };
+        }
         // The app is freed only here, after the message loop, never from inside
         // a message handler that may itself be running under a `get_app` borrow.
         drop(take_app(hwnd));
@@ -268,6 +295,34 @@ impl App {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
                 let app = get_app(hwnd)?;
                 app.switch_windows_state.modifier_released = true;
+            }
+            WM_USER_OVERVIEW_TOGGLE => {
+                info!("bare Win tap (time {}): overview toggle", lparam.0 as u32);
+            }
+            WM_USER_OVERVIEW_SECOND_TAP => {
+                info!(
+                    "bare Win double tap (time {}): Start left to Windows",
+                    lparam.0 as u32
+                );
+            }
+            WM_WTSSESSION_CHANGE => {
+                let event = wparam.0 as u32;
+                if matches!(
+                    event,
+                    WTS_SESSION_LOCK
+                        | WTS_SESSION_UNLOCK
+                        | WTS_CONSOLE_CONNECT
+                        | WTS_REMOTE_CONNECT
+                ) {
+                    debug!("session change {event}: resetting keyboard state");
+                    reset_input_state();
+                    if event == WTS_SESSION_LOCK {
+                        // The hook dropped the hold, so no release will commit.
+                        let app = get_app(hwnd)?;
+                        app.cancel_switch_app();
+                        app.switch_windows_state.modifier_released = true;
+                    }
+                }
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));

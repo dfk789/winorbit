@@ -34,6 +34,81 @@ pub struct Config {
     pub switch_apps_backdrop_color: Option<u32>,
     pub switch_apps_override_icons: IndexMap<String, String>,
     switch_apps_only_current_desktop: Option<bool>,
+    pub overview: OverviewConfig,
+}
+
+/// Default `[overview] double_tap_ms`.
+pub const DEFAULT_DOUBLE_TAP_MS: u32 = 400;
+/// Accepted non-zero `[overview] double_tap_ms` range.
+pub const DOUBLE_TAP_MS_RANGE: std::ops::RangeInclusive<u32> = 100..=1000;
+
+/// `[overview]`: bare Win/Super key handling. Read once at startup, so a
+/// change needs a restart.
+///
+/// Fails safe: a malformed value disables the feature (Windows keeps its
+/// native Win key behavior) and is reported in `error` for the log, instead
+/// of failing the whole config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverviewConfig {
+    pub enable: bool,
+    /// A clean tap starting this soon after a delivered tap passes natively so
+    /// Windows opens Start. 0 disables double tap.
+    pub double_tap_ms: u32,
+    pub error: Option<String>,
+}
+
+impl Default for OverviewConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            double_tap_ms: DEFAULT_DOUBLE_TAP_MS,
+            error: None,
+        }
+    }
+}
+
+/// What the keyboard hook needs to own bare Win taps. Exists only when the
+/// feature is enabled; without it the hook builds no tap state at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuperTapConfig {
+    pub double_tap_ms: u32,
+}
+
+impl OverviewConfig {
+    fn load(section: &ini::Properties) -> Self {
+        let mut conf = Self::default();
+        let mut errors = vec![];
+        if let Some(v) = section.get("enable") {
+            match Config::to_bool(v.trim()) {
+                Some(v) => conf.enable = v,
+                None => errors.push(format!("enable = {v:?} is not yes/no")),
+            }
+        }
+        if let Some(v) = section.get("double_tap_ms") {
+            match v.trim().parse::<u32>() {
+                Ok(ms) if ms == 0 || DOUBLE_TAP_MS_RANGE.contains(&ms) => conf.double_tap_ms = ms,
+                _ => errors.push(format!(
+                    "double_tap_ms = {v:?} must be 0 or {}-{}",
+                    DOUBLE_TAP_MS_RANGE.start(),
+                    DOUBLE_TAP_MS_RANGE.end()
+                )),
+            }
+        }
+        if !errors.is_empty() {
+            conf.enable = false;
+            conf.error = Some(format!(
+                "[overview] disabled, native Win key kept: {}",
+                errors.join("; ")
+            ));
+        }
+        conf
+    }
+
+    pub fn super_tap(&self) -> Option<SuperTapConfig> {
+        self.enable.then_some(SuperTapConfig {
+            double_tap_ms: self.double_tap_ms,
+        })
+    }
 }
 
 impl Default for Config {
@@ -63,6 +138,7 @@ impl Default for Config {
             switch_apps_backdrop_color: None,
             switch_apps_override_icons: Default::default(),
             switch_apps_only_current_desktop: None,
+            overview: OverviewConfig::default(),
         }
     }
 }
@@ -177,6 +253,9 @@ impl Config {
             {
                 conf.switch_apps_only_current_desktop = Some(v);
             }
+        }
+        if let Some(section) = ini_conf.section(Some("overview")) {
+            conf.overview = OverviewConfig::load(section);
         }
         Ok(conf)
     }
@@ -433,6 +512,74 @@ fn parse_hex_color(value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn overview(snippet: &str) -> OverviewConfig {
+        let conf = Ini::load_from_str(snippet).expect("config snippet should parse");
+        Config::load(&conf).expect("config should load").overview
+    }
+
+    #[test]
+    fn overview_is_disabled_by_default_and_in_the_shipped_ini() {
+        assert_eq!(Config::default().overview, OverviewConfig::default());
+        assert_eq!(Config::default().overview.super_tap(), None);
+        assert_eq!(overview(""), OverviewConfig::default());
+        assert_eq!(overview(DEFAULT_CONFIG), OverviewConfig::default());
+        // An upgrade with an old ini (no [overview]) keeps native Win.
+        assert_eq!(overview("[switch-apps]\nenable = yes\n").super_tap(), None);
+    }
+
+    #[test]
+    fn overview_enable_and_double_tap_parse() {
+        let cases = [
+            ("[overview]\nenable = yes\n", Some(DEFAULT_DOUBLE_TAP_MS)),
+            ("[overview]\nenable = no\ndouble_tap_ms = 300\n", None),
+            ("[overview]\nenable = yes\ndouble_tap_ms = 0\n", Some(0)),
+            ("[overview]\nenable = yes\ndouble_tap_ms = 100\n", Some(100)),
+            (
+                "[overview]\nenable = yes\ndouble_tap_ms = 1000\n",
+                Some(1000),
+            ),
+            (
+                "[overview]\nenable = yes\ndouble_tap_ms =  250 \n",
+                Some(250),
+            ),
+        ];
+        for (snippet, expected) in cases {
+            let conf = overview(snippet);
+            assert_eq!(conf.error, None, "{snippet:?}");
+            assert_eq!(
+                conf.super_tap().map(|tap| tap.double_tap_ms),
+                expected,
+                "{snippet:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_overview_values_fail_safe_to_native() {
+        let cases = [
+            "[overview]\nenable = maybe\n",
+            "[overview]\nenable =\n",
+            "[overview]\nenable = yes\ndouble_tap_ms = fast\n",
+            "[overview]\nenable = yes\ndouble_tap_ms = -5\n",
+            "[overview]\nenable = yes\ndouble_tap_ms = 50\n",
+            "[overview]\nenable = yes\ndouble_tap_ms = 5000\n",
+            "[overview]\ndouble_tap_ms = 50\nenable = yes\n",
+        ];
+        for snippet in cases {
+            let conf = overview(snippet);
+            assert_eq!(conf.super_tap(), None, "{snippet:?}");
+            assert!(conf.error.is_some(), "{snippet:?}: no error reported");
+        }
+        // The rest of the config still loads.
+        let conf = Ini::load_from_str("[overview]\nenable = maybe\n[switch-apps]\nenable = yes\n")
+            .expect("config snippet should parse");
+        assert!(
+            Config::load(&conf)
+                .expect("config should load")
+                .switch_apps_enable
+        );
+    }
 
     #[test]
     fn test_hotkey() {
