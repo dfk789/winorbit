@@ -80,6 +80,8 @@ $observerStarted = $false
 $app = $null
 $exitCode = 1
 $hiddenStartSeen = New-Object System.Collections.Generic.HashSet[string]
+$runOffset = $null
+$doubleTapMs = 0
 $WM_COMMAND = 0x0111; $IDM_EXIT = 1
 
 Add-Type -TypeDefinition @"
@@ -119,11 +121,28 @@ public static class V {
     static uint threadId;
     static Thread thread;
     static bool lwin, rwin;
+    // Physical non-Win keys down, for telling a clean Win hold from a chord.
+    static bool[] keys = new bool[256];
+    static uint holdDown;
+    static bool holdClean, holdAfterKey, keySinceRelease;
+    static bool altTab;
+    static readonly object gate = new object();
+    static System.Collections.Generic.List<uint[]> holds = new System.Collections.Generic.List<uint[]>();
 
     // Physical Win holds that ended (last Win key released).
     public static volatile int WinReleases;
     // Physical non-Win key presses seen while a Win key was held.
     public static volatile int ChordKeys;
+    // Physical Alt holds in which Tab was pressed.
+    public static volatile int AltTabHolds;
+
+    static bool AnyKeyDown() { foreach (bool k in keys) if (k) return true; return false; }
+    static bool AltDown() { return keys[0xA4] || keys[0xA5] || keys[0x12]; }
+
+    // Physical Win holds since ResetWin, oldest first: { down time, up time,
+    // clean (1: nothing else down or pressed during it), 1 if another key
+    // went down or up since the previous hold }. Times are KBDLLHOOKSTRUCT.time.
+    public static uint[][] Holds() { lock (gate) { return holds.ToArray(); } }
 
     static IntPtr Callback(int code, IntPtr wParam, IntPtr lParam) {
         if (code >= 0) {
@@ -133,10 +152,29 @@ public static class V {
             if (!injected) {
                 if (k.vkCode == 0x5B || k.vkCode == 0x5C) {
                     bool wasHeld = lwin || rwin;
+                    bool sideWasDown = k.vkCode == 0x5B ? lwin : rwin;
                     if (k.vkCode == 0x5B) lwin = !up; else rwin = !up;
-                    if (up && wasHeld && !lwin && !rwin) WinReleases++;
-                } else if (!up && (lwin || rwin)) {
-                    ChordKeys++;
+                    if (!up && !wasHeld) {
+                        holdDown = k.time;
+                        holdClean = !AnyKeyDown();
+                        holdAfterKey = keySinceRelease;
+                    } else if (!up && !sideWasDown) {
+                        holdClean = false; // the other Win side joined
+                    }
+                    if (up && wasHeld && !lwin && !rwin) {
+                        WinReleases++;
+                        keySinceRelease = false;
+                        lock (gate) { holds.Add(new uint[] { holdDown, k.time, holdClean ? 1u : 0u, holdAfterKey ? 1u : 0u }); }
+                    }
+                } else {
+                    // Any other key event, down or up, makes a Win hold a chord
+                    // and ends a double-tap pairing, as in WinOrbit.
+                    if (lwin || rwin) { holdClean = false; if (!up) ChordKeys++; }
+                    keySinceRelease = true;
+                    bool wasAlt = AltDown();
+                    keys[k.vkCode & 0xFF] = !up;
+                    if (k.vkCode == 0x09 && !up && AltDown()) altTab = true;
+                    if (wasAlt && !AltDown()) { if (altTab) AltTabHolds++; altTab = false; }
                 }
             }
         }
@@ -170,7 +208,11 @@ public static class V {
         thread = null;
     }
 
-    public static void ResetWin() { lwin = false; rwin = false; }
+    public static void ResetWin() {
+        lwin = false; rwin = false; altTab = false; keySinceRelease = false;
+        keys = new bool[256];
+        lock (gate) { holds.Clear(); }
+    }
 
     public static bool IsVisible(IntPtr hwnd) { return IsWindowVisible(hwnd); }
 
@@ -230,6 +272,24 @@ function Read-LogSince([string] $path, [long] $offset) {
     } finally {
         $stream.Dispose()
     }
+}
+
+# The overview actions WinOrbit must log for the observed physical Win holds,
+# when it trusts its key state (outside probation) and Start is closed:
+# every clean hold is a tap; it is a second tap when it starts within the
+# double-tap window of a first tap's release with no other key in between.
+function Get-ExpectedTaps($holds, [int] $windowMs) {
+    $first = 0; $second = 0; $chords = 0; $anchor = $null
+    foreach ($h in $holds) {
+        if ($h[3] -eq 1) { $anchor = $null }
+        if ($h[2] -ne 1) { $chords++; $anchor = $null; continue }
+        if ($null -ne $anchor -and ((([int64]$h[0] - [int64]$anchor) + 4294967296) % 4294967296) -le $windowMs) {
+            $second++; $anchor = $null
+        } else {
+            $first++; $anchor = $h[1]
+        }
+    }
+    return @{ Toggle = $first; Second = $second; Chords = $chords }
 }
 
 function Count-Taps([string] $text) {
@@ -313,15 +373,32 @@ function Invoke-Trial {
         [bool] $expectStart, [int] $expectToggle, [int] $expectSecond,
         [string] $nativeQuestion = '', [int] $seconds = 60, [switch] $Optional, [switch] $NoMeasure, [switch] $ExpectReset,
         [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd, [switch] $ExpectOverlayHidden, [switch] $ExpectNoReset,
-        # Counts are minimums: an owned tap shows nothing yet, so people tap
-        # again, and they may come back with a second Alt+Tab.
-        [switch] $AtLeast,
+        # Every Win hold is owned: the expected overview actions are derived,
+        # exactly, from the holds the observer saw (extra taps included).
+        # Otherwise they are the fixed counts given, and more Win releases
+        # than instructed make the trial invalid: it is run again.
+        [switch] $Owned,
+        # The trial is about a quick second tap: rerun it if none was made.
+        [switch] $RequireSecond,
+        # The Alt+Tab presses (Alt holds with Tab) the trial needs; any other
+        # number makes it invalid: it is run again. -1: not checked.
+        [int] $altTabHolds = -1,
+        [int] $attempt = 1,
         [string] $logPath = $script:logPath
     )
-    $script:trialCount++
+    if ($attempt -eq 1) { $script:trialCount++ }
+    $retry = @{
+        name = $name; instruction = $instruction; releases = $releases
+        expectStart = $expectStart; expectToggle = $expectToggle; expectSecond = $expectSecond
+        nativeQuestion = $nativeQuestion; seconds = $seconds; Optional = $Optional; NoMeasure = $NoMeasure
+        ExpectReset = $ExpectReset; expectCommits = $expectCommits; ExpectStartClosedAtEnd = $ExpectStartClosedAtEnd
+        ExpectOverlayHidden = $ExpectOverlayHidden; ExpectNoReset = $ExpectNoReset; Owned = $Owned
+        RequireSecond = $RequireSecond; altTabHolds = $altTabHolds; attempt = $attempt + 1; logPath = $logPath
+    }
     Close-StartIfOpen
     [V]::ResetWin()
     $before = [V]::WinReleases
+    $altTabBefore = [V]::AltTabHolds
     $offset = Get-LogLength $logPath
     Write-Host ""
     Write-Host "  [$name]" -ForegroundColor Cyan
@@ -357,6 +434,33 @@ function Invoke-Trial {
     $startAtEnd = Get-StartForeground
     Close-StartIfOpen
     if ($startWhat) { Write-Host "    Start detected as: $startWhat" }
+
+    # Is the physical input what the trial asked for?
+    $holds = [V]::Holds()
+    $seen = Get-ExpectedTaps $holds $script:doubleTapMs
+    $altTabs = [V]::AltTabHolds - $altTabBefore
+    $invalid = $null
+    if (-not $Owned -and $releases -gt 0 -and $holds.Count -gt $releases) {
+        $invalid = "$($holds.Count) Win releases, $releases asked for"
+    } elseif ($RequireSecond -and $seen.Second -eq 0) {
+        $invalid = 'no quick second tap'
+    } elseif ($altTabHolds -ge 0 -and $altTabs -ne $altTabHolds) {
+        $invalid = "$altTabs Alt+Tab presses, $altTabHolds asked for"
+    }
+    if ($invalid) {
+        if ($attempt -lt 3) {
+            Write-Host "    input did not match the step ($invalid): once more" -ForegroundColor Magenta
+            Invoke-Trial @retry
+        } else {
+            $failures.Add("${name}: input did not match the step 3 times ($invalid)")
+        }
+        return
+    }
+    if ($Owned) {
+        $expectToggle = $seen.Toggle
+        $expectSecond = $seen.Second
+        Write-Host ("    Win holds seen: {0} ({1} taps, {2} second taps, {3} chords)" -f $holds.Count, $seen.Toggle, $seen.Second, $seen.Chords)
+    }
     $text = Read-LogSince $logPath $offset
     $taps = Count-Taps $text
     if ($ExpectReset) {
@@ -371,20 +475,12 @@ function Invoke-Trial {
         Check $name 'Start in foreground (measured)' $expectStart $startSeen
     }
     Check $name 'Start open or flash (you)' $expectStart $userStart
-    if ($AtLeast) {
-        Check $name "overview actions logged (at least $expectToggle)" $true ($taps.Toggle -ge $expectToggle)
-    } else {
-        Check $name 'overview actions logged' $expectToggle $taps.Toggle
-    }
+    Check $name 'overview actions logged' $expectToggle $taps.Toggle
     Check $name 'double-tap actions logged' $expectSecond $taps.Second
     if ($expectCommits -ge 0) {
         # One commit per Alt hold, however many Tab presses it had.
         $commits = ([regex]::Matches($text, 'message WM_USER_SWITCH_APPS_DONE')).Count
-        if ($AtLeast) {
-            Check $name "WinOrbit switch commits logged (at least $expectCommits)" $true ($commits -ge $expectCommits)
-        } else {
-            Check $name 'WinOrbit switch commits logged' $expectCommits $commits
-        }
+        Check $name 'WinOrbit switch commits logged' $expectCommits $commits
     }
     if ($ExpectNoReset) {
         Check $name 'no input reset logged' $true ($text -notmatch 'input reset:')
@@ -423,9 +519,12 @@ try {
     Write-Host "WinOrbit log: $script:logPath"
 
     $offset = Get-LogLength $script:logPath
+    $script:runOffset = $offset
     $app = Start-App $Exe
     $startup = Read-LogSince $script:logPath $offset
     Check 'startup' 'listener owns bare Win tap' $true ($startup -match "bare Win tap owned \(double tap $doubleTapMs ms\)")
+    # Every reset observer and the cloak watcher were installed.
+    Check 'startup' 'all reset observers, cloak changes watched' $true ($startup -match 'bare Win taps owned; Start detection: visible Start, cloak changes watched')
     [V]::Start()
     $observerStarted = $true
     Write-Host "`nWinOrbit started. Keep this window focused unless a step says otherwise."
@@ -438,14 +537,14 @@ try {
     $trialsBefore = $script:trialCount
     if (Want 1) {
     Write-Host "`n[1] Clean taps"
-    Invoke-Trial 'LWin tap' 'tap the LEFT Windows key once' 1 $false 1 0
-    Invoke-Trial 'RWin tap' 'tap the RIGHT Windows key once (no right Win key? wait 15 s to skip)' 1 $false 1 0 -seconds 15 -Optional
-    Invoke-Trial 'LWin held 2 s' 'hold the LEFT Windows key about 2 seconds, then release' 1 $false 1 0
-    Invoke-Trial '10 taps' 'tap the LEFT Windows key 10 times SLOWLY: count one-and-two between taps' 10 $false 10 0 -seconds 90
-    Invoke-Trial 'double tap' 'double-tap the LEFT Windows key quickly (Start must NOT open)' 2 $false 1 1
-    Invoke-Trial 'triple tap' 'tap the LEFT Windows key 3 times quickly (Start must NOT open)' 3 $false 2 1
+    Invoke-Trial 'LWin tap' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+    Invoke-Trial 'RWin tap' 'tap the RIGHT Windows key once (no right Win key? wait 15 s to skip)' 1 $false 0 0 -seconds 15 -Optional -Owned
+    Invoke-Trial 'LWin held 2 s' 'hold the LEFT Windows key about 2 seconds, then release' 1 $false 0 0 -Owned
+    Invoke-Trial '10 taps' 'tap the LEFT Windows key 10 times SLOWLY: count one-and-two between taps' 10 $false 0 0 -seconds 90 -Owned
+    Invoke-Trial 'double tap' 'double-tap the LEFT Windows key quickly (Start must NOT open)' 2 $false 0 0 -Owned -RequireSecond
+    Invoke-Trial 'triple tap' 'tap the LEFT Windows key 3 times quickly (Start must NOT open)' 3 $false 0 0 -Owned -RequireSecond
     Invoke-Trial 'Ctrl+Esc, then a tap closes Start' 'press Ctrl+Esc (Start opens), wait a second, tap the LEFT Windows key once (Start must close)' 1 $true 0 0 'Did Ctrl+Esc open Start and your tap close it?' -ExpectStartClosedAtEnd
-    Invoke-Trial 'two slow taps' 'tap the LEFT Windows key, wait about 2 seconds, tap it again' 2 $false 2 0
+    Invoke-Trial 'two slow taps' 'tap the LEFT Windows key, wait about 2 seconds, tap it again' 2 $false 0 0 -Owned
     Invoke-Trial 'Shift held, Win tap' 'hold Shift, tap the LEFT Windows key, release Shift' 1 $false 0 0
     }
 
@@ -472,18 +571,18 @@ try {
     if ((Want 3) -and -not $SkipLock) {
         Write-Host "`n[3] Win+L lock/unlock"
         Invoke-Trial 'Win+L, then the first tap' 'press Win+L, sign back in, FIRST THING tap the LEFT Windows key once (Start opens), then click here and press Enter' 0 $true 0 0 -ExpectReset -NoMeasure
-        Invoke-Trial 'second tap after unlock' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
+        Invoke-Trial 'second tap after unlock' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
         Invoke-Trial 'chord after unlock' 'press Win+E (Explorer opens; close it)' 1 $false 0 0 'Did Explorer open?'
         if (-not $SkipUac) {
             Invoke-Trial 'UAC, then the first tap' 'press Win+R, type cmd, press Ctrl+Shift+Enter, click No on the UAC prompt, click this window, then tap the LEFT Windows key once' 2 $true 0 0 -ExpectReset -seconds 120
-            Invoke-Trial 'second tap after UAC' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
+            Invoke-Trial 'second tap after UAC' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
         }
         Invoke-Trial 'Ctrl+Alt+Del, then the first tap' 'press Ctrl+Alt+Del, click Cancel, then FIRST THING tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 120
-        Invoke-Trial 'second tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
-        Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectCommits 1
-        Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectCommits 0
+        Invoke-Trial 'second tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+        Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectCommits 1 -altTabHolds 1
+        Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectCommits 0 -altTabHolds 0
         Invoke-Trial 'Ctrl+Alt+Del during Alt+Tab' 'hold Alt, tap Tab (switcher shows), KEEP Alt held and press Ctrl+Del, click Cancel, release all keys, CLICK this window' 0 $false 0 0 'Was the WinOrbit switcher gone when you came back?' -ExpectReset -expectCommits 0 -ExpectOverlayHidden
-        Invoke-Trial 'Alt+Tab after the interrupted switch' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch normally?' -expectCommits 1
+        Invoke-Trial 'Alt+Tab after the interrupted switch' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch normally?' -expectCommits 1 -altTabHolds 1
     }
 
     if (Want 4) {
@@ -491,9 +590,9 @@ try {
     Write-Host "  Windows sends a non-elevated WinOrbit no keys while an elevated window (Task Manager) is focused;"
     Write-Host "  WinOrbit resets its key state when focus moves there."
     Invoke-Trial 'Ctrl+Shift+Esc, then the first tap' 'open Task Manager with Ctrl+Shift+Esc, CLICK back into this window, then tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 90
-    Invoke-Trial 'second tap after Task Manager' 'tap the LEFT Windows key once' 1 $false 1 0 -AtLeast
+    Invoke-Trial 'second tap after Task Manager' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
     Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key ONCE (Start opens natively), then CLICK this window (Start closes)' 0 $true 0 0 -NoMeasure -ExpectReset
-    Invoke-Trial 'tap back here' 'tap the LEFT Windows key once' 1 $false 1 0
+    Invoke-Trial 'tap back here' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
     }
 
     if (Want 5) {
@@ -502,10 +601,10 @@ try {
     $stop = Stop-App $app; $app = $null
     Check 'exit' 'exited in time' $true $stop.Exited
     Check 'exit' 'exit code' 0 $stop.Code
-    $shutdown = Read-LogSince $script:logPath 0
+    $shutdown = Read-LogSince $script:logPath $script:runOffset
     if ($shutdown -match 'keyboard hook longest callback (\d+) us') {
         $all = [regex]::Matches($shutdown, 'keyboard hook longest callback (\d+) us')
-        Write-Host ("    longest hook callback this run: {0} us" -f $all[$all.Count - 1].Groups[1].Value)
+        Write-Host ("    longest hook callback, first WinOrbit: {0} us" -f $all[$all.Count - 1].Groups[1].Value)
     } else {
         $failures.Add('exit: no hook callback duration logged')
     }
@@ -525,7 +624,9 @@ try {
         # Observed on 22631: Windows closes Start right after the launch.
         Write-Host "    (Start closed during the launch; the startup classification is checked from the log only)"
     }
-    Invoke-Trial 'after relaunch' 'tap the LEFT Windows key once' 1 $false 1 0
+    # Startup probation again: this Enter is the key-up that ends it.
+    [void](Read-Host "  Press Enter to continue")
+    Invoke-Trial 'after relaunch' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
     $stop = Stop-App $app; $app = $null
     Check 'second exit' 'exit code' 0 $stop.Code
     }
@@ -533,9 +634,9 @@ try {
     if (Want 7) {
     if (-not $app) { $app = Start-App $Exe }
     Write-Host "`n[7] Regression on this build"
-    Invoke-Trial 'Alt+Tab' 'press Alt+Tab, release (the app list shows, the next app activates), then CLICK this window' 0 $false 0 0 'Did the app list look normal and the right app activate?' -expectCommits 1 -ExpectNoReset -AtLeast
+    Invoke-Trial 'Alt+Tab' 'press Alt+Tab, release (the app list shows, the next app activates), then CLICK this window' 0 $false 0 0 'Did the app list look normal and the right app activate?' -expectCommits 1 -ExpectNoReset -altTabHolds 1
     Invoke-Trial 'Alt+`' 'press Alt+` (cycles windows of the current app), then CLICK this window' 0 $false 0 0 'Did Alt+` cycle the app''s windows?'
-    Invoke-Trial 'Win+Left, then a tap' 'click another window, press Win+Left, then IMMEDIATELY tap the LEFT Windows key once (Start must NOT open)' 2 $false 1 0 -seconds 90
+    Invoke-Trial 'Win+Left, then a tap' 'click another window, press Win+Left, then IMMEDIATELY tap the LEFT Windows key once (Start must NOT open)' 2 $false 0 0 -seconds 90 -Owned
     }
 
     if (Want 6) {
@@ -581,6 +682,13 @@ try {
             }
         } catch {
             $failures.Add("cleanup failed: $_")
+        }
+    }
+    if ($script:logPath -and (Test-Path $script:logPath) -and $null -ne $script:runOffset) {
+        # Logged by each WinOrbit of this run when it exits.
+        $budget = @([regex]::Matches((Read-LogSince $script:logPath $script:runOffset), 'keyboard hook longest callback (\d+) us') | ForEach-Object { [int]$_.Groups[1].Value })
+        if ($budget.Count) {
+            Write-Host ("`nlongest keyboard hook callback, whole run: {0} us (over {1} WinOrbit runs)" -f ($budget | Measure-Object -Maximum).Maximum, $budget.Count)
         }
     }
     if ($script:logPath -and (Test-Path $script:logPath)) {
