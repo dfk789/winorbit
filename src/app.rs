@@ -1,5 +1,6 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
+use crate::input_reset::InputResetWatcher;
 use crate::keyboard::{reset_input_state, KeyboardListener};
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::preview::{PreviewSource, WindowPreviewSource};
@@ -19,13 +20,7 @@ use std::collections::HashMap;
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
-    System::{
-        LibraryLoader::GetModuleHandleW,
-        RemoteDesktop::{
-            WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
-            NOTIFY_FOR_THIS_SESSION,
-        },
-    },
+    System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
         LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
@@ -74,6 +69,9 @@ pub struct App {
     painter: GdiAAPainter,
     /// Owned by the app so it is stopped before the app state is freed.
     keyboard_listener: KeyboardListener,
+    /// Lock/unlock and desktop-switch signals; unregistered when the app is
+    /// freed after the message loop, on this thread.
+    _input_reset: InputResetWatcher,
 }
 
 impl App {
@@ -87,14 +85,7 @@ impl App {
         }
         let keyboard_listener =
             KeyboardListener::init(hwnd, &config.to_hotkeys(), config.overview.super_tap())?;
-        // Lock/unlock sends key-ups to the secure desktop; the notification
-        // lets the hook drop key state it can no longer trust. Without it the
-        // hook still heals from GetAsyncKeyState on the next relevant press.
-        let session_notifications =
-            unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
-        if let Err(err) = &session_notifications {
-            warn!("session lock notifications unavailable, {err}");
-        }
+        let input_reset = InputResetWatcher::init(hwnd);
 
         let trayicon = match config.trayicon {
             true => Some(TrayIcon::create()),
@@ -120,6 +111,7 @@ impl App {
             cached_icons: Default::default(),
             painter,
             keyboard_listener,
+            _input_reset: input_reset,
         };
 
         app.set_trayicon();
@@ -129,9 +121,6 @@ impl App {
             .map_err(|err| anyhow!("Failed to set window ptr, {err}"))?;
 
         let result = Self::eventloop();
-        if session_notifications.is_ok() {
-            let _ = unsafe { WTSUnRegisterSessionNotification(hwnd) };
-        }
         // The app is freed only here, after the message loop, never from inside
         // a message handler that may itself be running under a `get_app` borrow.
         drop(take_app(hwnd));
@@ -307,15 +296,15 @@ impl App {
             }
             WM_WTSSESSION_CHANGE => {
                 let event = wparam.0 as u32;
-                if matches!(
-                    event,
-                    WTS_SESSION_LOCK
-                        | WTS_SESSION_UNLOCK
-                        | WTS_CONSOLE_CONNECT
-                        | WTS_REMOTE_CONNECT
-                ) {
-                    debug!("session change {event}: resetting keyboard state");
-                    reset_input_state();
+                let reason = match event {
+                    WTS_SESSION_LOCK => Some("session lock"),
+                    WTS_SESSION_UNLOCK => Some("session unlock"),
+                    WTS_CONSOLE_CONNECT => Some("console connect"),
+                    WTS_REMOTE_CONNECT => Some("remote connect"),
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    reset_input_state(reason);
                     if event == WTS_SESSION_LOCK {
                         // The hook dropped the hold, so no release will commit.
                         let app = get_app(hwnd)?;

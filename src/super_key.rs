@@ -20,30 +20,24 @@
 //! A Win down while another key is already down goes straight to
 //! `ChordPassthrough`. `TapCommitted` is not stored: it is the outcome
 //! returned for the release that ends a `SuperPending` hold.
+//!
+//! Recovery from lost key-ups (secure desktop, elevated foreground) comes only
+//! from `reset`, driven by explicit signals. The state is never "healed" from
+//! `GetAsyncKeyState`: Windows reports an injected key-up there exactly like
+//! a physical one, so healing from it would let injected input change what a
+//! physical tap means. Without a reset a stale key can only make taps pass
+//! natively (fail-open), never make a chord look like a tap.
 
 /// Left Windows key.
 pub const VK_LWIN: u8 = 0x5B;
 /// Right Windows key.
 pub const VK_RWIN: u8 = 0x5C;
 
-/// Asks Windows whether a key is down right now (`GetAsyncKeyState` in
-/// production).
-///
-/// Inside a `WH_KEYBOARD_LL` callback this reports the state *before* the
-/// event being handled. So for the event's own key it tells a key repeat
-/// (already down) from a fresh press (still up), and for every other key it
-/// is that key's current state.
-pub trait KeyStateProbe {
-    fn is_down(&self, vk: u8) -> bool;
-}
-
 /// Physical Win keys believed down, one bit per side.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WinSides(u8);
 
 impl WinSides {
-    const SIDES: [(u8, u8); 2] = [(VK_LWIN, 0b01), (VK_RWIN, 0b10)];
-
     fn bit(vk: u8) -> u8 {
         if vk == VK_LWIN {
             0b01
@@ -66,16 +60,6 @@ impl WinSides {
 
     fn is_empty(self) -> bool {
         self.0 == 0
-    }
-
-    /// Drops every side except `current` that Windows reports as up: its
-    /// key-up was lost (for example on the secure desktop).
-    fn heal(&mut self, current: u8, probe: &impl KeyStateProbe) {
-        for (vk, bit) in Self::SIDES {
-            if vk != current && self.0 & bit != 0 && !probe.is_down(vk) {
-                self.0 &= !bit;
-            }
-        }
     }
 }
 
@@ -102,22 +86,6 @@ impl KeysDown {
 
     fn is_empty(&self) -> bool {
         self.0.iter().all(|word| *word == 0)
-    }
-
-    /// Drops every key Windows reports as up. Only the keys believed down are
-    /// queried, normally none or a handful.
-    fn heal(&mut self, probe: &impl KeyStateProbe) {
-        for word in 0..self.0.len() {
-            let mut bits = self.0[word];
-            while bits != 0 {
-                let bit = bits.trailing_zeros();
-                bits &= bits - 1;
-                let vk = (word as u32 * 64 + bit) as u8;
-                if !probe.is_down(vk) {
-                    self.0[word] &= !(1 << bit);
-                }
-            }
-        }
     }
 }
 
@@ -180,7 +148,8 @@ impl SuperTap {
         }
     }
 
-    /// Forgets all physical state, e.g. after the session was locked.
+    /// Forgets all physical state. Called when key-ups may have been lost
+    /// (session lock/unlock, input desktop switch).
     pub fn reset(&mut self) {
         *self = Self::new(self.double_tap_ms);
     }
@@ -194,16 +163,10 @@ impl SuperTap {
     }
 
     /// Handles one physical key event. `time` is `KBDLLHOOKSTRUCT.time`.
-    pub fn on_key(
-        &mut self,
-        vk: u8,
-        is_pressed: bool,
-        time: u32,
-        probe: &impl KeyStateProbe,
-    ) -> Option<TapOutcome> {
+    pub fn on_key(&mut self, vk: u8, is_pressed: bool, time: u32) -> Option<TapOutcome> {
         if vk == VK_LWIN || vk == VK_RWIN {
             return if is_pressed {
-                self.on_win_down(vk, time, probe);
+                self.on_win_down(vk, time);
                 None
             } else {
                 self.on_win_up(vk, time)
@@ -226,7 +189,7 @@ impl SuperTap {
         None
     }
 
-    fn on_win_down(&mut self, vk: u8, time: u32, probe: &impl KeyStateProbe) {
+    fn on_win_down(&mut self, vk: u8, time: u32) {
         let mut sides = match self.phase {
             SuperPhase::Idle => WinSides::default(),
             SuperPhase::SuperPending { sides, .. } | SuperPhase::ChordPassthrough { sides } => {
@@ -234,26 +197,18 @@ impl SuperTap {
             }
         };
         if sides.contains(vk) {
-            if probe.is_down(vk) {
-                // Auto-repeat of a key already down: no new press.
-                return;
-            }
-            // Windows says this key was up, so its last key-up was lost and
-            // this is a fresh press.
-            sides.remove(vk);
+            // Auto-repeat (or a press whose earlier key-up was lost): no new
+            // press, so a tap can neither start nor be split here.
+            return;
         }
-        sides.heal(vk, probe);
-
         if !sides.is_empty() {
-            // The other Win side is (really) down too.
+            // The other Win side is down too.
             sides.insert(vk);
             self.pair_anchor = None;
             self.phase = SuperPhase::ChordPassthrough { sides };
             return;
         }
 
-        // A new hold. Keys whose key-up was lost must not make it a chord.
-        self.keys.heal(probe);
         sides.insert(vk);
         let is_second = self
             .pair_anchor
@@ -297,24 +252,11 @@ impl SuperTap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
 
     const SHIFT: u8 = 0xA0;
     const CTRL: u8 = 0xA2;
     const L: u8 = 0x4C;
     const E: u8 = 0x45;
-
-    /// Windows' key state as `GetAsyncKeyState` reports it to a hook: updated
-    /// only after the hook has seen an event, unless a key-up is "lost".
-    #[derive(Default)]
-    struct FakeProbe(RefCell<KeysDown>);
-
-    impl KeyStateProbe for FakeProbe {
-        fn is_down(&self, vk: u8) -> bool {
-            let (word, bit) = KeysDown::slot(vk);
-            self.0.borrow().0[word] & bit != 0
-        }
-    }
 
     #[derive(Debug, Clone, Copy)]
     enum Step {
@@ -322,8 +264,9 @@ mod tests {
         Up(u8),
         /// Time passes (ms).
         Wait(u32),
-        /// The key goes up without the hook seeing it (secure desktop).
-        LoseUp(u8),
+        /// The key goes up without the hook seeing it (secure desktop,
+        /// elevated foreground). Nothing reaches the state machine.
+        LoseUp(#[allow(dead_code)] u8),
         /// The caller delivered the last first tap.
         Delivered,
         Reset,
@@ -332,7 +275,6 @@ mod tests {
 
     struct Run {
         tap: SuperTap,
-        probe: FakeProbe,
         now: u32,
         last_tap_time: u32,
     }
@@ -341,7 +283,6 @@ mod tests {
         fn new(double_tap_ms: u32) -> Self {
             Self {
                 tap: SuperTap::new(double_tap_ms),
-                probe: FakeProbe::default(),
                 // Close to wrap-around, so time arithmetic must wrap.
                 now: u32::MAX - 1_000,
                 last_tap_time: 0,
@@ -353,8 +294,7 @@ mod tests {
                 Down(vk) | Up(vk) => {
                     let is_pressed = matches!(step, Down(_));
                     self.now = self.now.wrapping_add(10);
-                    let outcome = self.tap.on_key(vk, is_pressed, self.now, &self.probe);
-                    self.probe.0.borrow_mut().set(vk, is_pressed);
+                    let outcome = self.tap.on_key(vk, is_pressed, self.now);
                     if let Some(TapOutcome::FirstTap { time }) = outcome {
                         self.last_tap_time = time;
                     }
@@ -364,10 +304,7 @@ mod tests {
                     self.now = self.now.wrapping_add(ms);
                     None
                 }
-                LoseUp(vk) => {
-                    self.probe.0.borrow_mut().set(vk, false);
-                    None
-                }
+                LoseUp(_) => None,
                 Delivered => {
                     self.tap.tap_delivered(self.last_tap_time);
                     None
@@ -502,40 +439,80 @@ mod tests {
                 vec!["first"],
             ),
             (
-                "Win+L, both key-ups lost, next tap is clean",
+                "Win+L, key-ups lost, reset: next tap is clean",
                 vec![
                     Down(VK_LWIN),
                     Down(L),
                     LoseUp(L),
                     LoseUp(VK_LWIN),
+                    Reset,
                     Down(VK_LWIN),
                     Up(VK_LWIN),
                 ],
                 vec!["first"],
             ),
             (
-                "lost LWin up, then RWin tap is clean",
-                vec![Down(VK_LWIN), LoseUp(VK_LWIN), Down(VK_RWIN), Up(VK_RWIN)],
-                vec!["first"],
-            ),
-            (
-                "lost key-up of a non-Win key, then a tap is clean",
-                vec![Down(CTRL), LoseUp(CTRL), Down(VK_LWIN), Up(VK_LWIN)],
-                vec!["first"],
-            ),
-            (
-                "after recovery a chord is still a chord",
+                "Win+L, key-ups lost, reset: chords stay chords",
                 vec![
                     Down(VK_LWIN),
                     Down(L),
                     LoseUp(L),
                     LoseUp(VK_LWIN),
+                    Reset,
                     Down(VK_LWIN),
                     Down(E),
                     Up(E),
                     Up(VK_LWIN),
                 ],
                 vec![],
+            ),
+            (
+                "missed reset, stale Win side: first press is a repeat and passes",
+                vec![
+                    Down(VK_LWIN),
+                    Down(E),
+                    LoseUp(E),
+                    LoseUp(VK_LWIN),
+                    Down(E),
+                    Up(E),
+                    Down(VK_LWIN),
+                    Up(VK_LWIN),
+                    Down(VK_LWIN),
+                    Up(VK_LWIN),
+                ],
+                vec!["first"],
+            ),
+            (
+                "missed reset, stale other side: passes until that side goes up",
+                vec![
+                    Down(VK_LWIN),
+                    LoseUp(VK_LWIN),
+                    Down(VK_RWIN),
+                    Up(VK_RWIN),
+                    Down(VK_RWIN),
+                    Up(VK_RWIN),
+                    Down(VK_LWIN),
+                    Up(VK_LWIN),
+                    Down(VK_RWIN),
+                    Up(VK_RWIN),
+                ],
+                vec!["first"],
+            ),
+            (
+                "missed reset, stale non-Win key: taps pass until it is pressed and released",
+                vec![
+                    Down(CTRL),
+                    LoseUp(CTRL),
+                    Down(VK_LWIN),
+                    Up(VK_LWIN),
+                    Down(VK_LWIN),
+                    Up(VK_LWIN),
+                    Down(CTRL),
+                    Up(CTRL),
+                    Down(VK_LWIN),
+                    Up(VK_LWIN),
+                ],
+                vec!["first"],
             ),
             (
                 "reset mid-hold, then a tap",

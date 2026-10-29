@@ -6,7 +6,7 @@ use crate::{
     },
     config::{Hotkey, SuperTapConfig, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
     foreground::IS_FOREGROUND_IN_BLACKLIST,
-    super_key::{KeyStateProbe, SuperTap, TapOutcome, VK_LWIN, VK_RWIN},
+    super_key::{SuperTap, TapOutcome, VK_LWIN, VK_RWIN},
 };
 
 use anyhow::{anyhow, bail, Result};
@@ -23,9 +23,8 @@ use windows::Win32::{
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-            KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY,
-            VK_CONTROL, VK_ESCAPE,
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+            KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW,
@@ -132,11 +131,16 @@ static HOOK: LazyLock<HookShared> = LazyLock::new(HookShared::new);
 /// At most one listener (or detached hook thread) may own `HOOK` at a time.
 static LISTENER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Tells the hook that key-ups may have been lost (the session was locked or
-/// unlocked, so input went to the secure desktop). Never blocks: the hook
-/// drops its physical key state on its next event. Safe to call at any time.
-pub fn reset_input_state() {
+/// Tells the hook that key-ups may have been lost (session lock/unlock, a
+/// switch to the secure desktop). Never blocks: the hook drops its physical
+/// key state on its next event. Safe to call at any time, from any thread.
+///
+/// This is the hook's only recovery from lost key-ups. It never consults
+/// `GetAsyncKeyState`, which reports an injected key-up exactly like a
+/// physical one and so would let injected input change hook decisions.
+pub fn reset_input_state(reason: &str) {
     HOOK.epoch.fetch_add(1, Ordering::AcqRel);
+    info!("input reset: {reason}");
 }
 
 /// Owns the dedicated thread that installs `WH_KEYBOARD_LL` and pumps its
@@ -545,12 +549,12 @@ trait StartReplay {
 }
 
 /// Everything the hook needs from the system besides the action sink.
-trait HookIo: KeyInjector + KeyStateProbe + StartReplay {}
+trait HookIo: KeyInjector + StartReplay {}
 
-impl<T: KeyInjector + KeyStateProbe + StartReplay> HookIo for T {}
+impl<T: KeyInjector + StartReplay> HookIo for T {}
 
-/// Production `HookIo`: `SendInput`, `GetAsyncKeyState`, and a thread message
-/// to the current (hook) thread.
+/// Production `HookIo`: `SendInput`, and a thread message to the current
+/// (hook) thread.
 struct SystemIo;
 
 impl KeyInjector for SystemIo {
@@ -565,12 +569,6 @@ impl KeyInjector for SystemIo {
             warn!("injected {sent} of {count} modifier mask events");
         }
         sent
-    }
-}
-
-impl KeyStateProbe for SystemIo {
-    fn is_down(&self, vk: u8) -> bool {
-        (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
     }
 }
 
@@ -758,29 +756,6 @@ impl KeyboardState {
         }
     }
 
-    /// Ends a modifier hold whose key-ups were lost: Windows reports none of
-    /// its sides down although the hook still believes it is held. Posts the
-    /// hold's release actions as a real release would.
-    fn heal_hold(&mut self, hold: usize, probe: &impl KeyStateProbe, sink: &mut impl ActionSink) {
-        if !self.holds[hold].sides.is_down() {
-            return;
-        }
-        let vks: &[u8] = match self.holds[hold].modifier {
-            [0x5b, 0x5c] => &[VK_LWIN, VK_RWIN],
-            [0x38, 0x38] => &[0x12], // VK_MENU, either Alt
-            [0x1d, 0x1d] => &[0x11], // VK_CONTROL, either Ctrl
-            _ => return,
-        };
-        if vks.iter().any(|vk| probe.is_down(*vk)) {
-            return;
-        }
-        let state = &mut self.holds[hold];
-        state.sides = SidesDown::default();
-        state.is_masked = false;
-        state.is_owned = false;
-        self.end_holds(1 << hold, sink);
-    }
-
     fn end_holds(&mut self, ended_holds: u32, sink: &mut impl ActionSink) {
         for state in self.hotkeys.iter_mut() {
             if ended_holds & (1 << state.hold) == 0 {
@@ -848,7 +823,7 @@ impl KeyboardState {
         let reverse = self.shift.is_down();
 
         let tap = match self.super_tap.as_mut() {
-            Some(super_tap) => super_tap.on_key(event.vk, event.is_pressed, event.time, io),
+            Some(super_tap) => super_tap.on_key(event.vk, event.is_pressed, event.time),
             None => None,
         };
         let is_modifier = self.handle_modifier_key(event, sink);
@@ -857,18 +832,6 @@ impl KeyboardState {
         }
         if is_modifier || event.vk == VK_LWIN || event.vk == VK_RWIN {
             return false;
-        }
-
-        if event.is_pressed {
-            // A hotkey press with its modifier believed held: make sure the
-            // modifier really is held, so a lost key-up can never turn a plain
-            // key into a switch.
-            for index in 0..self.hotkeys.len() {
-                if self.hotkeys[index].hotkey.code == event.scan_code {
-                    let hold = self.hotkeys[index].hold;
-                    self.heal_hold(hold, io, sink);
-                }
-            }
         }
 
         for index in 0..self.hotkeys.len() {
@@ -1118,7 +1081,6 @@ mod tests {
     };
     use crate::config::SuperTapConfig;
     use crate::config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID};
-    use crate::super_key::KeyStateProbe;
     use parking_lot::MutexGuard;
     use std::collections::VecDeque;
     use std::sync::{atomic::Ordering, mpsc};
@@ -1180,44 +1142,15 @@ mod tests {
     /// call inserts the next scripted count, or everything once the script is
     /// exhausted. With `fail_up`, every mask key-up fails forever.
     ///
-    /// Key state: `async_down` is what `GetAsyncKeyState` would report. The
-    /// harness updates it after the hook has seen each event, as Windows does.
-    ///
     /// Start replay: counts requests; `fail_replay` makes them fail.
+    #[derive(Default)]
     struct FakeInjector {
         script: VecDeque<usize>,
         fail_up: bool,
         requests: Vec<Vec<MaskKey>>,
         inserted: Vec<MaskKey>,
-        async_down: [bool; 256],
         replays: usize,
         fail_replay: bool,
-    }
-
-    impl Default for FakeInjector {
-        fn default() -> Self {
-            Self {
-                script: VecDeque::new(),
-                fail_up: false,
-                requests: vec![],
-                inserted: vec![],
-                async_down: [false; 256],
-                replays: 0,
-                fail_replay: false,
-            }
-        }
-    }
-
-    impl KeyStateProbe for FakeInjector {
-        fn is_down(&self, vk: u8) -> bool {
-            let any = |sides: [u8; 2]| sides.iter().any(|vk| self.async_down[*vk as usize]);
-            match vk {
-                0x10 => any([0xA0, 0xA1]),
-                0x11 => any([0xA2, 0xA3]),
-                0x12 => any([0xA4, 0xA5]),
-                _ => self.async_down[vk as usize],
-            }
-        }
     }
 
     impl StartReplay for FakeInjector {
@@ -1375,11 +1308,6 @@ mod tests {
             self.now = self.now.wrapping_add(ms);
         }
 
-        /// The key goes up while the hook cannot see it (secure desktop).
-        fn lose_up(&mut self, scan_code: u32, is_extended: bool) {
-            self.injector.async_down[vk_of(scan_code, is_extended) as usize] = false;
-        }
-
         fn state(&self) -> MutexGuard<'_, KeyboardState> {
             self.shared.state.lock()
         }
@@ -1387,20 +1315,20 @@ mod tests {
         /// Feeds one raw hook event through the same entry point as the real
         /// hook, including the injected-input filter.
         fn raw(&mut self, mut data: KBDLLHOOKSTRUCT) -> bool {
-            self.now = self.now.wrapping_add(10);
+            // Only physical events advance the clock, so a run with injected
+            // events interleaved sees exactly the same physical timestamps.
+            if data.flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) == 0 {
+                self.now = self.now.wrapping_add(10);
+            }
             data.time = self.now;
             let sink = &mut self.sink;
-            let consumed = handle_hook_data(
+            handle_hook_data(
                 &self.shared,
                 &data,
                 self.blacklisted,
                 move |_| sink,
                 &mut self.injector,
-            );
-            // Windows' key state changes only after the hooks have seen the
-            // event, injected or not.
-            self.injector.async_down[data.vkCode as usize & 0xFF] = data.flags.0 & LLKHF_UP.0 == 0;
-            consumed
+            )
         }
 
         /// A key event without injected flags, as a physical key produces.
@@ -2828,13 +2756,13 @@ mod tests {
     }
 
     #[test]
-    fn lost_key_ups_heal_so_the_next_tap_works_and_chords_stay_native() {
-        // Win+L locks the PC; the lock screen swallows both key-ups.
+    fn reset_after_lost_key_ups_makes_the_next_tap_clean_and_chords_native() {
+        // Win+L locks the PC; the lock screen takes both key-ups, then the
+        // session notification bumps the epoch.
         let mut h = Harness::with_overview(400);
         h.down_ext(LWIN);
         assert!(!h.down(L));
-        h.lose_up(L, false);
-        h.lose_up(LWIN, true);
+        h.bump_epoch();
         h.wait(30_000);
         assert_eq!(h.win_tap(LWIN), [false, false]);
         assert_eq!(h.taps(), vec!["toggle"], "first tap after unlock");
@@ -2854,51 +2782,215 @@ mod tests {
     }
 
     #[test]
-    fn session_lock_epoch_resets_tap_and_hotkey_holds() {
-        // Mid-tap.
-        let mut h = Harness::with_overview(400);
-        h.down_ext(LWIN);
-        h.down(L);
-        h.lose_up(L, false);
-        h.lose_up(LWIN, true);
-        h.bump_epoch();
-        h.win_tap(RWIN);
-        assert_eq!(h.taps(), vec!["toggle"]);
-
+    fn reset_ends_hotkey_holds_without_posting() {
         // Mid-switch: Alt's key-up is lost; after the reset Tab is plain Tab.
         let mut h = Harness::with_overview(400);
         h.down(ALT);
         assert!(h.tap(TAB));
-        h.lose_up(ALT, false);
         h.bump_epoch();
         assert!(!h.tap(TAB), "plain Tab consumed after the reset");
         assert_eq!(h.sink.posted, vec![SwitchApps { reverse: false }]);
         assert_eq!(h.injector.requests, vec![vec![Down, Up]]);
-    }
-
-    #[test]
-    fn stale_modifier_holds_heal_before_a_hotkey_fires() {
-        // Without a lock notification: the lost Alt key-up is noticed on the
-        // next Tab press, which then commits the switch it ended.
-        let mut h = Harness::new();
-        h.down(ALT);
-        assert!(h.tap(TAB));
-        h.lose_up(ALT, false);
-        assert!(!h.tap(TAB), "plain Tab consumed with a stale Alt");
-        assert_eq!(
-            h.sink.posted,
-            vec![SwitchApps { reverse: false }, SwitchAppsDone]
-        );
 
         // A stale Win side must not turn plain Tab into win+tab.
         for win in [LWIN, RWIN] {
-            let mut h = Harness::with_hotkeys(["win+`", "win+tab"]);
+            let mut h = Harness::with_hotkeys_and_overview(["win+`", "win+tab"]);
             h.down_ext(win);
-            h.lose_up(win, true);
-            assert!(!h.tap(TAB), "{win:#x}: plain Tab consumed with a stale Win");
+            h.bump_epoch();
+            assert!(!h.tap(TAB), "{win:#x}: plain Tab consumed after the reset");
             assert!(!h.tap(BACKTICK));
             assert!(h.sink.posted.is_empty());
             assert!(h.injector.requests.is_empty());
+        }
+    }
+
+    #[test]
+    fn missed_reset_only_ever_fails_open_to_native_start() {
+        // Stale Win side (its key-up went to an elevated window): the next
+        // press is taken as a repeat, so that tap is left to Windows; the one
+        // after it works.
+        let mut h = Harness::with_overview(400);
+        h.down_ext(LWIN);
+        h.tap(E);
+        assert_eq!(h.win_tap(LWIN), [false, false]);
+        assert!(h.sink.posted.is_empty() && h.injector.requests.is_empty());
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+
+        // Stale non-Win key: taps are left to Windows until it is pressed and
+        // released again.
+        let mut h = Harness::with_overview(400);
+        h.down(CTRL);
+        for _ in 0..3 {
+            assert_eq!(h.win_tap(LWIN), [false, false]);
+            h.wait(1_000);
+        }
+        assert!(h.sink.posted.is_empty() && h.injector.requests.is_empty());
+        h.tap(CTRL);
+        h.win_tap(LWIN);
+        assert_eq!(h.taps(), vec!["toggle"]);
+    }
+
+    #[test]
+    fn injected_key_up_does_not_make_a_chord_look_clean() {
+        for flags in INJECTED_VARIANTS {
+            let mut h = Harness::with_overview(400);
+            h.down(SHIFT);
+            assert!(!h.raw(hook_data(SHIFT, false, false, flags)));
+            h.win_tap(LWIN);
+            h.up(SHIFT);
+            assert!(
+                h.sink.posted.is_empty(),
+                "{flags:#x}: Shift+Win became a tap"
+            );
+            assert!(h.injector.requests.is_empty(), "{flags:#x}: masked");
+        }
+    }
+
+    /// Builds a fresh harness for one run.
+    type Build = fn() -> Harness;
+
+    /// One step of a physical sequence.
+    #[derive(Clone, Copy, Debug)]
+    enum Phys {
+        Key(u32, bool, bool),
+        Wait(u32),
+    }
+
+    /// What the hook decided for a run: whether each physical event was
+    /// consumed, the actions posted, the injection requests, Start replays.
+    type Decisions = (Vec<bool>, Vec<HotKeyAction>, Vec<Vec<MaskKey>>, usize);
+
+    fn run_physical(
+        build: Build,
+        steps: &[Phys],
+        injected: Option<(usize, u32, bool, bool, u32)>,
+    ) -> Decisions {
+        let mut h = build();
+        let mut consumed = vec![];
+        for index in 0..=steps.len() {
+            if let Some((at, key, ext, is_pressed, flags)) = injected {
+                if at == index {
+                    assert!(
+                        !h.raw(hook_data(key, ext, is_pressed, flags)),
+                        "injected consumed"
+                    );
+                }
+            }
+            match steps.get(index) {
+                Some(Phys::Key(key, ext, is_pressed)) => {
+                    consumed.push(h.event(*key, *ext, *is_pressed))
+                }
+                Some(Phys::Wait(ms)) => h.wait(*ms),
+                None => {}
+            }
+        }
+        (
+            consumed,
+            h.sink.posted,
+            h.injector.requests,
+            h.injector.replays,
+        )
+    }
+
+    #[test]
+    fn injected_events_never_change_any_decision() {
+        use Phys::{Key, Wait};
+        let tap = |win| [Key(win, true, true), Key(win, true, false)];
+        let sequences: Vec<(&str, Vec<Phys>)> = vec![
+            ("LWin tap", tap(LWIN).to_vec()),
+            (
+                "double tap",
+                [&tap(LWIN)[..], &[Wait(100)], &tap(LWIN)].concat(),
+            ),
+            (
+                "RWin then LWin",
+                [&tap(RWIN)[..], &[Wait(1_000)], &tap(LWIN)].concat(),
+            ),
+            (
+                "Win+E",
+                vec![
+                    Key(LWIN, true, true),
+                    Key(E, false, true),
+                    Key(E, false, false),
+                    Key(LWIN, true, false),
+                ],
+            ),
+            (
+                "Shift then Win",
+                vec![
+                    Key(SHIFT, false, true),
+                    Key(LWIN, true, true),
+                    Key(LWIN, true, false),
+                    Key(SHIFT, false, false),
+                ],
+            ),
+            (
+                "Alt+Tab+Tab",
+                vec![
+                    Key(ALT, false, true),
+                    Key(TAB, false, true),
+                    Key(TAB, false, false),
+                    Key(TAB, false, true),
+                    Key(TAB, false, false),
+                    Key(ALT, false, false),
+                ],
+            ),
+            (
+                "Alt+Tab, Esc",
+                vec![
+                    Key(ALT, false, true),
+                    Key(TAB, false, true),
+                    Key(TAB, false, false),
+                    Key(ESC, false, true),
+                    Key(ESC, false, false),
+                    Key(ALT, false, false),
+                ],
+            ),
+            (
+                "Win+Tab",
+                vec![
+                    Key(LWIN, true, true),
+                    Key(TAB, false, true),
+                    Key(TAB, false, false),
+                    Key(LWIN, true, false),
+                ],
+            ),
+        ];
+        let harnesses: [(&str, Build); 3] = [
+            ("overview", || Harness::with_overview(400)),
+            ("disabled", Harness::new),
+            ("win hotkeys + overview", || {
+                Harness::with_hotkeys_and_overview(["win+`", "win+tab"])
+            }),
+        ];
+        for (harness, build) in harnesses {
+            for (name, steps) in &sequences {
+                let baseline = run_physical(build, steps, None);
+                let mut keys = vec![(LWIN, true), (RWIN, true), (SHIFT, false), (ALT, false)];
+                for step in steps {
+                    if let Key(key, ext, _) = step {
+                        if !keys.contains(&(*key, *ext)) {
+                            keys.push((*key, *ext));
+                        }
+                    }
+                }
+                for flags in INJECTED_VARIANTS {
+                    for at in 0..=steps.len() {
+                        for (key, ext) in &keys {
+                            for is_pressed in [true, false] {
+                                let injected = Some((at, *key, *ext, is_pressed, flags));
+                                assert_eq!(
+                                    run_physical(build, steps, injected),
+                                    baseline,
+                                    "{harness}, {name}: injected {key:#x} pressed={is_pressed} \
+                                     flags={flags:#x} before step {at}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
