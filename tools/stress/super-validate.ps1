@@ -30,9 +30,10 @@
           must do its native thing and log no overview action.
       [3] Win+L lock/unlock, optional UAC prompt, Ctrl+Alt+Del > Cancel:
           each must log an input reset, and the next tap must work.
-      [4] Elevated foreground (Task Manager): Windows sends a non-elevated
-          WinOrbit no keys there, so Start must open natively and nothing is
-          logged.
+      [4] Elevated foreground (Task Manager): opening it with Ctrl+Shift+Esc
+          must reset input (its key-ups are lost), the next tap must work;
+          Windows sends a non-elevated WinOrbit no keys there, so a tap in it
+          opens Start natively and nothing is logged.
       [5] Exit and relaunch: exit code 0, tap works again; with WinOrbit
           exited a tap opens Start natively.
       [6] Disabled: a copy run with [overview] enable = no; taps open Start.
@@ -46,12 +47,18 @@
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File super-validate.ps1 -Exe .\winorbit.exe
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File super-validate.ps1 -Exe .\winorbit.exe -Only 4
 #>
 param(
     [Parameter(Mandatory = $true)] [string] $Exe,
     [switch] $SkipUac,
-    [switch] $SkipLock
+    [switch] $SkipLock,
+    # Run only these sections (1-6), e.g. -Only 4. Default: all.
+    [int[]] $Only
 )
+
+function Want([int] $section) { return (-not $Only) -or ($Only -contains $section) }
 
 $ErrorActionPreference = 'Stop'
 $failures = New-Object System.Collections.Generic.List[string]
@@ -398,6 +405,8 @@ try {
     Write-Host "`nWinOrbit started. Keep this window focused unless a step says otherwise."
     Write-Host "When Start opens, the script closes it with Esc."
 
+    if ($Only) { Write-Host ("Sections: {0}" -f ($Only -join ', ')) }
+    if (Want 1) {
     Write-Host "`n[1] Clean taps"
     Invoke-Trial 'LWin tap' 'tap the LEFT Windows key once' 1 $false 1 0
     Invoke-Trial 'RWin tap' 'tap the RIGHT Windows key once (no right Win key? wait 15 s to skip)' 1 $false 1 0 -seconds 15 -Optional
@@ -407,7 +416,9 @@ try {
     Invoke-Trial 'tap closes open Start' 'double-tap the LEFT Windows key (Start opens), wait a second, tap it once more (Start must close)' 3 $true 1 1 'Did your last tap close Start?' -ExpectStartClosedAtEnd
     Invoke-Trial 'two slow taps' 'tap the LEFT Windows key, wait about 2 seconds, tap it again' 2 $false 2 0
     Invoke-Trial 'Shift held, Win tap' 'hold Shift, tap the LEFT Windows key, release Shift' 1 $false 0 0
+    }
 
+    if (Want 2) {
     Write-Host "`n[2] Native chords (each must do its normal Windows thing; undo it afterwards)"
     $chords = @(
         @('Win+E', 'press Win+E (Explorer opens; close it)', 'Did Explorer open?'),
@@ -425,8 +436,9 @@ try {
         $releases = if ($chord[0] -in @('Win+D', 'Win+Ctrl+O')) { 2 } else { 1 }
         Invoke-Trial $chord[0] $chord[1] $releases $false 0 0 $chord[2] -seconds 90
     }
+    }
 
-    if (-not $SkipLock) {
+    if ((Want 3) -and -not $SkipLock) {
         Write-Host "`n[3] Win+L lock/unlock"
         Invoke-Trial 'Win+L' 'press Win+L, sign back in, come back here' 0 $false 0 0 -ExpectReset
         Invoke-Trial 'tap after unlock' 'tap the LEFT Windows key once' 1 $false 1 0
@@ -443,12 +455,17 @@ try {
         Invoke-Trial 'Alt+Tab after the interrupted switch' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch normally?' -expectCommits 1
     }
 
+    if (Want 4) {
     Write-Host "`n[4] Elevated foreground"
-    Write-Host "  Windows sends a non-elevated WinOrbit no keys while an elevated window (Task Manager) is focused."
-    [void](Read-Host "  >>> First open Task Manager (Ctrl+Shift+Esc), click back into this window, then press Enter")
-    Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key ONCE (Start opens natively), then CLICK this window (Start closes)' 0 $true 0 0 -NoMeasure
+    Write-Host "  Windows sends a non-elevated WinOrbit no keys while an elevated window (Task Manager) is focused;"
+    Write-Host "  WinOrbit resets its key state when focus moves there."
+    Invoke-Trial 'open Task Manager' 'open Task Manager with Ctrl+Shift+Esc, then CLICK back into this window' 0 $false 0 0 -ExpectReset
+    Invoke-Trial 'tap after Ctrl+Shift+Esc' 'tap the LEFT Windows key once' 1 $false 1 0
+    Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key ONCE (Start opens natively), then CLICK this window (Start closes)' 0 $true 0 0 -NoMeasure -ExpectReset
     Invoke-Trial 'tap back here' 'tap the LEFT Windows key once' 1 $false 1 0
+    }
 
+    if (Want 5) {
     Write-Host "`n[5] Exit and relaunch"
     [V]::Stop(); $observerStarted = $false
     $stop = Stop-App $app; $app = $null
@@ -467,7 +484,10 @@ try {
     Invoke-Trial 'after relaunch' 'tap the LEFT Windows key once' 1 $false 1 0
     $stop = Stop-App $app; $app = $null
     Check 'second exit' 'exit code' 0 $stop.Code
+    }
 
+    if (Want 6) {
+    if ($app) { [void](Stop-App $app); $app = $null }
     Write-Host "`n[6] Disabled ([overview] enable = no)"
     $disabledDir = Join-Path (Split-Path $Exe) 's06d-disabled'
     New-Item -ItemType Directory -Force -Path $disabledDir | Out-Null
@@ -487,6 +507,7 @@ try {
     Invoke-Trial 'disabled Win+E' 'press Win+E (Explorer opens; close it)' 1 $false 0 0 'Did Explorer open?' -logPath $disabledLog
     $stop = Stop-App $app; $app = $null
     Check 'disabled exit' 'exit code' 0 $stop.Code
+    }
 } catch {
     $failures.Add("aborted: $_")
 } finally {
