@@ -7,10 +7,12 @@ extern crate log;
 mod app;
 mod config;
 mod foreground;
+mod input_reset;
 mod keyboard;
 mod painter;
 mod preview;
 mod startup;
+mod super_key;
 mod switch_apps;
 mod trayicon;
 

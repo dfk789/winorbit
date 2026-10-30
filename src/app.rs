@@ -1,6 +1,7 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
-use crate::keyboard::KeyboardListener;
+use crate::input_reset::{decide_super_tap, InputResetWatcher, ResetReason, SuperTapDecision};
+use crate::keyboard::{reset_input_state, KeyboardListener};
 use crate::painter::{find_clicked_app_index, GdiAAPainter};
 use crate::preview::{PreviewSource, WindowPreviewSource};
 use crate::startup::Startup;
@@ -25,8 +26,9 @@ use windows::Win32::{
         LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
         SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
         HICON, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONUP,
-        WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST,
+        WM_NCHITTEST, WM_RBUTTONUP, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_LOCK,
+        WTS_SESSION_UNLOCK,
     },
 };
 
@@ -38,6 +40,15 @@ pub const WM_USER_SWITCH_APPS_DONE: u32 = 6011;
 pub const WM_USER_SWITCH_APPS_CANCEL: u32 = 6012;
 pub const WM_USER_SWITCH_WINDOWS: u32 = 6020;
 pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
+/// Clean bare Win tap (Start suppressed); `lparam` is the key-up's
+/// `KBDLLHOOKSTRUCT.time`. Only logged until the overview exists.
+pub const WM_USER_OVERVIEW_TOGGLE: u32 = 6030;
+/// Clean bare Win tap within `double_tap_ms` of a delivered toggle; Start was
+/// suppressed too. `lparam` as above. Only logged until the overview exists.
+pub const WM_USER_OVERVIEW_SECOND_TAP: u32 = 6031;
+/// Input was reset (desktop switch, elevated focus; `wparam` is a
+/// `ResetReason`): cancel any open switcher. The hook is already reset.
+pub const WM_USER_INPUT_RESET: u32 = 6040;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -62,6 +73,9 @@ pub struct App {
     painter: GdiAAPainter,
     /// Owned by the app so it is stopped before the app state is freed.
     keyboard_listener: KeyboardListener,
+    /// Lock/unlock and desktop-switch signals; unregistered when the app is
+    /// freed after the message loop, on this thread.
+    _input_reset: InputResetWatcher,
 }
 
 impl App {
@@ -69,16 +83,44 @@ impl App {
         let hwnd = Self::create_window()?;
         let painter = GdiAAPainter::new(hwnd)?;
 
-        let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
-        let keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
+        let is_admin = is_running_as_admin()?;
+        debug!("is_admin {is_admin}");
+
+        // Every reset signal is installed before the keyboard hook starts, so
+        // whether bare Win taps may be owned is known up front.
+        let input_reset = InputResetWatcher::init(hwnd);
+        // Not elevated: Windows hides input from the hook while an elevated
+        // window is focused, so focus moving there must reset key state.
+        let foreground_watcher = ForegroundWatcher::init(
+            &config.switch_windows_blacklist,
+            config.overview.super_tap().is_some(),
+            !is_admin,
+        )?;
+        if let Some(error) = &config.overview.error {
+            warn!("{error}");
+        }
+        let super_tap = decide_super_tap(
+            config.overview.super_tap(),
+            input_reset.observers(foreground_watcher.is_watching()),
+        );
+        match &super_tap {
+            SuperTapDecision::NotRequested => {}
+            SuperTapDecision::Enabled(_) => info!(
+                "bare Win taps owned; Start detection: {}",
+                foreground_watcher.start_tracking().describe()
+            ),
+            SuperTapDecision::Unsafe(missing) => warn!(
+                "bare Win taps left to Windows: cannot watch {}",
+                missing.join(", ")
+            ),
+        }
+        let keyboard_listener =
+            KeyboardListener::init(hwnd, &config.to_hotkeys(), super_tap.config())?;
 
         let trayicon = match config.trayicon {
             true => Some(TrayIcon::create()),
             false => None,
         };
-
-        let is_admin = is_running_as_admin()?;
-        debug!("is_admin {is_admin}");
 
         let startup = Startup::init(is_admin)?;
 
@@ -96,6 +138,7 @@ impl App {
             cached_icons: Default::default(),
             painter,
             keyboard_listener,
+            _input_reset: input_reset,
         };
 
         app.set_trayicon();
@@ -268,6 +311,38 @@ impl App {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
                 let app = get_app(hwnd)?;
                 app.switch_windows_state.modifier_released = true;
+            }
+            WM_USER_OVERVIEW_TOGGLE => {
+                info!("bare Win tap (time {}): overview toggle", lparam.0 as u32);
+            }
+            WM_USER_OVERVIEW_SECOND_TAP => {
+                info!(
+                    "bare Win second tap (time {}): overview second tap",
+                    lparam.0 as u32
+                );
+            }
+            WM_WTSSESSION_CHANGE => {
+                let event = wparam.0 as u32;
+                let reason = match event {
+                    WTS_SESSION_LOCK => Some("session lock"),
+                    WTS_SESSION_UNLOCK => Some("session unlock"),
+                    WTS_CONSOLE_CONNECT => Some("console connect"),
+                    WTS_REMOTE_CONNECT => Some("remote connect"),
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    // Already a window message: reset the hook first thing.
+                    reset_input_state(reason);
+                    get_app(hwnd)?.cancel_after_input_reset();
+                }
+            }
+            WM_USER_INPUT_RESET => {
+                // The signal already reset the hook (`input_reset`); only the
+                // UI side is left, so no second epoch bump here.
+                if let Some(reason) = ResetReason::from_wparam(wparam.0) {
+                    debug!("cancelling switcher after: {}", reason.describe());
+                    get_app(hwnd)?.cancel_after_input_reset();
+                }
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
@@ -504,6 +579,14 @@ impl App {
             }
             self.painter.unpaint(state);
         }
+    }
+
+    /// After an input reset (already applied to the hook): any open switcher
+    /// is cancelled because the release that would commit it can no longer
+    /// arrive.
+    fn cancel_after_input_reset(&mut self) {
+        self.cancel_switch_app();
+        self.switch_windows_state.modifier_released = true;
     }
 
     fn cancel_switch_app(&mut self) {

@@ -1,0 +1,762 @@
+<#
+.SYNOPSIS
+    Physical-keyboard validation of WinOrbit's bare Win/Super tap handling
+    (TASK-S06D).
+
+.DESCRIPTION
+    Starts the given winorbit.exe and walks you through prompts on your real
+    keyboard. Each trial checks, without asking you, what can be measured:
+
+      * whether Start (StartMenuExperienceHost / SearchHost) came to the
+        foreground,
+      * how many overview actions WinOrbit logged ("bare Win tap" and
+        "bare Win second tap" lines in its log),
+
+    and asks you what cannot be measured (did Start flash, did the native
+    shortcut do its thing). A trial fails if either disagrees with the
+    expectation.
+
+    The script installs its own WH_KEYBOARD_LL hook only to OBSERVE: it never
+    consumes or injects into the key stream it watches, and is used only to
+    notice when you have released the Windows key. It is installed after
+    WinOrbit's hook, so Windows calls it first; it passes every event on.
+    It asks you to press Esc when Start is open, and injects only key-ups
+    for anything still down at the end (and Esc if you do not close Start
+    within 30 s).
+
+    Trials:
+      [1] Clean taps: LWin, RWin (skippable), 2 s hold, 10 taps, double and
+          triple tap (all owned: Start never opens), Ctrl+Esc opens Start and
+          a tap closes it, two slow taps, Shift held + Win.
+      [2] Native chord matrix: Win+E/D/R/X/1/A/Shift+S/Ctrl+O/Tab/Left. Each
+          must do its native thing and log no overview action.
+      [3] Win+L lock/unlock, optional UAC prompt, Ctrl+Alt+Del > Cancel:
+          each must log an input reset; the first Win tap after it is native
+          (probation), the next one owned.
+      [4] Elevated foreground (Task Manager): opening it with Ctrl+Shift+Esc
+          resets input, the first tap after it is native, the next owned;
+          Windows sends a non-elevated WinOrbit no keys in Task Manager, so a
+          tap there opens Start natively and nothing is logged.
+      [5] Exit and relaunch: exit code 0; with WinOrbit exited a tap opens
+          Start natively; WinOrbit started while Start is open sees it, and
+          a tap closes Start; taps are owned again afterwards.
+      [6] Disabled: a copy run with [overview] enable = no; taps open Start.
+      [7] Regression: Alt+Tab (one commit, no input reset), Alt+`, and a tap
+          right after Win+Left (hidden SearchHost must not make it native).
+      [8] No Win, Shift, Ctrl, Alt or vkE8 key left down.
+
+    Exit code: 0 only if every trial passed and the run completed.
+
+    Requirements: WinOrbit not running; winorbit.ini next to the exe with
+    [overview] enable = yes, double_tap_ms = 400, and [log] level = debug or
+    info with a path. Run from a NON-elevated terminal.
+
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File super-validate.ps1 -Exe .\winorbit.exe
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File super-validate.ps1 -Exe .\winorbit.exe -Only 4
+#>
+param(
+    [Parameter(Mandatory = $true)] [string] $Exe,
+    [switch] $SkipUac,
+    [switch] $SkipLock,
+    # Run only these sections (1-7), e.g. -Only 4 or -Only 1,3,4. Default: all.
+    # A string, because powershell -File passes "1,3,4" as one argument.
+    [string] $Only = ''
+)
+
+$OnlySections = @($Only -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { [int]$_ })
+if ($Only -and ($OnlySections.Count -eq 0 -or @($OnlySections | Where-Object { $_ -lt 1 -or $_ -gt 7 }).Count)) {
+    throw "-Only must list sections 1-7, e.g. -Only 1,3,4"
+}
+function Want([int] $section) { return ($OnlySections.Count -eq 0) -or ($OnlySections -contains $section) }
+
+$ErrorActionPreference = 'Stop'
+$failures = New-Object System.Collections.Generic.List[string]
+$stamp = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
+$log = Join-Path (Get-Location) "winorbit-s06d-validate-$stamp.log"
+$transcriptStarted = $false
+$helperLoaded = $false
+$observerStarted = $false
+$app = $null
+$exitCode = 1
+$hiddenStartSeen = New-Object System.Collections.Generic.HashSet[string]
+$runOffset = $null
+$doubleTapMs = 0
+$WM_COMMAND = 0x0111; $IDM_EXIT = 1
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public static class V {
+    delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    struct KBDLLHOOKSTRUCT { public uint vkCode; public uint scanCode; public uint flags; public uint time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; }
+
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr hMod, uint threadId);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
+    [DllImport("user32.dll")] static extern bool PostThreadMessage(uint threadId, uint msg, IntPtr w, IntPtr l);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string name);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
+
+    const uint LLKHF_INJECTED = 0x10, LLKHF_LOWER_IL_INJECTED = 0x02, LLKHF_UP = 0x80;
+    static readonly HookProc Proc = Callback;
+    static IntPtr hook = IntPtr.Zero;
+    static uint threadId;
+    static Thread thread;
+    static bool lwin, rwin;
+    // Physical non-Win keys down, for telling a clean Win hold from a chord.
+    static bool[] keys = new bool[256];
+    static uint holdDown;
+    static bool holdClean, holdAfterKey, keySinceRelease;
+    static bool altTab;
+    static readonly object gate = new object();
+    static System.Collections.Generic.List<uint[]> holds = new System.Collections.Generic.List<uint[]>();
+
+    // Physical Win holds that ended (last Win key released).
+    public static volatile int WinReleases;
+    // Physical non-Win key presses seen while a Win key was held.
+    public static volatile int ChordKeys;
+    // Physical Alt holds in which Tab was pressed.
+    public static volatile int AltTabHolds;
+
+    static bool AnyKeyDown() { foreach (bool k in keys) if (k) return true; return false; }
+    static bool AltDown() { return keys[0xA4] || keys[0xA5] || keys[0x12]; }
+
+    // Physical Win holds since ResetWin, oldest first: { down time, up time,
+    // clean (1: nothing else down or pressed during it), 1 if another key
+    // went down or up since the previous hold }. Times are KBDLLHOOKSTRUCT.time.
+    public static uint[][] Holds() { lock (gate) { return holds.ToArray(); } }
+
+    static IntPtr Callback(int code, IntPtr wParam, IntPtr lParam) {
+        if (code >= 0) {
+            KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+            bool injected = (k.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) != 0;
+            bool up = (k.flags & LLKHF_UP) != 0;
+            if (!injected) {
+                if (k.vkCode == 0x5B || k.vkCode == 0x5C) {
+                    bool wasHeld = lwin || rwin;
+                    bool sideWasDown = k.vkCode == 0x5B ? lwin : rwin;
+                    if (k.vkCode == 0x5B) lwin = !up; else rwin = !up;
+                    if (!up && !wasHeld) {
+                        holdDown = k.time;
+                        holdClean = !AnyKeyDown();
+                        holdAfterKey = keySinceRelease;
+                    } else if (!up && !sideWasDown) {
+                        holdClean = false; // the other Win side joined
+                    }
+                    if (up && wasHeld && !lwin && !rwin) {
+                        WinReleases++;
+                        keySinceRelease = false;
+                        lock (gate) { holds.Add(new uint[] { holdDown, k.time, holdClean ? 1u : 0u, holdAfterKey ? 1u : 0u }); }
+                    }
+                } else {
+                    // Any other key event, down or up, makes a Win hold a chord
+                    // and ends a double-tap pairing, as in WinOrbit.
+                    if (lwin || rwin) { holdClean = false; if (!up) ChordKeys++; }
+                    keySinceRelease = true;
+                    bool wasAlt = AltDown();
+                    keys[k.vkCode & 0xFF] = !up;
+                    if (k.vkCode == 0x09 && !up && AltDown()) altTab = true;
+                    if (wasAlt && !AltDown()) { if (altTab) AltTabHolds++; altTab = false; }
+                }
+            }
+        }
+        // Observer only: every event goes on unchanged.
+        return CallNextHookEx(hook, code, wParam, lParam);
+    }
+
+    public static void Start() {
+        ManualResetEvent ready = new ManualResetEvent(false);
+        string error = null;
+        thread = new Thread(() => {
+            hook = SetWindowsHookEx(13, Proc, GetModuleHandle(null), 0);
+            if (hook == IntPtr.Zero) error = "SetWindowsHookEx failed: " + Marshal.GetLastWin32Error();
+            threadId = GetCurrentThreadId();
+            ready.Set();
+            if (hook == IntPtr.Zero) return;
+            MSG msg;
+            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { }
+            UnhookWindowsHookEx(hook);
+        });
+        thread.IsBackground = true;
+        thread.Start();
+        ready.WaitOne();
+        if (error != null) throw new InvalidOperationException(error);
+    }
+
+    public static void Stop() {
+        if (thread == null) return;
+        PostThreadMessage(threadId, 0x0012, IntPtr.Zero, IntPtr.Zero);
+        thread.Join(2000);
+        thread = null;
+    }
+
+    public static void ResetWin() {
+        lwin = false; rwin = false; altTab = false; keySinceRelease = false;
+        keys = new bool[256];
+        lock (gate) { holds.Clear(); }
+    }
+
+    public static bool IsVisible(IntPtr hwnd) { return IsWindowVisible(hwnd); }
+
+    public static bool IsDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+    public static void Vk(byte vk, byte scan, bool up, bool extended) {
+        keybd_event(vk, scan, (up ? 2u : 0u) | (extended ? 1u : 0u), UIntPtr.Zero);
+    }
+
+    public static string Foreground() {
+        IntPtr hwnd = GetForegroundWindow();
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        StringBuilder cls = new StringBuilder(256);
+        GetClassName(hwnd, cls, 256);
+        string name = "?";
+        try { name = Process.GetProcessById((int)pid).ProcessName; } catch (Exception) { }
+        int cloaked = 0;
+        DwmGetWindowAttribute(hwnd, 14, out cloaked, 4); // DWMWA_CLOAKED
+        return name + " [" + cls + "]" + (IsWindowVisible(hwnd) ? "" : " invisible") + (cloaked != 0 ? " cloaked" : "");
+    }
+}
+"@
+$helperLoaded = $true
+
+function Get-IniValue([string] $ini, [string] $section, [string] $key) {
+    $current = ''
+    foreach ($line in Get-Content $ini) {
+        if ($line -match '^\s*\[(.+)\]\s*$') { $current = $Matches[1]; continue }
+        if ($current -eq $section -and $line -match "^\s*$key\s*=\s*(.*?)\s*$") { return $Matches[1] }
+    }
+    return ''
+}
+
+function Get-LogPath([string] $exePath) {
+    $ini = Join-Path (Split-Path $exePath) 'winorbit.ini'
+    $path = Get-IniValue $ini 'log' 'path'
+    $level = Get-IniValue $ini 'log' 'level'
+    if (-not $path -or $level -notin @('info', 'debug', 'trace')) {
+        throw "$ini must set [log] level = info or debug and a path; overview actions are read from the log"
+    }
+    if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path (Split-Path $exePath) $path }
+    return $path
+}
+
+function Get-LogLength([string] $path) {
+    if (Test-Path $path) { return (Get-Item $path).Length }
+    return 0
+}
+
+function Read-LogSince([string] $path, [long] $offset) {
+    if (-not (Test-Path $path)) { return '' }
+    $stream = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+    try {
+        [void]$stream.Seek($offset, 'Begin')
+        return (New-Object IO.StreamReader($stream)).ReadToEnd()
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+# The overview actions WinOrbit must log for the observed physical Win holds,
+# when it trusts its key state (outside probation) and Start is closed:
+# every clean hold is a tap; it is a second tap when it starts within the
+# double-tap window of a first tap's release with no other key in between.
+function Get-ExpectedTaps($holds, [int] $windowMs) {
+    $first = 0; $second = 0; $chords = 0; $anchor = $null
+    foreach ($h in $holds) {
+        if ($h[3] -eq 1) { $anchor = $null }
+        if ($h[2] -ne 1) { $chords++; $anchor = $null; continue }
+        if ($null -ne $anchor -and ((([int64]$h[0] - [int64]$anchor) + 4294967296) % 4294967296) -le $windowMs) {
+            $second++; $anchor = $null
+        } else {
+            $first++; $anchor = $h[1]
+        }
+    }
+    return @{ Toggle = $first; Second = $second; Chords = $chords }
+}
+
+function Count-Taps([string] $text) {
+    $toggles = ([regex]::Matches($text, 'bare Win tap \(time')).Count
+    $seconds = ([regex]::Matches($text, 'bare Win second tap')).Count
+    return @{ Toggle = $toggles; Second = $seconds }
+}
+
+function Start-App([string] $exePath) {
+    if (Get-Process -Name winorbit -ErrorAction SilentlyContinue) { throw "Another WinOrbit is running; exit it first." }
+    $p = Start-Process -FilePath $exePath -WorkingDirectory (Split-Path $exePath) -PassThru
+    $deadline = (Get-Date).AddSeconds(5)
+    do {
+        Start-Sleep -Milliseconds 50
+        $hwnd = [V]::FindWindow("WinOrbit", [NullString]::Value)
+    } while ($hwnd -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
+    if ($hwnd -eq [IntPtr]::Zero) {
+        if (-not $p.HasExited) { $p.Kill() }
+        throw "WinOrbit window did not appear"
+    }
+    Start-Sleep -Milliseconds 300
+    return @{ Process = $p; Hwnd = $hwnd }
+}
+
+# The newest low-level hook runs first and WinOrbit swallows the keys it uses
+# (Tab in Alt+Tab), so the observer is reinstalled after each launch to stay
+# ahead of WinOrbit and keep seeing them.
+function Start-AppObserved([string] $exePath) {
+    if ($script:observerStarted) { [V]::Stop(); $script:observerStarted = $false }
+    $a = Start-App $exePath
+    [V]::Start()
+    $script:observerStarted = $true
+    return $a
+}
+
+function Stop-App($a, [int] $timeoutMs = 5000) {
+    [void][V]::PostMessage($a.Hwnd, $WM_COMMAND, [IntPtr]$IDM_EXIT, [IntPtr]::Zero)
+    if (-not $a.Process.WaitForExit($timeoutMs)) {
+        $a.Process.Kill()
+        return @{ Exited = $false; Code = $null }
+    }
+    return @{ Exited = $true; Code = $a.Process.ExitCode }
+}
+
+# Returns the foreground "process [class]" if it is Start, else $null. Start
+# runs in SearchHost on Windows 11 23H2 (round-2 probe) and in
+# StartMenuExperienceHost elsewhere. ShellExperienceHost is not counted: it
+# also hosts Quick Settings (Win+A).
+function Get-StartForeground {
+    $fg = [V]::Foreground()
+    # A cloaked or invisible Start host is not a visible Start menu: Windows
+    # activates SearchHost briefly during Win+Left without showing anything.
+    if ($fg -match '^(StartMenuExperienceHost|SearchHost) ' -and $fg -notmatch ' (cloaked|invisible)$') { return $fg }
+    if ($fg -match '^(StartMenuExperienceHost|SearchHost) ' -and -not $script:hiddenStartSeen.Contains($fg)) {
+        [void]$script:hiddenStartSeen.Add($fg)
+        Write-Host "    (hidden Start host in foreground, not counted: $fg)"
+    }
+    return $null
+}
+
+function Test-StartForeground {
+    return [bool](Get-StartForeground)
+}
+
+# Asks for a PHYSICAL Esc: an injected key while WinOrbit is in probation
+# (just started, or after a reset) would keep taps native until that key is
+# pressed by hand, which would break the next owned-tap trial. Injects Esc
+# only as a last resort.
+function Close-StartIfOpen {
+    if (-not (Test-StartForeground)) { return }
+    Write-Host "  >>> Start is open: press Esc to close it" -ForegroundColor Yellow
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Test-StartForeground) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+    if (Test-StartForeground) {
+        Write-Host "    (no Esc: closing Start by injecting Esc; WinOrbit may then leave taps native until you press Esc)"
+        [V]::Vk(0x1B, 0x01, $false, $false); [V]::Vk(0x1B, 0x01, $true, $false)
+    }
+    Start-Sleep -Milliseconds 400
+}
+
+function Read-YesNo([string] $question) {
+    while ($true) {
+        $answer = (Read-Host "  $question (y/n)").Trim().ToLower()
+        if ($answer -in @('y', 'n')) { return $answer -eq 'y' }
+    }
+}
+
+function Check([string] $trial, [string] $what, $expected, $actual) {
+    $ok = "$expected" -eq "$actual"
+    $mark = if ($ok) { 'ok  ' } else { 'FAIL' }
+    Write-Host ("    {0} {1}: expected {2}, got {3}" -f $mark, $what, $expected, $actual)
+    if (-not $ok) { $failures.Add("${trial}: $what expected $expected, got $actual") }
+}
+
+# Waits for $releases Win releases (or Enter when $releases is 0), watching the
+# foreground for Start the whole time, then checks the log and asks.
+$trialCount = 0
+function Invoke-Trial {
+    param(
+        [string] $name, [string] $instruction, [int] $releases,
+        [bool] $expectStart, [int] $expectToggle, [int] $expectSecond,
+        [string] $nativeQuestion = '', [int] $seconds = 60, [switch] $Optional, [switch] $NoMeasure, [switch] $ExpectReset,
+        [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd, [switch] $ExpectStartOpenAtEnd, [switch] $ExpectOverlayHidden, [switch] $ExpectNoReset,
+        # Every Win hold is owned: the expected overview actions are derived,
+        # exactly, from the holds the observer saw (extra taps included).
+        # Otherwise they are the fixed counts given, and more Win releases
+        # than instructed make the trial invalid: it is run again.
+        [switch] $Owned,
+        # The trial is about a quick second tap: rerun it if none was made.
+        [switch] $RequireSecond,
+        # The Alt+Tab presses (Alt holds with Tab) the trial needs; any other
+        # number makes it invalid: it is run again. -1: not checked.
+        [int] $altTabHolds = -1,
+        # Start is open on purpose when the trial begins.
+        [switch] $KeepStart,
+        # The script raises a UAC prompt for the trial, so that the trial's only
+        # Win press is the tap; clicking Yes on it makes the trial invalid.
+        [switch] $AskUac,
+        [int] $attempt = 1,
+        [string] $logPath = $script:logPath
+    )
+    if ($attempt -eq 1) { $script:trialCount++ }
+    $retry = @{
+        name = $name; instruction = $instruction; releases = $releases
+        expectStart = $expectStart; expectToggle = $expectToggle; expectSecond = $expectSecond
+        nativeQuestion = $nativeQuestion; seconds = $seconds; Optional = $Optional; NoMeasure = $NoMeasure
+        ExpectReset = $ExpectReset; expectCommits = $expectCommits; ExpectStartClosedAtEnd = $ExpectStartClosedAtEnd
+        ExpectStartOpenAtEnd = $ExpectStartOpenAtEnd; AskUac = $AskUac
+        ExpectOverlayHidden = $ExpectOverlayHidden; ExpectNoReset = $ExpectNoReset; Owned = $Owned
+        RequireSecond = $RequireSecond; altTabHolds = $altTabHolds; KeepStart = $KeepStart; attempt = $attempt + 1; logPath = $logPath
+    }
+    if (-not $KeepStart) { Close-StartIfOpen }
+    [V]::ResetWin()
+    $before = [V]::WinReleases
+    $altTabBefore = [V]::AltTabHolds
+    $offset = Get-LogLength $logPath
+    Write-Host ""
+    Write-Host "  [$name]" -ForegroundColor Cyan
+    Write-Host "  >>> NOW: $instruction" -ForegroundColor Yellow
+    $startSeen = $false
+    $startWhat = $null
+    $shortfall = $null
+    $uacAccepted = $false
+    if ($AskUac) {
+        try { [void](Start-Process cmd -ArgumentList '/c', 'exit' -Verb RunAs -ErrorAction Stop); $uacAccepted = $true } catch { }
+    }
+    if ($releases -eq 0) {
+        [void](Read-Host "  Press Enter here when done")
+        Start-Sleep -Milliseconds 300
+        $startWhat = Get-StartForeground
+        $startSeen = [bool]$startWhat
+    } else {
+        $deadline = (Get-Date).AddSeconds($seconds)
+        $quietUntil = $null
+        while ((Get-Date) -lt $deadline) {
+            $fg = Get-StartForeground
+            if ($fg) { $startSeen = $true; if (-not $startWhat) { $startWhat = $fg } }
+            if (-not $quietUntil -and ([V]::WinReleases - $before) -ge $releases) {
+                $quietUntil = (Get-Date).AddMilliseconds(1500)
+            }
+            if ($quietUntil -and (Get-Date) -gt $quietUntil) { break }
+            Start-Sleep -Milliseconds 20
+        }
+        $done = [V]::WinReleases - $before
+        if ($done -lt $releases) {
+            if ($Optional) {
+                Write-Host "    (skipped: saw $done of $releases Win releases)"
+                return
+            }
+            $shortfall = "saw only $done of $releases Win releases"
+        }
+    }
+    $startAtEnd = Get-StartForeground
+    $script:startOpenAtEnd = [bool]$startAtEnd
+    Close-StartIfOpen
+    if ($startWhat) { Write-Host "    Start detected as: $startWhat" }
+
+    # Is the physical input what the trial asked for?
+    $holds = [V]::Holds()
+    $seen = Get-ExpectedTaps $holds $script:doubleTapMs
+    $altTabs = [V]::AltTabHolds - $altTabBefore
+    $invalid = $null
+    if ($shortfall) {
+        $invalid = $shortfall
+    } elseif ($uacAccepted) {
+        $invalid = 'Yes clicked on the UAC prompt, No asked for'
+    } elseif (-not $Owned -and $releases -gt 0 -and $holds.Count -gt $releases) {
+        $invalid = "$($holds.Count) Win releases, $releases asked for"
+    } elseif ($RequireSecond -and $seen.Second -eq 0) {
+        $invalid = 'no quick second tap'
+    } elseif ($altTabHolds -ge 0 -and $altTabs -ne $altTabHolds) {
+        $invalid = "$altTabs Alt+Tab presses, $altTabHolds asked for"
+    }
+    if ($invalid) {
+        if ($attempt -lt 3) {
+            Write-Host "    input did not match the step ($invalid): once more" -ForegroundColor Magenta
+            Invoke-Trial @retry
+        } else {
+            $failures.Add("${name}: input did not match the step 3 times ($invalid)")
+        }
+        return
+    }
+    if ($Owned) {
+        $expectToggle = $seen.Toggle
+        $expectSecond = $seen.Second
+        Write-Host ("    Win holds seen: {0} ({1} taps, {2} second taps, {3} chords)" -f $holds.Count, $seen.Toggle, $seen.Second, $seen.Chords)
+    }
+    $text = Read-LogSince $logPath $offset
+    $taps = Count-Taps $text
+    if ($ExpectReset) {
+        $resets = @([regex]::Matches($text, 'input reset: ([^\r\n]+)') | ForEach-Object { $_.Groups[1].Value.Trim() })
+        Write-Host ("    input resets logged: {0}" -f $(if ($resets.Count) { $resets -join ', ' } else { 'none' }))
+        Check $name 'input reset logged' $true ($resets.Count -gt 0)
+    }
+    $userStart = Read-YesNo "Did the Start menu open or flash, even briefly?"
+    if ($NoMeasure) {
+        Write-Host "    (Start not measured: it closes when you come back here)"
+    } else {
+        Check $name 'Start in foreground (measured)' $expectStart $startSeen
+    }
+    Check $name 'Start open or flash (you)' $expectStart $userStart
+    Check $name 'overview actions logged' $expectToggle $taps.Toggle
+    Check $name 'double-tap actions logged' $expectSecond $taps.Second
+    if ($expectCommits -ge 0) {
+        # One commit per Alt hold, however many Tab presses it had.
+        $commits = ([regex]::Matches($text, 'message WM_USER_SWITCH_APPS_DONE')).Count
+        Check $name 'WinOrbit switch commits logged' $expectCommits $commits
+    }
+    if ($ExpectNoReset) {
+        Check $name 'no input reset logged' $true ($text -notmatch 'input reset:')
+    }
+    if ($ExpectOverlayHidden) {
+        Check $name 'WinOrbit overlay hidden (measured)' $true (-not [V]::IsVisible($script:app.Hwnd))
+    }
+    if ($ExpectStartClosedAtEnd) {
+        Check $name 'Start closed at the end (measured)' $true (-not $startAtEnd)
+    }
+    if ($ExpectStartOpenAtEnd) {
+        Check $name 'Start still open at the end (measured)' $true ([bool]$startAtEnd)
+    }
+    if ($nativeQuestion) {
+        Check $name $nativeQuestion $true (Read-YesNo $nativeQuestion)
+    }
+}
+
+try {
+    Start-Transcript -Path $log | Out-Null
+    $transcriptStarted = $true
+    $Exe = (Resolve-Path $Exe).Path
+    Write-Host "Log: $log"
+    Write-Host "Exe: $Exe"
+    Write-Host ("Exe sha256: {0}" -f (Get-FileHash -Algorithm SHA256 $Exe).Hash)
+    Write-Host ("Windows: {0}" -f (Get-CimInstance Win32_OperatingSystem | ForEach-Object { "$($_.Caption) $($_.Version)" }))
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Write-Host "Terminal elevated: $elevated"
+    if ($elevated) { throw "Run from a NON-elevated terminal (Win+R, powershell, plain Enter)." }
+    $ini = Join-Path (Split-Path $Exe) 'winorbit.ini'
+    Write-Host "winorbit.ini:"
+    Get-Content $ini | Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { Write-Host "  $_" }
+    $doubleTapMs = Get-IniValue $ini 'overview' 'double_tap_ms'
+    if ((Get-IniValue $ini 'overview' 'enable') -ne 'yes' -or $doubleTapMs -notmatch '^\d+$' -or [int]$doubleTapMs -eq 0) {
+        throw "$ini must set [overview] enable = yes and a non-zero double_tap_ms"
+    }
+    Write-Host "double tap window: $doubleTapMs ms"
+    $script:logPath = Get-LogPath $Exe
+    Write-Host "WinOrbit log: $script:logPath"
+
+    $offset = Get-LogLength $script:logPath
+    $script:runOffset = $offset
+    $app = Start-App $Exe
+    $startup = Read-LogSince $script:logPath $offset
+    Check 'startup' 'listener owns bare Win tap' $true ($startup -match "bare Win tap owned \(double tap $doubleTapMs ms\)")
+    # Every reset observer and the cloak watcher were installed.
+    Check 'startup' 'all reset observers, cloak changes watched' $true ($startup -match 'bare Win taps owned; Start detection: visible Start, cloak changes watched')
+    [V]::Start()
+    $observerStarted = $true
+    Write-Host "`nWinOrbit started. Keep this window focused unless a step says otherwise."
+    # WinOrbit owns no tap until it has seen a key released with nothing else
+    # held (startup probation); this Enter is that key.
+    [void](Read-Host "  Press Enter to begin")
+    Write-Host "When Start stays open, the script asks you to press Esc."
+
+    if ($OnlySections.Count) { Write-Host ("Sections: {0}" -f ($OnlySections -join ', ')) }
+    $trialsBefore = $script:trialCount
+    if (Want 1) {
+    Write-Host "`n[1] Clean taps"
+    Invoke-Trial 'LWin tap' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+    Invoke-Trial 'RWin tap' 'tap the RIGHT Windows key once (no right Win key? wait 15 s to skip)' 1 $false 0 0 -seconds 15 -Optional -Owned
+    Invoke-Trial 'LWin held 2 s' 'hold the LEFT Windows key about 2 seconds, then release' 1 $false 0 0 -Owned
+    Invoke-Trial '10 taps' 'tap the LEFT Windows key 10 times SLOWLY: count one-and-two between taps' 10 $false 0 0 -seconds 90 -Owned
+    Invoke-Trial 'double tap' 'double-tap the LEFT Windows key quickly (Start must NOT open)' 2 $false 0 0 -Owned -RequireSecond
+    Invoke-Trial 'triple tap' 'tap the LEFT Windows key 3 times quickly (Start must NOT open)' 3 $false 0 0 -Owned -RequireSecond
+    Invoke-Trial 'Ctrl+Esc, then a tap closes Start' 'press Ctrl+Esc (Start opens), wait a second, tap the LEFT Windows key once (Start must close)' 1 $true 0 0 'Did Ctrl+Esc open Start and your tap close it?' -ExpectStartClosedAtEnd
+    Invoke-Trial 'two slow taps' 'tap the LEFT Windows key, wait about 2 seconds, tap it again' 2 $false 0 0 -Owned
+    Invoke-Trial 'Shift held, Win tap' 'hold Shift, tap the LEFT Windows key, release Shift' 1 $false 0 0
+    }
+
+    if (Want 2) {
+    Write-Host "`n[2] Native chords (each must do its normal Windows thing; undo it afterwards)"
+    $chords = @(
+        @('Win+E', 'press Win+E (Explorer opens; close it)', 'Did Explorer open?'),
+        @('Win+D', 'press Win+D, release both keys, press Win+D again (desktop shows, then windows come back)', 'Did the desktop show and come back?'),
+        @('Win+R', 'press Win+R (Run opens), then press Esc', 'Did the Run box open?'),
+        @('Win+X', 'press Win+X (the power-user menu opens), then press Esc', 'Did the Win+X menu open?'),
+        @('Win+1', 'press Win+1 (first taskbar app opens or activates)', 'Did the first taskbar app open or activate?'),
+        @('Win+A', 'press Win+A (Quick Settings opens), then press Esc', 'Did Quick Settings open?'),
+        @('Win+Shift+S', 'press Win+Shift+S (snipping bar appears), then press Esc', 'Did the snipping bar appear?'),
+        @('Win+Ctrl+O', 'press Win+Ctrl+O (On-Screen Keyboard opens), release all keys, press Win+Ctrl+O again to close it', 'Did the On-Screen Keyboard open?'),
+        @('Win+Tab', 'press Win+Tab (Task View opens), then press Esc', 'Did Task View open?'),
+        @('Win+Left', 'click another window, press Win+Left (it snaps left), then come back here', 'Did the window snap left?')
+    )
+    foreach ($chord in $chords) {
+        $releases = if ($chord[0] -in @('Win+D', 'Win+Ctrl+O')) { 2 } else { 1 }
+        Invoke-Trial $chord[0] $chord[1] $releases $false 0 0 $chord[2] -seconds 90
+    }
+    }
+
+    if ((Want 3) -and -not $SkipLock) {
+        Write-Host "`n[3] Win+L lock/unlock"
+        Invoke-Trial 'Win+L, then the first tap' 'press Win+L, sign back in, FIRST THING tap the LEFT Windows key once (Start opens), then click here and press Enter' 0 $true 0 0 -ExpectReset -NoMeasure
+        Invoke-Trial 'second tap after unlock' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+        Invoke-Trial 'chord after unlock' 'press Win+E (Explorer opens; close it)' 1 $false 0 0 'Did Explorer open?'
+        if (-not $SkipUac) {
+            Invoke-Trial 'UAC, then the first tap' 'click No on the UAC prompt the script raises, then FIRST THING tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 120 -AskUac
+            Invoke-Trial 'second tap after UAC' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+        }
+        Invoke-Trial 'Ctrl+Alt+Del, then the first tap' 'press Ctrl+Alt+Del, click Cancel, then FIRST THING tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 120
+        Invoke-Trial 'second tap after Ctrl+Alt+Del' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+        Invoke-Trial 'Alt+Tab after Ctrl+Alt+Del' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch?' -expectCommits 1 -altTabHolds 1
+        Invoke-Trial 'plain Tab after Ctrl+Alt+Del' 'CLICK this window with the mouse (no Alt+Tab), then press Tab alone twice' 0 $false 0 0 'Did plain Tab do nothing special (no WinOrbit switcher)?' -expectCommits 0 -altTabHolds 0
+        Invoke-Trial 'Ctrl+Alt+Del during Alt+Tab' 'hold Alt, tap Tab (switcher shows), KEEP Alt held and press Ctrl+Del, click Cancel, release all keys, CLICK this window' 0 $false 0 0 'Was the WinOrbit switcher gone when you came back?' -ExpectReset -expectCommits 0 -ExpectOverlayHidden
+        Invoke-Trial 'Alt+Tab after the interrupted switch' 'press Alt+Tab, release (WinOrbit switches), then CLICK this window to come back' 0 $false 0 0 'Did WinOrbit''s switcher appear and switch normally?' -expectCommits 1 -altTabHolds 1
+    }
+
+    if (Want 4) {
+    Write-Host "`n[4] Elevated foreground"
+    Write-Host "  Windows sends a non-elevated WinOrbit no keys while an elevated window (Task Manager) is focused;"
+    Write-Host "  WinOrbit resets its key state when focus moves there."
+    Invoke-Trial 'Ctrl+Shift+Esc, then the first tap' 'open Task Manager with Ctrl+Shift+Esc, CLICK back into this window, then tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 90
+    Invoke-Trial 'second tap after Task Manager' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+    Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key ONCE (Start opens natively), then CLICK this window (Start closes)' 0 $true 0 0 -NoMeasure -ExpectReset
+    Invoke-Trial 'tap back here' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+    Write-Host "  >>> Close Task Manager now (Alt+Tab trials must not land on it)" -ForegroundColor Yellow
+    }
+
+    if (Want 5) {
+    Write-Host "`n[5] Exit and relaunch"
+    [V]::Stop(); $observerStarted = $false
+    $stop = Stop-App $app; $app = $null
+    Check 'exit' 'exited in time' $true $stop.Exited
+    Check 'exit' 'exit code' 0 $stop.Code
+    $shutdown = Read-LogSince $script:logPath $script:runOffset
+    if ($shutdown -match 'keyboard hook longest callback (\d+) us') {
+        $all = [regex]::Matches($shutdown, 'keyboard hook longest callback (\d+) us')
+        Write-Host ("    longest hook callback, first WinOrbit: {0} us" -f $all[$all.Count - 1].Groups[1].Value)
+    } else {
+        $failures.Add('exit: no hook callback duration logged')
+    }
+    [V]::Start(); $observerStarted = $true
+    Invoke-Trial 'WinOrbit exited' 'tap the LEFT Windows key once (WinOrbit is not running: Start opens)' 1 $true 0 0
+    # What Windows alone does with this tap: the same tap under WinOrbit, which
+    # leaves it to Windows, must end the same way.
+    Invoke-Trial 'tap after typing in Start, no WinOrbit' 'press Ctrl+Esc, type the letter a, then tap the LEFT Windows key once' 1 $true 0 0
+    $nativeTapCloses = -not $script:startOpenAtEnd
+    Write-Host ("    without WinOrbit that tap {0} Start" -f $(if ($nativeTapCloses) { 'closed' } else { 'left open' }))
+        Write-Host "  >>> NOW: press Ctrl+Esc again so Start is open; the script then starts WinOrbit" -ForegroundColor Yellow
+    $deadline = (Get-Date).AddSeconds(30)
+    while (-not (Test-StartForeground) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+    $offset = Get-LogLength $script:logPath
+    $app = Start-AppObserved $Exe
+    $startedWith = Read-LogSince $script:logPath $offset
+    Check 'launch with Start open' 'WinOrbit saw Start open at startup' $true ($startedWith -match 'start open=true')
+    Start-Sleep -Milliseconds 300
+    if (Test-StartForeground) {
+        $instruction = 'type the letter a (it goes into Start search), then tap the LEFT Windows key once'
+        if ($nativeTapCloses) {
+            Invoke-Trial 'tap closes Start open since launch' "$instruction (Start must close)" 1 $true 0 0 'Did your tap close Start?' -ExpectStartClosedAtEnd -KeepStart
+        } else {
+            Invoke-Trial 'tap leaves Start open since launch' "$instruction (Start stays open, as it did without WinOrbit)" 1 $true 0 0 'Did Start stay open?' -ExpectStartOpenAtEnd -KeepStart
+        }
+    } else {
+        # Observed on 22631: Windows closes Start right after the launch.
+        Write-Host "    (Start closed during the launch; the startup classification is checked from the log only)"
+    }
+    # Startup probation again: this Enter is the key-up that ends it.
+    [void](Read-Host "  Press Enter to continue")
+    Invoke-Trial 'after relaunch' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+    $stop = Stop-App $app; $app = $null
+    Check 'second exit' 'exit code' 0 $stop.Code
+    }
+
+    if (Want 7) {
+    if (-not $app) { $app = Start-AppObserved $Exe }
+    Write-Host "`n[7] Regression on this build"
+    Invoke-Trial 'Alt+Tab' 'press Alt+Tab, release (the app list shows, the next app activates), then CLICK this window' 0 $false 0 0 'Did the app list look normal and the right app activate?' -expectCommits 1 -ExpectNoReset -altTabHolds 1
+    Invoke-Trial 'Alt+`' 'press Alt+` (cycles windows of the current app), then CLICK this window' 0 $false 0 0 'Did Alt+` cycle the app''s windows?'
+    Invoke-Trial 'Win+Left, then a tap' 'click another window, press Win+Left, then IMMEDIATELY tap the LEFT Windows key once (Start must NOT open)' 2 $false 0 0 -seconds 90 -Owned
+    }
+
+    if (Want 6) {
+    if ($app) { [void](Stop-App $app); $app = $null }
+    Write-Host "`n[6] Disabled ([overview] enable = no)"
+    $disabledDir = Join-Path (Split-Path $Exe) 's06d-disabled'
+    New-Item -ItemType Directory -Force -Path $disabledDir | Out-Null
+    Copy-Item $Exe (Join-Path $disabledDir 'winorbit.exe') -Force
+    $section = ''
+    $lines = foreach ($line in Get-Content $ini) {
+        if ($line -match '^\s*\[(.+)\]\s*$') { $section = $Matches[1] }
+        if ($section -eq 'overview' -and $line -match '^\s*enable\s*=') { 'enable = no' } else { $line }
+    }
+    $lines | Set-Content -Path (Join-Path $disabledDir 'winorbit.ini') -Encoding ASCII
+    $disabledExe = Join-Path $disabledDir 'winorbit.exe'
+    $disabledLog = Get-LogPath $disabledExe
+    $offset = Get-LogLength $disabledLog
+    $app = Start-AppObserved $disabledExe
+    Check 'disabled startup' 'listener leaves Win native' $true ((Read-LogSince $disabledLog $offset) -match 'bare Win tap native')
+    Invoke-Trial 'disabled tap' 'tap the LEFT Windows key once (Start opens natively)' 1 $true 0 0 -logPath $disabledLog
+    Invoke-Trial 'disabled Win+E' 'press Win+E (Explorer opens; close it)' 1 $false 0 0 'Did Explorer open?' -logPath $disabledLog
+    $stop = Stop-App $app; $app = $null
+    Check 'disabled exit' 'exit code' 0 $stop.Code
+    }
+    # A run that checked nothing must never report PASS.
+    if ($script:trialCount -eq $trialsBefore) { $failures.Add("no trial ran (sections: $Only)") }
+} catch {
+    $failures.Add("aborted: $_")
+} finally {
+    if ($observerStarted) { [V]::Stop() }
+    if ($app) { try { [void](Stop-App $app) } catch { } }
+    if ($helperLoaded) {
+        try {
+            Start-Sleep -Milliseconds 200
+            $stuck = @()
+            foreach ($key in @(@('LWin', 0x5B), @('RWin', 0x5C), @('Shift', 0x10), @('Ctrl', 0x11), @('Alt', 0x12), @('vkE8', 0xE8))) {
+                if ([V]::IsDown($key[1])) { $stuck += $key[0] }
+            }
+            Write-Host ("`n[8] keys left down: {0}" -f $(if ($stuck.Count) { $stuck -join ', ' } else { 'none' }))
+            foreach ($name in $stuck) { $failures.Add("$name left down") }
+            foreach ($key in @(@(0x5B, 0x5B, $true), @(0x5C, 0x5C, $true), @(0xA0, 0x2A, $false), @(0xA2, 0x1D, $false), @(0xA4, 0x38, $false), @(0xE8, 0, $false))) {
+                if ([V]::IsDown($key[0])) { [V]::Vk([byte]$key[0], [byte]$key[1], $true, $key[2]) }
+            }
+        } catch {
+            $failures.Add("cleanup failed: $_")
+        }
+    }
+    if ($script:logPath -and (Test-Path $script:logPath) -and $null -ne $script:runOffset) {
+        # Logged by each WinOrbit of this run when it exits.
+        $budget = @([regex]::Matches((Read-LogSince $script:logPath $script:runOffset), 'keyboard hook longest callback (\d+) us') | ForEach-Object { [int]$_.Groups[1].Value })
+        if ($budget.Count) {
+            Write-Host ("`nlongest keyboard hook callback, whole run: {0} us (over {1} WinOrbit runs)" -f ($budget | Measure-Object -Maximum).Maximum, $budget.Count)
+        }
+    }
+    if ($script:logPath -and (Test-Path $script:logPath)) {
+        $problems = (Read-LogSince $script:logPath 0) -split "`n" | Where-Object { $_ -match 'ERROR|WARN' -and $_ -match 'keyboard|Start|overview|mask|session' }
+        if ($problems) {
+            Write-Host "`nWinOrbit log warnings/errors (whole log file):"
+            $problems | ForEach-Object { Write-Host "  $_" }
+        }
+    }
+    if ($failures.Count -eq 0) {
+        Write-Host "`nRESULT: PASS" -ForegroundColor Green
+    } else {
+        Write-Host "`nRESULT: FAIL" -ForegroundColor Red
+        $failures | ForEach-Object { Write-Host "  - $_" }
+    }
+    $exitCode = [int]($failures.Count -ne 0)
+    Write-Host "exit code: $exitCode"
+    if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch { } }
+}
+exit $exitCode
