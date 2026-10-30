@@ -315,6 +315,17 @@ function Start-App([string] $exePath) {
     return @{ Process = $p; Hwnd = $hwnd }
 }
 
+# The newest low-level hook runs first and WinOrbit swallows the keys it uses
+# (Tab in Alt+Tab), so the observer is reinstalled after each launch to stay
+# ahead of WinOrbit and keep seeing them.
+function Start-AppObserved([string] $exePath) {
+    if ($script:observerStarted) { [V]::Stop(); $script:observerStarted = $false }
+    $a = Start-App $exePath
+    [V]::Start()
+    $script:observerStarted = $true
+    return $a
+}
+
 function Stop-App($a, [int] $timeoutMs = 5000) {
     [void][V]::PostMessage($a.Hwnd, $WM_COMMAND, [IntPtr]$IDM_EXIT, [IntPtr]::Zero)
     if (-not $a.Process.WaitForExit($timeoutMs)) {
@@ -382,7 +393,7 @@ function Invoke-Trial {
         [string] $name, [string] $instruction, [int] $releases,
         [bool] $expectStart, [int] $expectToggle, [int] $expectSecond,
         [string] $nativeQuestion = '', [int] $seconds = 60, [switch] $Optional, [switch] $NoMeasure, [switch] $ExpectReset,
-        [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd, [switch] $ExpectOverlayHidden, [switch] $ExpectNoReset,
+        [int] $expectCommits = -1, [switch] $ExpectStartClosedAtEnd, [switch] $ExpectStartOpenAtEnd, [switch] $ExpectOverlayHidden, [switch] $ExpectNoReset,
         # Every Win hold is owned: the expected overview actions are derived,
         # exactly, from the holds the observer saw (extra taps included).
         # Otherwise they are the fixed counts given, and more Win releases
@@ -395,6 +406,9 @@ function Invoke-Trial {
         [int] $altTabHolds = -1,
         # Start is open on purpose when the trial begins.
         [switch] $KeepStart,
+        # The script raises a UAC prompt for the trial, so that the trial's only
+        # Win press is the tap; clicking Yes on it makes the trial invalid.
+        [switch] $AskUac,
         [int] $attempt = 1,
         [string] $logPath = $script:logPath
     )
@@ -404,6 +418,7 @@ function Invoke-Trial {
         expectStart = $expectStart; expectToggle = $expectToggle; expectSecond = $expectSecond
         nativeQuestion = $nativeQuestion; seconds = $seconds; Optional = $Optional; NoMeasure = $NoMeasure
         ExpectReset = $ExpectReset; expectCommits = $expectCommits; ExpectStartClosedAtEnd = $ExpectStartClosedAtEnd
+        ExpectStartOpenAtEnd = $ExpectStartOpenAtEnd; AskUac = $AskUac
         ExpectOverlayHidden = $ExpectOverlayHidden; ExpectNoReset = $ExpectNoReset; Owned = $Owned
         RequireSecond = $RequireSecond; altTabHolds = $altTabHolds; KeepStart = $KeepStart; attempt = $attempt + 1; logPath = $logPath
     }
@@ -417,6 +432,11 @@ function Invoke-Trial {
     Write-Host "  >>> NOW: $instruction" -ForegroundColor Yellow
     $startSeen = $false
     $startWhat = $null
+    $shortfall = $null
+    $uacAccepted = $false
+    if ($AskUac) {
+        try { [void](Start-Process cmd -ArgumentList '/c', 'exit' -Verb RunAs -ErrorAction Stop); $uacAccepted = $true } catch { }
+    }
     if ($releases -eq 0) {
         [void](Read-Host "  Press Enter here when done")
         Start-Sleep -Milliseconds 300
@@ -440,10 +460,11 @@ function Invoke-Trial {
                 Write-Host "    (skipped: saw $done of $releases Win releases)"
                 return
             }
-            $failures.Add("${name}: saw only $done of $releases Win releases")
+            $shortfall = "saw only $done of $releases Win releases"
         }
     }
     $startAtEnd = Get-StartForeground
+    $script:startOpenAtEnd = [bool]$startAtEnd
     Close-StartIfOpen
     if ($startWhat) { Write-Host "    Start detected as: $startWhat" }
 
@@ -452,7 +473,11 @@ function Invoke-Trial {
     $seen = Get-ExpectedTaps $holds $script:doubleTapMs
     $altTabs = [V]::AltTabHolds - $altTabBefore
     $invalid = $null
-    if (-not $Owned -and $releases -gt 0 -and $holds.Count -gt $releases) {
+    if ($shortfall) {
+        $invalid = $shortfall
+    } elseif ($uacAccepted) {
+        $invalid = 'Yes clicked on the UAC prompt, No asked for'
+    } elseif (-not $Owned -and $releases -gt 0 -and $holds.Count -gt $releases) {
         $invalid = "$($holds.Count) Win releases, $releases asked for"
     } elseif ($RequireSecond -and $seen.Second -eq 0) {
         $invalid = 'no quick second tap'
@@ -503,6 +528,9 @@ function Invoke-Trial {
     if ($ExpectStartClosedAtEnd) {
         Check $name 'Start closed at the end (measured)' $true (-not $startAtEnd)
     }
+    if ($ExpectStartOpenAtEnd) {
+        Check $name 'Start still open at the end (measured)' $true ([bool]$startAtEnd)
+    }
     if ($nativeQuestion) {
         Check $name $nativeQuestion $true (Read-YesNo $nativeQuestion)
     }
@@ -543,7 +571,7 @@ try {
     # WinOrbit owns no tap until it has seen a key released with nothing else
     # held (startup probation); this Enter is that key.
     [void](Read-Host "  Press Enter to begin")
-    Write-Host "When Start opens, the script closes it with Esc."
+    Write-Host "When Start stays open, the script asks you to press Esc."
 
     if ($OnlySections.Count) { Write-Host ("Sections: {0}" -f ($OnlySections -join ', ')) }
     $trialsBefore = $script:trialCount
@@ -586,7 +614,7 @@ try {
         Invoke-Trial 'second tap after unlock' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
         Invoke-Trial 'chord after unlock' 'press Win+E (Explorer opens; close it)' 1 $false 0 0 'Did Explorer open?'
         if (-not $SkipUac) {
-            Invoke-Trial 'UAC, then the first tap' 'press Win+R, type cmd, press Ctrl+Shift+Enter, click No on the UAC prompt, click this window, then tap the LEFT Windows key once' 2 $true 0 0 -ExpectReset -seconds 120
+            Invoke-Trial 'UAC, then the first tap' 'click No on the UAC prompt the script raises, then FIRST THING tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 120 -AskUac
             Invoke-Trial 'second tap after UAC' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
         }
         Invoke-Trial 'Ctrl+Alt+Del, then the first tap' 'press Ctrl+Alt+Del, click Cancel, then FIRST THING tap the LEFT Windows key once' 1 $true 0 0 -ExpectReset -seconds 120
@@ -605,6 +633,7 @@ try {
     Invoke-Trial 'second tap after Task Manager' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
     Invoke-Trial 'tap in Task Manager' 'click Task Manager, tap the LEFT Windows key ONCE (Start opens natively), then CLICK this window (Start closes)' 0 $true 0 0 -NoMeasure -ExpectReset
     Invoke-Trial 'tap back here' 'tap the LEFT Windows key once' 1 $false 0 0 -Owned
+    Write-Host "  >>> Close Task Manager now (Alt+Tab trials must not land on it)" -ForegroundColor Yellow
     }
 
     if (Want 5) {
@@ -622,16 +651,26 @@ try {
     }
     [V]::Start(); $observerStarted = $true
     Invoke-Trial 'WinOrbit exited' 'tap the LEFT Windows key once (WinOrbit is not running: Start opens)' 1 $true 0 0
+    # What Windows alone does with this tap: the same tap under WinOrbit, which
+    # leaves it to Windows, must end the same way.
+    Invoke-Trial 'tap after typing in Start, no WinOrbit' 'press Ctrl+Esc, type the letter a, then tap the LEFT Windows key once' 1 $true 0 0
+    $nativeTapCloses = -not $script:startOpenAtEnd
+    Write-Host ("    without WinOrbit that tap {0} Start" -f $(if ($nativeTapCloses) { 'closed' } else { 'left open' }))
         Write-Host "  >>> NOW: press Ctrl+Esc again so Start is open; the script then starts WinOrbit" -ForegroundColor Yellow
     $deadline = (Get-Date).AddSeconds(30)
     while (-not (Test-StartForeground) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
     $offset = Get-LogLength $script:logPath
-    $app = Start-App $Exe
+    $app = Start-AppObserved $Exe
     $startedWith = Read-LogSince $script:logPath $offset
     Check 'launch with Start open' 'WinOrbit saw Start open at startup' $true ($startedWith -match 'start open=true')
     Start-Sleep -Milliseconds 300
     if (Test-StartForeground) {
-        Invoke-Trial 'tap closes Start open since launch' 'type the letter a (it goes into Start search), then tap the LEFT Windows key once (Start must close)' 1 $true 0 0 'Did your tap close Start?' -ExpectStartClosedAtEnd -KeepStart
+        $instruction = 'type the letter a (it goes into Start search), then tap the LEFT Windows key once'
+        if ($nativeTapCloses) {
+            Invoke-Trial 'tap closes Start open since launch' "$instruction (Start must close)" 1 $true 0 0 'Did your tap close Start?' -ExpectStartClosedAtEnd -KeepStart
+        } else {
+            Invoke-Trial 'tap leaves Start open since launch' "$instruction (Start stays open, as it did without WinOrbit)" 1 $true 0 0 'Did Start stay open?' -ExpectStartOpenAtEnd -KeepStart
+        }
     } else {
         # Observed on 22631: Windows closes Start right after the launch.
         Write-Host "    (Start closed during the launch; the startup classification is checked from the log only)"
@@ -644,7 +683,7 @@ try {
     }
 
     if (Want 7) {
-    if (-not $app) { $app = Start-App $Exe }
+    if (-not $app) { $app = Start-AppObserved $Exe }
     Write-Host "`n[7] Regression on this build"
     Invoke-Trial 'Alt+Tab' 'press Alt+Tab, release (the app list shows, the next app activates), then CLICK this window' 0 $false 0 0 'Did the app list look normal and the right app activate?' -expectCommits 1 -ExpectNoReset -altTabHolds 1
     Invoke-Trial 'Alt+`' 'press Alt+` (cycles windows of the current app), then CLICK this window' 0 $false 0 0 'Did Alt+` cycle the app''s windows?'
@@ -666,7 +705,7 @@ try {
     $disabledExe = Join-Path $disabledDir 'winorbit.exe'
     $disabledLog = Get-LogPath $disabledExe
     $offset = Get-LogLength $disabledLog
-    $app = Start-App $disabledExe
+    $app = Start-AppObserved $disabledExe
     Check 'disabled startup' 'listener leaves Win native' $true ((Read-LogSince $disabledLog $offset) -match 'bare Win tap native')
     Invoke-Trial 'disabled tap' 'tap the LEFT Windows key once (Start opens natively)' 1 $true 0 0 -logPath $disabledLog
     Invoke-Trial 'disabled Win+E' 'press Win+E (Explorer opens; close it)' 1 $false 0 0 'Did Explorer open?' -logPath $disabledLog
